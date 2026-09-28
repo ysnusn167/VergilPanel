@@ -45,6 +45,13 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+/*
+ * Read request body.
+ *
+ * Supports:
+ * 1. application/json
+ * 2. application/x-www-form-urlencoded
+ */
 async function readBody(req) {
   let body = "";
 
@@ -52,11 +59,52 @@ async function readBody(req) {
     body += chunk;
   }
 
+  const contentType = String(
+    req.headers["content-type"] || ""
+  ).toLowerCase();
+
+  // JSON request
+  if (contentType.includes("application/json")) {
+    try {
+      return JSON.parse(body);
+    } catch {
+      return null;
+    }
+  }
+
+  // Normal HTML form request
+  if (
+    contentType.includes(
+      "application/x-www-form-urlencoded"
+    )
+  ) {
+    try {
+      const params = new URLSearchParams(body);
+
+      return {
+        username: params.get("username") || "",
+        password: params.get("password") || ""
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // Try JSON as a fallback
   try {
     return JSON.parse(body);
   } catch {
     return null;
   }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function page(title, content) {
@@ -65,8 +113,12 @@ function page(title, content) {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title} - VergilPanel</title>
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
+
+  <title>${escapeHtml(title)} - VergilPanel</title>
 
   <style>
     * {
@@ -90,7 +142,7 @@ function page(title, content) {
       background: #151c32;
       padding: 30px;
       border-radius: 18px;
-      box-shadow: 0 20px 60px rgba(0,0,0,.4);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, .4);
     }
 
     h1 {
@@ -170,7 +222,10 @@ const server = http.createServer(async (req, res) => {
 
     const path = url.pathname;
 
+    // --------------------------------------------------
     // Health
+    // --------------------------------------------------
+
     if (req.method === "GET" && path === "/health") {
       return sendJson(res, 200, {
         ok: true,
@@ -180,10 +235,18 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // API setup status
-    if (req.method === "GET" && path === "/api/setup/status") {
+    // --------------------------------------------------
+    // Setup status
+    // --------------------------------------------------
+
+    if (
+      req.method === "GET" &&
+      path === "/api/setup/status"
+    ) {
       const admin = db
-        .prepare("SELECT COUNT(*) AS count FROM admins")
+        .prepare(
+          "SELECT COUNT(*) AS count FROM admins"
+        )
         .get();
 
       return sendJson(res, 200, {
@@ -191,7 +254,10 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // --------------------------------------------------
     // Setup page
+    // --------------------------------------------------
+
     if (req.method === "GET" && path === "/setup") {
       return sendHtml(
         res,
@@ -204,14 +270,18 @@ const server = http.createServer(async (req, res) => {
 
             <h1>Initial Setup</h1>
 
-            <p>Create your administrator account.</p>
+            <p>
+              Create your administrator account.
+            </p>
 
             <form method="POST" action="/setup">
+
               <input
                 type="text"
                 name="username"
                 placeholder="Username"
                 required
+                minlength="3"
               >
 
               <input
@@ -219,11 +289,13 @@ const server = http.createServer(async (req, res) => {
                 name="password"
                 placeholder="Password"
                 required
+                minlength="6"
               >
 
               <button type="submit">
                 Create Admin
               </button>
+
             </form>
           </div>
           `
@@ -231,7 +303,10 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // --------------------------------------------------
     // Setup submit
+    // --------------------------------------------------
+
     if (req.method === "POST" && path === "/setup") {
       const body = await readBody(req);
 
@@ -249,15 +324,21 @@ const server = http.createServer(async (req, res) => {
       const username = body.username.trim();
       const password = body.password;
 
-      if (username.length < 3 || password.length < 6) {
+      if (
+        username.length < 3 ||
+        password.length < 6
+      ) {
         return sendJson(res, 400, {
           ok: false,
-          error: "Username must be 3+ characters and password 6+ characters."
+          error:
+            "Username must be 3+ characters and password 6+ characters."
         });
       }
 
       const existing = db
-        .prepare("SELECT COUNT(*) AS count FROM admins")
+        .prepare(
+          "SELECT COUNT(*) AS count FROM admins"
+        )
         .get();
 
       if (existing.count > 0) {
@@ -303,7 +384,10 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // --------------------------------------------------
     // Login page
+    // --------------------------------------------------
+
     if (req.method === "GET" && path === "/login") {
       return sendHtml(
         res,
@@ -316,9 +400,12 @@ const server = http.createServer(async (req, res) => {
 
             <h1>Login</h1>
 
-            <p>Sign in to your panel.</p>
+            <p>
+              Sign in to your panel.
+            </p>
 
             <form method="POST" action="/login">
+
               <input
                 type="text"
                 name="username"
@@ -336,6 +423,7 @@ const server = http.createServer(async (req, res) => {
               <button type="submit">
                 Login
               </button>
+
             </form>
           </div>
           `
@@ -343,7 +431,10 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // --------------------------------------------------
     // Login submit
+    // --------------------------------------------------
+
     if (req.method === "POST" && path === "/login") {
       const body = await readBody(req);
 
@@ -354,17 +445,26 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
+      const username = String(
+        body.username || ""
+      ).trim();
+
+      const password = String(
+        body.password || ""
+      );
+
       const admin = db
         .prepare(
           "SELECT * FROM admins WHERE username = ?"
         )
-        .get(String(body.username || "").trim());
+        .get(username);
 
-      const passwordHash = hashPassword(
-        String(body.password || "")
-      );
+      const passwordHash = hashPassword(password);
 
-      if (!admin || admin.password_hash !== passwordHash) {
+      if (
+        !admin ||
+        admin.password_hash !== passwordHash
+      ) {
         return sendHtml(
           res,
           401,
@@ -405,7 +505,9 @@ const server = http.createServer(async (req, res) => {
             </p>
 
             <p>
-              Welcome, ${admin.username} 👋
+              Welcome,
+              ${escapeHtml(admin.username)}
+              👋
             </p>
           </div>
           `
@@ -413,10 +515,15 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // --------------------------------------------------
     // Main page
+    // --------------------------------------------------
+
     if (req.method === "GET" && path === "/") {
       const admin = db
-        .prepare("SELECT COUNT(*) AS count FROM admins")
+        .prepare(
+          "SELECT COUNT(*) AS count FROM admins"
+        )
         .get();
 
       if (admin.count === 0) {
@@ -468,6 +575,10 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // --------------------------------------------------
+    // 404
+    // --------------------------------------------------
+
     return sendJson(res, 404, {
       ok: false,
       error: "Not Found"
@@ -484,6 +595,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`VergilPanel running on ${HOST}:${PORT}`);
-  console.log(`SQLite database: ${DB_PATH}`);
+  console.log(
+    `VergilPanel v0.3.0 running on ${HOST}:${PORT}`
+  );
+
+  console.log(
+    `SQLite database: ${DB_PATH}`
+  );
 });
