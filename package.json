@@ -1,6 +1,6 @@
 {
   "name": "vergilpanel",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "VergilPanel - automatic VLESS XHTTP and WebSocket panel.",
   "type": "module",
@@ -12,6 +12,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "better-sqlite3": "^12.4.1"
+    "better-sqlite3": "^12.4.1",
+    "qrcode": "^1.5.4"
   }
 }
