@@ -1,8 +1,8 @@
 {
   "name": "vergilpanel",
-  "version": "0.2.0",
+  "version": "0.6.0",
   "private": true,
-  "description": "VergilPanel - Railway-ready Xray management panel foundation.",
+  "description": "VergilPanel - automatic VLESS XHTTP and WebSocket panel.",
   "type": "module",
   "scripts": {
     "start": "node server/index.js",
