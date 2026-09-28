@@ -1,6 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { spawn } from "node:child_process";
 import Database from "better-sqlite3";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -8,9 +9,21 @@ const HOST = "0.0.0.0";
 
 const DATA_DIR = process.env.DATA_DIR || "/app/data";
 const DB_PATH = `${DATA_DIR}/vergilpanel.db`;
-const VERSION = "0.4.0";
+
+const XRAY_PATH = process.env.XRAY_PATH || "/opt/xray/xray";
+const XRAY_DIR = process.env.XRAY_DIR || "/app/xray";
+const XRAY_CONFIG_PATH = `${XRAY_DIR}/generated-config.json`;
+
+const XRAY_PORT = Number(
+  process.env.XRAY_PORT ||
+  process.env.RAILWAY_TCP_APPLICATION_PORT ||
+  2053
+);
+
+const VERSION = "0.5.0";
 
 await fs.mkdir(DATA_DIR, { recursive: true });
+await fs.mkdir(XRAY_DIR, { recursive: true });
 
 const db = new Database(DB_PATH);
 
@@ -38,6 +51,9 @@ db.exec(`
 `);
 
 const sessions = new Map();
+
+let xrayProcess = null;
+let xrayStarting = false;
 
 const startedAt = Date.now();
 
@@ -102,7 +118,12 @@ function formatDate(date) {
   return new Date(date).toLocaleDateString("en-GB");
 }
 
-function send(res, statusCode, body, contentType = "text/html; charset=utf-8") {
+function send(
+  res,
+  statusCode,
+  body,
+  contentType = "text/html; charset=utf-8"
+) {
   res.writeHead(statusCode, {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
@@ -224,6 +245,259 @@ async function readBody(req) {
   });
 }
 
+/*
+ * ---------------------------------------------------------
+ * RAILWAY / VLESS
+ * ---------------------------------------------------------
+ */
+
+function getTcpDomain() {
+  return (
+    process.env.RAILWAY_TCP_PROXY_DOMAIN ||
+    ""
+  ).trim();
+}
+
+function getTcpPort() {
+  return Number(
+    process.env.RAILWAY_TCP_PROXY_PORT || 0
+  );
+}
+
+function getVlessLink(user) {
+  const domain = getTcpDomain();
+  const port = getTcpPort();
+
+  if (!domain || !port) {
+    return null;
+  }
+
+  const params = new URLSearchParams();
+
+  params.set("type", "tcp");
+  params.set("security", "none");
+
+  return `vless://${user.uuid}@${domain}:${port}?${params.toString()}#${encodeURIComponent(
+    user.username
+  )}`;
+}
+
+/*
+ * ---------------------------------------------------------
+ * XRAY CONFIGURATION
+ * ---------------------------------------------------------
+ */
+
+function getXrayUsers() {
+  const users = db
+    .prepare(`
+      SELECT
+        id,
+        username,
+        uuid,
+        status,
+        expires_at
+      FROM users
+      ORDER BY id ASC
+    `)
+    .all();
+
+  const now = Date.now();
+
+  return users
+    .filter((user) => {
+      if (user.status !== "active") {
+        return false;
+      }
+
+      if (!user.expires_at) {
+        return true;
+      }
+
+      return new Date(user.expires_at).getTime() >= now;
+    })
+    .map((user) => ({
+      id: user.uuid,
+      level: 0,
+      email: user.username,
+    }));
+}
+
+async function buildXrayConfig() {
+  const users = getXrayUsers();
+
+  const config = {
+    log: {
+      loglevel: "warning",
+    },
+
+    inbounds: [
+      {
+        tag: "vless-tcp",
+        listen: "0.0.0.0",
+        port: XRAY_PORT,
+        protocol: "vless",
+
+        settings: {
+          clients: users,
+          decryption: "none",
+        },
+
+        streamSettings: {
+          network: "tcp",
+          security: "none",
+        },
+      },
+    ],
+
+    outbounds: [
+      {
+        tag: "direct",
+        protocol: "freedom",
+        settings: {},
+      },
+    ],
+  };
+
+  await fs.writeFile(
+    XRAY_CONFIG_PATH,
+    JSON.stringify(config, null, 2),
+    "utf8"
+  );
+
+  return config;
+}
+
+async function stopXray() {
+  if (!xrayProcess) {
+    return;
+  }
+
+  const processToStop = xrayProcess;
+
+  xrayProcess = null;
+
+  try {
+    processToStop.kill("SIGTERM");
+  } catch {
+    // Process may already be gone.
+  }
+
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 3000);
+
+    processToStop.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+async function startXray() {
+  if (xrayStarting) {
+    return;
+  }
+
+  xrayStarting = true;
+
+  try {
+    await buildXrayConfig();
+
+    await stopXray();
+
+    console.log(
+      `⚔️ Starting Xray on ${HOST}:${XRAY_PORT}`
+    );
+
+    xrayProcess = spawn(
+      XRAY_PATH,
+      [
+        "run",
+        "-config",
+        XRAY_CONFIG_PATH,
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+
+    xrayProcess.stdout.on(
+      "data",
+      (data) => {
+        process.stdout.write(
+          `[XRAY] ${data.toString()}`
+        );
+      }
+    );
+
+    xrayProcess.stderr.on(
+      "data",
+      (data) => {
+        process.stderr.write(
+          `[XRAY] ${data.toString()}`
+        );
+      }
+    );
+
+    xrayProcess.on(
+      "error",
+      (error) => {
+        console.error(
+          "Xray process error:",
+          error
+        );
+      }
+    );
+
+    xrayProcess.on(
+      "exit",
+      (code, signal) => {
+        console.log(
+          `⚔️ Xray exited. code=${code} signal=${signal}`
+        );
+
+        if (xrayProcess) {
+          xrayProcess = null;
+        }
+      }
+    );
+
+    console.log(
+      `⚙️ Xray config synced: ${getXrayUsers().length} active user(s)`
+    );
+  } finally {
+    xrayStarting = false;
+  }
+}
+
+async function syncXray() {
+  try {
+    await startXray();
+    return true;
+  } catch (error) {
+    console.error(
+      "Xray sync failed:",
+      error
+    );
+
+    return false;
+  }
+}
+
+function isXrayRunning() {
+  return Boolean(
+    xrayProcess &&
+    xrayProcess.exitCode === null &&
+    !xrayProcess.killed
+  );
+}
+
+/*
+ * ---------------------------------------------------------
+ * HTML
+ * ---------------------------------------------------------
+ */
+
 function page(title, content, username = null) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -265,7 +539,7 @@ function page(title, content, username = null) {
     }
 
     .container {
-      width: min(1100px, calc(100% - 32px));
+      width: min(1150px, calc(100% - 32px));
       margin: 0 auto;
     }
 
@@ -331,6 +605,10 @@ function page(title, content, username = null) {
       background: #d9445c;
     }
 
+    .btn.success {
+      background: #239b73;
+    }
+
     .hero {
       padding: 42px 0 28px;
     }
@@ -386,7 +664,7 @@ function page(title, content, username = null) {
     }
 
     .dot.off {
-      background: #8a93a8;
+      background: #d9445c;
     }
 
     .section {
@@ -413,7 +691,7 @@ function page(title, content, username = null) {
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 720px;
+      min-width: 850px;
     }
 
     th,
@@ -451,6 +729,11 @@ function page(title, content, username = null) {
     .badge.disabled {
       background: rgba(217,68,92,.12);
       color: #ff7f91;
+    }
+
+    .badge.warning {
+      background: rgba(255,193,7,.12);
+      color: #ffd86b;
     }
 
     .form-card {
@@ -512,6 +795,40 @@ function page(title, content, username = null) {
       font-size: 14px;
     }
 
+    .success-box {
+      background: rgba(54,211,153,.10);
+      border: 1px solid rgba(54,211,153,.20);
+      color: #7ceabd;
+      padding: 14px;
+      border-radius: 10px;
+      margin-bottom: 18px;
+    }
+
+    .link-box {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .link-box input {
+      margin: 0;
+      font-family: monospace;
+      font-size: 12px;
+    }
+
+    .mono {
+      font-family: monospace;
+      font-size: 12px;
+      word-break: break-all;
+    }
+
+    .xray-box {
+      background: rgba(83,109,254,.08);
+      border: 1px solid rgba(83,109,254,.20);
+      border-radius: 14px;
+      padding: 18px;
+    }
+
     footer {
       padding: 45px 0 30px;
       text-align: center;
@@ -549,6 +866,10 @@ function page(title, content, username = null) {
 
       .hero {
         padding-top: 30px;
+      }
+
+      .link-box {
+        flex-direction: column;
       }
     }
   </style>
@@ -621,6 +942,7 @@ function loginPage(error = "") {
       <form method="POST" action="/login">
 
         <label>Username</label>
+
         <input
           type="text"
           name="username"
@@ -629,6 +951,7 @@ function loginPage(error = "") {
         >
 
         <label>Password</label>
+
         <input
           type="password"
           name="password"
@@ -670,6 +993,7 @@ function setupPage(error = "") {
       <form method="POST" action="/setup">
 
         <label>Admin Username</label>
+
         <input
           type="text"
           name="username"
@@ -678,6 +1002,7 @@ function setupPage(error = "") {
         >
 
         <label>Admin Password</label>
+
         <input
           type="password"
           name="password"
@@ -711,19 +1036,28 @@ function dashboardPage(username) {
     .prepare("SELECT COUNT(*) AS count FROM admins")
     .get().count;
 
+  const xrayRunning = isXrayRunning();
+
+  const tcpDomain = getTcpDomain();
+  const tcpPort = getTcpPort();
+
   return page(
     "Dashboard",
     `
     <div class="hero">
+
       <h1>Dashboard</h1>
+
       <p>
         Welcome back, ${escapeHtml(username)} 👋
       </p>
+
     </div>
 
     <div class="grid">
 
       <div class="card">
+
         <div class="card-title">
           Panel Status
         </div>
@@ -732,9 +1066,11 @@ function dashboardPage(username) {
           <span class="dot"></span>
           Online
         </div>
+
       </div>
 
       <div class="card">
+
         <div class="card-title">
           Database
         </div>
@@ -743,9 +1079,11 @@ function dashboardPage(username) {
           <span class="dot"></span>
           Connected
         </div>
+
       </div>
 
       <div class="card">
+
         <div class="card-title">
           Users
         </div>
@@ -753,9 +1091,11 @@ function dashboardPage(username) {
         <div class="card-value">
           ${totalUsers}
         </div>
+
       </div>
 
       <div class="card">
+
         <div class="card-title">
           Active Users
         </div>
@@ -763,6 +1103,7 @@ function dashboardPage(username) {
         <div class="card-value">
           ${activeUsers}
         </div>
+
       </div>
 
     </div>
@@ -776,6 +1117,7 @@ function dashboardPage(username) {
       <div class="grid">
 
         <div class="card">
+
           <div class="card-title">
             Administrators
           </div>
@@ -783,30 +1125,41 @@ function dashboardPage(username) {
           <div class="card-value">
             ${totalAdmins}
           </div>
+
         </div>
 
         <div class="card">
+
           <div class="card-title">
             Xray
           </div>
 
           <div class="card-value status">
-            <span class="dot off"></span>
-            Not configured
+
+            <span class="dot ${
+              xrayRunning ? "" : "off"
+            }"></span>
+
+            ${xrayRunning ? "Running" : "Stopped"}
+
           </div>
+
         </div>
 
         <div class="card">
+
           <div class="card-title">
-            Uptime
+            Xray Port
           </div>
 
           <div class="card-value">
-            ${formatUptime(Date.now() - startedAt)}
+            ${XRAY_PORT}
           </div>
+
         </div>
 
         <div class="card">
+
           <div class="card-title">
             Version
           </div>
@@ -814,6 +1167,7 @@ function dashboardPage(username) {
           <div class="card-value">
             v${VERSION}
           </div>
+
         </div>
 
       </div>
@@ -822,17 +1176,54 @@ function dashboardPage(username) {
 
     <div class="section">
 
+      <div class="xray-box">
+
+        <div class="card-title">
+          Railway TCP Proxy
+        </div>
+
+        ${
+          tcpDomain && tcpPort
+            ? `
+              <div class="card-value">
+                ${escapeHtml(tcpDomain)}:${tcpPort}
+              </div>
+
+              <p style="color:#8995b2;">
+                Automatic connection endpoint detected.
+              </p>
+            `
+            : `
+              <div class="card-value">
+                Not detected
+              </div>
+
+              <p style="color:#8995b2;">
+                Create a Railway TCP Proxy for port ${XRAY_PORT}.
+              </p>
+            `
+        }
+
+      </div>
+
+    </div>
+
+    <div class="section">
+
       <div class="section-header">
+
         <h2>Management</h2>
 
         <a href="/users/new" class="btn">
           + New User
         </a>
+
       </div>
 
       <div class="grid">
 
         <a href="/users" class="card">
+
           <div class="card-title">
             Users
           </div>
@@ -840,19 +1231,23 @@ function dashboardPage(username) {
           <div class="card-value">
             Manage →
           </div>
+
         </a>
 
-        <div class="card">
+        <a href="/xray" class="card">
+
           <div class="card-title">
             Xray
           </div>
 
           <div class="card-value">
-            Coming soon
+            Configuration →
           </div>
-        </div>
+
+        </a>
 
         <div class="card">
+
           <div class="card-title">
             Settings
           </div>
@@ -860,9 +1255,11 @@ function dashboardPage(username) {
           <div class="card-value">
             Coming soon
           </div>
+
         </div>
 
         <div class="card">
+
           <div class="card-title">
             API
           </div>
@@ -870,6 +1267,7 @@ function dashboardPage(username) {
           <div class="card-value">
             Coming soon
           </div>
+
         </div>
 
       </div>
@@ -900,8 +1298,10 @@ function usersPage(username) {
 
   const rows = users.length
     ? users
-        .map(
-          (user) => `
+        .map((user) => {
+          const link = getVlessLink(user);
+
+          return `
       <tr>
 
         <td>
@@ -912,8 +1312,10 @@ function usersPage(username) {
           ${escapeHtml(user.protocol.toUpperCase())}
         </td>
 
-        <td style="font-family:monospace;font-size:12px;">
-          ${escapeHtml(user.uuid)}
+        <td>
+          <div class="mono">
+            ${escapeHtml(user.uuid)}
+          </div>
         </td>
 
         <td>
@@ -939,33 +1341,51 @@ function usersPage(username) {
         </td>
 
         <td>
-          <form method="POST" action="/users/delete">
-            <input
-              type="hidden"
-              name="id"
-              value="${user.id}"
+          <div class="actions">
+
+            <a
+              href="/users/view?id=${user.id}"
+              class="btn"
+            >
+              Config
+            </a>
+
+            <form
+              method="POST"
+              action="/users/delete"
             >
 
-            <button
-              class="btn danger"
-              type="submit"
-              onclick="return confirm('Delete this user?')"
-            >
-              Delete
-            </button>
-          </form>
+              <input
+                type="hidden"
+                name="id"
+                value="${user.id}"
+              >
+
+              <button
+                class="btn danger"
+                type="submit"
+                onclick="return confirm('Delete this user?')"
+              >
+                Delete
+              </button>
+
+            </form>
+
+          </div>
         </td>
 
       </tr>
-    `
-        )
+    `;
+        })
         .join("")
     : `
       <tr>
         <td colspan="8">
+
           <div class="empty">
             No users yet.
           </div>
+
         </td>
       </tr>
     `;
@@ -1014,6 +1434,7 @@ function usersPage(username) {
         <table>
 
           <thead>
+
             <tr>
               <th>Username</th>
               <th>Protocol</th>
@@ -1024,6 +1445,7 @@ function usersPage(username) {
               <th>Status</th>
               <th>Action</th>
             </tr>
+
           </thead>
 
           <tbody>
@@ -1040,16 +1462,23 @@ function usersPage(username) {
   );
 }
 
-function newUserPage(username, error = "") {
+function userViewPage(username, user, error = "") {
+  const link = getVlessLink(user);
+
   return page(
-    "New User",
+    `User ${user.username}`,
     `
     <div class="hero">
-      <h1>New User</h1>
-      <p>Create a new VLESS user.</p>
+
+      <h1>${escapeHtml(user.username)}</h1>
+
+      <p>
+        VLESS connection configuration
+      </p>
+
     </div>
 
-    <div class="card form-card">
+    <div class="card">
 
       ${
         error
@@ -1057,79 +1486,310 @@ function newUserPage(username, error = "") {
           : ""
       }
 
-      <form method="POST" action="/users/new">
+      <div class="section-header">
+        <h2>VLESS TCP</h2>
 
-        <label>
-          Username
-        </label>
+        <span class="badge ${
+          user.status === "active"
+            ? "active"
+            : "disabled"
+        }">
+          ${escapeHtml(user.status)}
+        </span>
+      </div>
 
-        <input
-          type="text"
-          name="username"
-          placeholder="e.g. user01"
-          required
+      <label>
+        UUID
+      </label>
+
+      <div class="xray-box mono">
+        ${escapeHtml(user.uuid)}
+      </div>
+
+      <br>
+
+      <label>
+        Server
+      </label>
+
+      <div class="xray-box mono">
+        ${
+          getTcpDomain()
+            ? `${escapeHtml(getTcpDomain())}:${getTcpPort()}`
+            : "TCP Proxy not detected"
+        }
+      </div>
+
+      <br>
+
+      <label>
+        VLESS Link
+      </label>
+
+      ${
+        link
+          ? `
+          <div class="link-box">
+
+            <input
+              id="vlessLink"
+              type="text"
+              readonly
+              value="${escapeHtml(link)}"
+            >
+
+            <button
+              class="btn"
+              type="button"
+              onclick="copyLink()"
+            >
+              Copy
+            </button>
+
+          </div>
+
+          <p style="color:#7f8aa6;font-size:13px;">
+            Open the link with your VLESS client.
+          </p>
+          `
+          : `
+          <div class="error">
+            Railway TCP Proxy information was not detected.
+          </div>
+          `
+      }
+
+      <br>
+
+      <div class="actions">
+
+        <a
+          href="/users"
+          class="btn secondary"
         >
+          Back
+        </a>
 
-        <label>
-          Protocol
-        </label>
+      </div>
 
-        <select name="protocol">
-          <option value="vless">
-            VLESS
-          </option>
-        </select>
+    </div>
 
-        <label>
-          Traffic Limit (GB)
-        </label>
+    <script>
+      async function copyLink() {
+        const input =
+          document.getElementById("vlessLink");
 
-        <input
-          type="number"
-          name="traffic_limit_gb"
-          min="0"
-          step="0.1"
-          value="0"
-        >
+        if (!input) return;
 
-        <small style="display:block;color:#77829e;margin-top:-10px;margin-bottom:18px;">
-          0 = Unlimited
-        </small>
+        try {
+          await navigator.clipboard.writeText(
+            input.value
+          );
 
-        <label>
-          Expiry Date
-        </label>
+          alert("VLESS link copied.");
+        } catch {
+          input.select();
+          document.execCommand("copy");
+          alert("VLESS link copied.");
+        }
+      }
+    </script>
+    `,
+    username
+  );
+}
 
-        <input
-          type="date"
-          name="expires_at"
-        >
+function xrayPage(username) {
+  const xrayRunning = isXrayRunning();
 
-        <div class="actions">
+  const tcpDomain = getTcpDomain();
+  const tcpPort = getTcpPort();
 
-          <button
-            class="btn"
-            type="submit"
-          >
-            Create User
-          </button>
+  const activeCount = getXrayUsers().length;
 
-          <a
-            href="/users"
-            class="btn secondary"
-          >
-            Cancel
-          </a>
+  return page(
+    "Xray",
+    `
+    <div class="hero">
+
+      <h1>Xray Configuration</h1>
+
+      <p>
+        Automatic Xray management
+      </p>
+
+    </div>
+
+    <div class="grid">
+
+      <div class="card">
+
+        <div class="card-title">
+          Xray Status
+        </div>
+
+        <div class="card-value status">
+
+          <span class="dot ${
+            xrayRunning ? "" : "off"
+          }"></span>
+
+          ${xrayRunning ? "Running" : "Stopped"}
 
         </div>
 
-      </form>
+      </div>
+
+      <div class="card">
+
+        <div class="card-title">
+          Transport
+        </div>
+
+        <div class="card-value">
+          TCP
+        </div>
+
+      </div>
+
+      <div class="card">
+
+        <div class="card-title">
+          Internal Port
+        </div>
+
+        <div class="card-value">
+          ${XRAY_PORT}
+        </div>
+
+      </div>
+
+      <div class="card">
+
+        <div class="card-title">
+          Active Xray Users
+        </div>
+
+        <div class="card-value">
+          ${activeCount}
+        </div>
+
+      </div>
+
+    </div>
+
+    <div class="section">
+
+      <div class="card">
+
+        <h2>Connection Endpoint</h2>
+
+        ${
+          tcpDomain && tcpPort
+            ? `
+              <p class="mono">
+                ${escapeHtml(tcpDomain)}:${tcpPort}
+              </p>
+            `
+            : `
+              <p style="color:#ff8b9a;">
+                Railway TCP Proxy is not detected.
+              </p>
+            `
+        }
+
+      </div>
+
+    </div>
+
+    <div class="section">
+
+      <div class="card">
+
+        <h2>Automatic Sync</h2>
+
+        <p style="color:#8f9ab7;line-height:1.7;">
+          VergilPanel generates the Xray configuration
+          automatically from the Users database.
+          Creating or deleting a user automatically
+          synchronizes Xray.
+        </p>
+
+      </div>
+
+    </div>
+
+    <div class="section">
+
+      <div class="card">
+
+        <h2>Supported Transport</h2>
+
+        <div class="grid">
+
+          <div class="card">
+            <div class="card-title">
+              VLESS + TCP
+            </div>
+
+            <div class="card-value">
+              Enabled
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              WebSocket
+            </div>
+
+            <div class="card-value">
+              Next
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              XHTTP
+            </div>
+
+            <div class="card-value">
+              Next
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              Secure Transport
+            </div>
+
+            <div class="card-value">
+              Next
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+
+    </div>
+
+    <div class="section">
+
+      <a href="/dashboard" class="btn secondary">
+        ← Dashboard
+      </a>
 
     </div>
     `,
     username
   );
 }
+
+/*
+ * ---------------------------------------------------------
+ * REQUEST HANDLER
+ * ---------------------------------------------------------
+ */
 
 async function handleRequest(req, res) {
   const url = new URL(
@@ -1143,7 +1803,11 @@ async function handleRequest(req, res) {
   /*
    * HEALTH
    */
-  if (method === "GET" && path === "/health") {
+
+  if (
+    method === "GET" &&
+    path === "/health"
+  ) {
     send(
       res,
       200,
@@ -1153,6 +1817,41 @@ async function handleRequest(req, res) {
           service: "VergilPanel",
           version: VERSION,
           database: "sqlite",
+          xray: isXrayRunning(),
+          xrayPort: XRAY_PORT,
+          tcpProxyDomain: getTcpDomain() || null,
+          tcpProxyPort: getTcpPort() || null,
+        },
+        null,
+        2
+      ),
+      "application/json; charset=utf-8"
+    );
+
+    return;
+  }
+
+  /*
+   * XRAY STATUS API
+   */
+
+  if (
+    method === "GET" &&
+    path === "/api/xray/status"
+  ) {
+    send(
+      res,
+      200,
+      JSON.stringify(
+        {
+          ok: true,
+          running: isXrayRunning(),
+          port: XRAY_PORT,
+          activeUsers: getXrayUsers().length,
+          tcpProxy: {
+            domain: getTcpDomain() || null,
+            port: getTcpPort() || null,
+          },
         },
         null,
         2
@@ -1166,7 +1865,11 @@ async function handleRequest(req, res) {
   /*
    * SETUP STATUS
    */
-  if (method === "GET" && path === "/api/setup/status") {
+
+  if (
+    method === "GET" &&
+    path === "/api/setup/status"
+  ) {
     const admin = db
       .prepare("SELECT id FROM admins LIMIT 1")
       .get();
@@ -1186,7 +1889,11 @@ async function handleRequest(req, res) {
   /*
    * ROOT
    */
-  if (method === "GET" && path === "/") {
+
+  if (
+    method === "GET" &&
+    path === "/"
+  ) {
     const admin = db
       .prepare("SELECT id FROM admins LIMIT 1")
       .get();
@@ -1210,7 +1917,11 @@ async function handleRequest(req, res) {
   /*
    * SETUP GET
    */
-  if (method === "GET" && path === "/setup") {
+
+  if (
+    method === "GET" &&
+    path === "/setup"
+  ) {
     const admin = db
       .prepare("SELECT id FROM admins LIMIT 1")
       .get();
@@ -1227,7 +1938,11 @@ async function handleRequest(req, res) {
   /*
    * SETUP POST
    */
-  if (method === "POST" && path === "/setup") {
+
+  if (
+    method === "POST" &&
+    path === "/setup"
+  ) {
     const admin = db
       .prepare("SELECT id FROM admins LIMIT 1")
       .get();
@@ -1240,14 +1955,21 @@ async function handleRequest(req, res) {
     try {
       const body = await readBody(req);
 
-      const username = String(body.username || "").trim();
-      const password = String(body.password || "");
+      const username = String(
+        body.username || ""
+      ).trim();
+
+      const password = String(
+        body.password || ""
+      );
 
       if (!username || !password) {
         send(
           res,
           400,
-          setupPage("Username and password are required.")
+          setupPage(
+            "Username and password are required."
+          )
         );
 
         return;
@@ -1267,7 +1989,11 @@ async function handleRequest(req, res) {
 
       db.prepare(`
         INSERT INTO admins
-        (username, password_hash, created_at)
+        (
+          username,
+          password_hash,
+          created_at
+        )
         VALUES (?, ?, ?)
       `).run(
         username,
@@ -1283,7 +2009,9 @@ async function handleRequest(req, res) {
       send(
         res,
         500,
-        setupPage("Unable to complete setup.")
+        setupPage(
+          "Unable to complete setup."
+        )
       );
 
       return;
@@ -1293,7 +2021,11 @@ async function handleRequest(req, res) {
   /*
    * LOGIN GET
    */
-  if (method === "GET" && path === "/login") {
+
+  if (
+    method === "GET" &&
+    path === "/login"
+  ) {
     const admin = db
       .prepare("SELECT id FROM admins LIMIT 1")
       .get();
@@ -1317,12 +2049,21 @@ async function handleRequest(req, res) {
   /*
    * LOGIN POST
    */
-  if (method === "POST" && path === "/login") {
+
+  if (
+    method === "POST" &&
+    path === "/login"
+  ) {
     try {
       const body = await readBody(req);
 
-      const username = String(body.username || "").trim();
-      const password = String(body.password || "");
+      const username = String(
+        body.username || ""
+      ).trim();
+
+      const password = String(
+        body.password || ""
+      );
 
       const admin = db
         .prepare(`
@@ -1335,12 +2076,15 @@ async function handleRequest(req, res) {
 
       if (
         !admin ||
-        admin.password_hash !== hashPassword(password)
+        admin.password_hash !==
+          hashPassword(password)
       ) {
         send(
           res,
           401,
-          loginPage("Invalid username or password.")
+          loginPage(
+            "Invalid username or password."
+          )
         );
 
         return;
@@ -1350,9 +2094,13 @@ async function handleRequest(req, res) {
 
       res.writeHead(302, {
         Location: "/dashboard",
+
         "Set-Cookie": [
-          `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax`,
+          `vergil_session=${encodeURIComponent(
+            token
+          )}; HttpOnly; Path=/; SameSite=Lax`,
         ],
+
         "Cache-Control": "no-store",
       });
 
@@ -1375,13 +2123,19 @@ async function handleRequest(req, res) {
   /*
    * LOGOUT
    */
-  if (method === "POST" && path === "/logout") {
+
+  if (
+    method === "POST" &&
+    path === "/logout"
+  ) {
     deleteSession(req);
 
     res.writeHead(302, {
       Location: "/login",
+
       "Set-Cookie":
         "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax",
+
       "Cache-Control": "no-store",
     });
 
@@ -1393,7 +2147,11 @@ async function handleRequest(req, res) {
   /*
    * DASHBOARD
    */
-  if (method === "GET" && path === "/dashboard") {
+
+  if (
+    method === "GET" &&
+    path === "/dashboard"
+  ) {
     const session = requireAuth(req, res);
 
     if (!session) {
@@ -1410,9 +2168,36 @@ async function handleRequest(req, res) {
   }
 
   /*
+   * XRAY PAGE
+   */
+
+  if (
+    method === "GET" &&
+    path === "/xray"
+  ) {
+    const session = requireAuth(req, res);
+
+    if (!session) {
+      return;
+    }
+
+    send(
+      res,
+      200,
+      xrayPage(session.username)
+    );
+
+    return;
+  }
+
+  /*
    * USERS
    */
-  if (method === "GET" && path === "/users") {
+
+  if (
+    method === "GET" &&
+    path === "/users"
+  ) {
     const session = requireAuth(req, res);
 
     if (!session) {
@@ -1429,9 +2214,60 @@ async function handleRequest(req, res) {
   }
 
   /*
+   * USER VIEW
+   */
+
+  if (
+    method === "GET" &&
+    path === "/users/view"
+  ) {
+    const session = requireAuth(req, res);
+
+    if (!session) {
+      return;
+    }
+
+    const id = Number(url.searchParams.get("id"));
+
+    if (!Number.isInteger(id)) {
+      redirect(res, "/users");
+      return;
+    }
+
+    const user = db
+      .prepare(`
+        SELECT *
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+      `)
+      .get(id);
+
+    if (!user) {
+      redirect(res, "/users");
+      return;
+    }
+
+    send(
+      res,
+      200,
+      userViewPage(
+        session.username,
+        user
+      )
+    );
+
+    return;
+  }
+
+  /*
    * NEW USER GET
    */
-  if (method === "GET" && path === "/users/new") {
+
+  if (
+    method === "GET" &&
+    path === "/users/new"
+  ) {
     const session = requireAuth(req, res);
 
     if (!session) {
@@ -1450,7 +2286,11 @@ async function handleRequest(req, res) {
   /*
    * NEW USER POST
    */
-  if (method === "POST" && path === "/users/new") {
+
+  if (
+    method === "POST" &&
+    path === "/users/new"
+  ) {
     const session = requireAuth(req, res);
 
     if (!session) {
@@ -1460,7 +2300,10 @@ async function handleRequest(req, res) {
     try {
       const body = await readBody(req);
 
-      const username = String(body.username || "").trim();
+      const username = String(
+        body.username || ""
+      ).trim();
+
       const protocol = String(
         body.protocol || "vless"
       ).toLowerCase();
@@ -1573,7 +2416,25 @@ async function handleRequest(req, res) {
         new Date().toISOString()
       );
 
-      redirect(res, "/users");
+      const syncOk = await syncXray();
+
+      if (!syncOk) {
+        console.error(
+          `User ${username} created but Xray sync failed.`
+        );
+      }
+
+      redirect(res, `/users/view?id=${
+        db
+          .prepare(`
+            SELECT id
+            FROM users
+            WHERE uuid = ?
+            LIMIT 1
+          `)
+          .get(uuid).id
+      }`);
+
       return;
     } catch (error) {
       console.error(error);
@@ -1594,6 +2455,7 @@ async function handleRequest(req, res) {
   /*
    * DELETE USER
    */
+
   if (
     method === "POST" &&
     path === "/users/delete"
@@ -1618,6 +2480,14 @@ async function handleRequest(req, res) {
         "DELETE FROM users WHERE id = ?"
       ).run(id);
 
+      const syncOk = await syncXray();
+
+      if (!syncOk) {
+        console.error(
+          "User deleted but Xray sync failed."
+        );
+      }
+
       redirect(res, "/users");
       return;
     } catch (error) {
@@ -1636,6 +2506,7 @@ async function handleRequest(req, res) {
   /*
    * 404
    */
+
   send(
     res,
     404,
@@ -1643,10 +2514,13 @@ async function handleRequest(req, res) {
       "404",
       `
       <div class="hero">
+
         <h1>404</h1>
+
         <p>
           The page you are looking for does not exist.
         </p>
+
       </div>
 
       <a href="/" class="btn">
@@ -1657,12 +2531,21 @@ async function handleRequest(req, res) {
   );
 }
 
+/*
+ * ---------------------------------------------------------
+ * SERVER
+ * ---------------------------------------------------------
+ */
+
 const server = http.createServer(
   async (req, res) => {
     try {
       await handleRequest(req, res);
     } catch (error) {
-      console.error("Unhandled server error:", error);
+      console.error(
+        "Unhandled server error:",
+        error
+      );
 
       if (!res.headersSent) {
         send(
@@ -1677,12 +2560,66 @@ const server = http.createServer(
   }
 );
 
-server.listen(PORT, HOST, () => {
+server.listen(
+  PORT,
+  HOST,
+  async () => {
+    console.log(
+      `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
+    );
+
+    console.log(
+      `📦 Database: ${DB_PATH}`
+    );
+
+    console.log(
+      `⚙️ Xray binary: ${XRAY_PATH}`
+    );
+
+    console.log(
+      `⚙️ Xray internal port: ${XRAY_PORT}`
+    );
+
+    console.log(
+      `🌐 Railway TCP Proxy: ${
+        getTcpDomain() || "not detected"
+      }:${getTcpPort() || "?"}`
+    );
+
+    await syncXray();
+  }
+);
+
+/*
+ * ---------------------------------------------------------
+ * SHUTDOWN
+ * ---------------------------------------------------------
+ */
+
+async function shutdown(signal) {
   console.log(
-    `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
+    `Received ${signal}. Shutting down...`
   );
 
-  console.log(
-    `📦 Database: ${DB_PATH}`
-  );
-});
+  await stopXray();
+
+  db.close();
+
+  server.close(() => {
+    process.exit(0);
+  });
+}
+
+process.on(
+  "SIGTERM",
+  () => {
+    shutdown("SIGTERM");
+  }
+);
+
+process.on(
+  "SIGINT",
+  () => {
+    shutdown("SIGINT");
+  }
+);
