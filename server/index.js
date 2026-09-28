@@ -372,7 +372,10 @@ async function startXray() {
     });
 
     xrayProcess.on("error", error => {
-        console.error("❌ Xray process error:", error);
+        console.error(
+            "❌ Xray process error:",
+            error
+        );
     });
 
     xrayProcess.on("exit", (code, signal) => {
@@ -462,13 +465,17 @@ function layout(title, body) {
 <html lang="en">
 
 <head>
+
 <meta charset="utf-8">
+
 <meta
     name="viewport"
     content="width=device-width,initial-scale=1"
 >
 
-<title>${escapeHtml(title)} — VergilPanel</title>
+<title>
+${escapeHtml(title)} — VergilPanel
+</title>
 
 <style>
 
@@ -496,6 +503,7 @@ function layout(title, body) {
 
 body{
     margin:0;
+
     background:
         radial-gradient(
             circle at top right,
@@ -568,6 +576,7 @@ a{
     cursor:pointer;
 
     font-size:14px;
+
     transition:.2s;
 }
 
@@ -660,6 +669,7 @@ th{
 
 .badge{
     display:inline-flex;
+    align-items:center;
     padding:5px 9px;
     border-radius:999px;
     background:#202633;
@@ -749,17 +759,24 @@ pre.config{
 
 .qr-card{
     text-align:center;
+
     background:#0a0d13;
+
     border:1px solid var(--border);
+
     border-radius:15px;
+
     padding:18px;
 }
 
 .qr-card img{
     width:220px;
     max-width:100%;
+
     background:white;
+
     padding:8px;
+
     border-radius:12px;
 }
 
@@ -836,9 +853,13 @@ pre.config{
 .status-dot{
     width:9px;
     height:9px;
+
     border-radius:50%;
+
     display:inline-block;
+
     background:var(--red);
+
     margin-right:7px;
 }
 
@@ -849,8 +870,11 @@ pre.config{
 
 .login{
     min-height:100vh;
+
     display:grid;
+
     place-items:center;
+
     padding:20px;
 }
 
@@ -907,11 +931,15 @@ footer{
 }
 
 </style>
+
 </head>
 
 <body>
+
 ${body}
+
 </body>
+
 </html>
 `;
 }
@@ -938,9 +966,14 @@ ${
         : ""
 }
 
-<form method="POST" action="/login">
+<form
+    method="POST"
+    action="/login"
+>
 
-<label>Username</label>
+<label>
+Username
+</label>
 
 <input
     name="username"
@@ -948,7 +981,9 @@ ${
     autocomplete="username"
 >
 
-<label>Password</label>
+<label>
+Password
+</label>
 
 <input
     type="password"
@@ -977,6 +1012,7 @@ Login
 }
 
 function dashboardPage(req) {
+
     const users = allUsers();
     const active = activeUsers();
 
@@ -1005,7 +1041,10 @@ ${escapeHtml(
 )}
 </span>
 
-<a class="btn" href="/logout">
+<a
+    class="btn"
+    href="/logout"
+>
 Logout
 </a>
 
@@ -1028,9 +1067,12 @@ VLESS management powered by Xray
 <br>
 
 <span class="badge">
-<span class="status-dot ${
-    xrayOnline ? "online" : ""
-}"></span>
+
+<span
+    class="status-dot ${
+        xrayOnline ? "online" : ""
+    }"
+></span>
 
 Xray ${
     xrayOnline
@@ -1425,24 +1467,33 @@ Create User
 }
 
 async function configPage(req, user) {
-    const origin = getPublicOrigin(req);
 
-    const links = makeVlessLinks(
-        user,
-        origin
-    );
+    const origin =
+        getPublicOrigin(req);
+
+    const links =
+        makeVlessLinks(
+            user,
+            origin
+        );
 
     const subscriptionUrl =
         `${origin}/sub/${user.subscription_token}`;
 
     const xhttpQr =
-        await qrCode(links.xhttp);
+        await qrCode(
+            links.xhttp
+        );
 
     const wsQr =
-        await qrCode(links.websocket);
+        await qrCode(
+            links.websocket
+        );
 
     const subQr =
-        await qrCode(subscriptionUrl);
+        await qrCode(
+            subscriptionUrl
+        );
 
     return layout(
         `${user.username} Config`,
@@ -1638,37 +1689,40 @@ async function copyText(text){
     );
 }
 
-function setupComplete() {
-    return (
-        db
-            .prepare(
-                "SELECT COUNT(*) AS count FROM admins"
-            )
-            .get()
-            .count > 0
-    );
-}
+/*
+ * Default admin
+ *
+ * اگر Railway Variable وجود داشته باشد:
+ *
+ * ADMIN_USERNAME
+ * ADMIN_PASSWORD
+ *
+ * از آنها استفاده می‌شود.
+ *
+ * اگر وجود نداشته باشند:
+ *
+ * Username = admin
+ * Password = admin
+ */
 
 function ensureDefaultAdmin() {
+
     const username =
         String(
-            process.env.ADMIN_USERNAME || ""
+            process.env.ADMIN_USERNAME || "admin"
         ).trim();
 
     const password =
         String(
-            process.env.ADMIN_PASSWORD || ""
+            process.env.ADMIN_PASSWORD || "admin"
         );
 
-    if (!username || !password) {
-        return;
-    }
-
-    const existing = db.prepare(`
-        SELECT id
-        FROM admins
-        WHERE username = ?
-    `).get(username);
+    const existing =
+        db.prepare(`
+            SELECT id
+            FROM admins
+            WHERE username = ?
+        `).get(username);
 
     if (existing) {
 
@@ -1682,7 +1736,7 @@ function ensureDefaultAdmin() {
         );
 
         console.log(
-            `👤 Admin environment password synchronized: ${username}`
+            `👤 Admin ready: ${username}`
         );
 
         return;
@@ -1706,12 +1760,17 @@ function ensureDefaultAdmin() {
     );
 }
 
-function authenticate(username, password) {
-    const admin = db.prepare(`
-        SELECT *
-        FROM admins
-        WHERE username = ?
-    `).get(username);
+function authenticate(
+    username,
+    password
+) {
+
+    const admin =
+        db.prepare(`
+            SELECT *
+            FROM admins
+            WHERE username = ?
+        `).get(username);
 
     if (!admin) {
         return false;
@@ -1736,11 +1795,12 @@ async function createUser(form) {
         );
     }
 
-    const exists = db.prepare(`
-        SELECT id
-        FROM users
-        WHERE username = ?
-    `).get(username);
+    const exists =
+        db.prepare(`
+            SELECT id
+            FROM users
+            WHERE username = ?
+        `).get(username);
 
     if (exists) {
         throw new Error(
@@ -1886,13 +1946,22 @@ function proxyHttpToXray(
 ) {
 
     const options = {
-        hostname: "127.0.0.1",
-        port: targetPort,
-        path: req.url,
-        method: req.method,
+
+        hostname:
+            "127.0.0.1",
+
+        port:
+            targetPort,
+
+        path:
+            req.url,
+
+        method:
+            req.method,
 
         headers: {
             ...req.headers,
+
             host:
                 `127.0.0.1:${targetPort}`
         }
@@ -1949,8 +2018,11 @@ function proxyWebSocket(
 
     const upstream =
         net.connect({
-            host: "127.0.0.1",
-            port: XRAY_WS_PORT
+            host:
+                "127.0.0.1",
+
+            port:
+                XRAY_WS_PORT
         });
 
     upstream.on(
@@ -1965,7 +2037,9 @@ function proxyWebSocket(
 
             for (
                 const [key, value]
-                of Object.entries(req.headers)
+                of Object.entries(
+                    req.headers
+                )
             ) {
 
                 if (
@@ -2001,7 +2075,10 @@ function proxyWebSocket(
                 head &&
                 head.length
             ) {
-                upstream.write(head);
+
+                upstream.write(
+                    head
+                );
             }
 
             clientSocket.pipe(
@@ -2095,6 +2172,24 @@ async function subscriptionResponse(
         return;
     }
 
+    if (
+        user.expires_at &&
+        user.expires_at <= nowIso()
+    ) {
+
+        sendJson(
+            res,
+            {
+                ok: false,
+                error:
+                    "Subscription expired."
+            },
+            403
+        );
+
+        return;
+    }
+
     const origin =
         getPublicOrigin(req);
 
@@ -2111,10 +2206,7 @@ async function subscriptionResponse(
                 "text/plain; charset=utf-8",
 
             "Cache-Control":
-                "no-store",
-
-            "Profile-Update-Interval":
-                "24"
+                "no-store"
         }
     );
 
@@ -2191,12 +2283,16 @@ async function handleRequest(
                 res,
                 {
                     ok: true,
-                    panel: VERSION,
+
+                    panel:
+                        VERSION,
+
                     xray:
                         Boolean(
                             xrayProcess &&
                             !xrayProcess.killed
                         ),
+
                     transports: [
                         "xhttp",
                         "websocket"
@@ -2246,16 +2342,12 @@ async function handleRequest(
 
             const username =
                 String(
-                    form.get(
-                        "username"
-                    ) || ""
+                    form.get("username") || ""
                 ).trim();
 
             const password =
                 String(
-                    form.get(
-                        "password"
-                    ) || ""
+                    form.get("password") || ""
                 );
 
             if (
@@ -2300,215 +2392,6 @@ async function handleRequest(
             );
 
             res.end();
-
-            return;
-        }
-
-        /*
-         * Setup
-         */
-
-        if (
-            pathname === "/setup" &&
-            req.method === "GET"
-        ) {
-
-            if (
-                setupComplete()
-            ) {
-
-                redirect(
-                    res,
-                    "/login"
-                );
-
-                return;
-            }
-
-            sendHtml(
-                res,
-                `
-                ${layout(
-                    "Setup",
-                    `
-                    <div class="login">
-                    <div class="card">
-
-                    <div class="brand">
-                    ⚔️ Vergil<span>Panel</span>
-                    </div>
-
-                    <h2>
-                    Initial Setup
-                    </h2>
-
-                    <p class="muted">
-                    Create the first administrator account.
-                    </p>
-
-                    <form
-                        method="POST"
-                        action="/setup"
-                    >
-
-                    <label>
-                    Username
-                    </label>
-
-                    <input
-                        name="username"
-                        required
-                        value="admin"
-                    >
-
-                    <label>
-                    Password
-                    </label>
-
-                    <input
-                        type="password"
-                        name="password"
-                        required
-                        minlength="6"
-                    >
-
-                    <label>
-                    Confirm Password
-                    </label>
-
-                    <input
-                        type="password"
-                        name="confirm"
-                        required
-                        minlength="6"
-                    >
-
-                    <br><br>
-
-                    <button
-                        class="btn primary"
-                        type="submit"
-                        style="width:100%"
-                    >
-                    Create Panel
-                    </button>
-
-                    </form>
-
-                    </div>
-                    </div>
-                    `
-                )}
-                `
-            );
-
-            return;
-        }
-
-        if (
-            pathname === "/setup" &&
-            req.method === "POST"
-        ) {
-
-            if (
-                setupComplete()
-            ) {
-
-                redirect(
-                    res,
-                    "/login"
-                );
-
-                return;
-            }
-
-            const form =
-                await readForm(req);
-
-            const username =
-                String(
-                    form.get(
-                        "username"
-                    ) || ""
-                ).trim();
-
-            const password =
-                String(
-                    form.get(
-                        "password"
-                    ) || ""
-                );
-
-            const confirm =
-                String(
-                    form.get(
-                        "confirm"
-                    ) || ""
-                );
-
-            if (
-                !username ||
-                !password
-            ) {
-
-                sendHtml(
-                    res,
-                    loginPage(
-                        "Username and password are required."
-                    ),
-                    400
-                );
-
-                return;
-            }
-
-            if (
-                password.length < 6
-            ) {
-
-                sendHtml(
-                    res,
-                    loginPage(
-                        "Password must contain at least 6 characters."
-                    ),
-                    400
-                );
-
-                return;
-            }
-
-            if (
-                password !== confirm
-            ) {
-
-                sendHtml(
-                    res,
-                    loginPage(
-                        "Passwords do not match."
-                    ),
-                    400
-                );
-
-                return;
-            }
-
-            db.prepare(`
-                INSERT INTO admins(
-                    username,
-                    password_hash,
-                    created_at
-                )
-                VALUES (?, ?, ?)
-            `).run(
-                username,
-                hashPassword(password),
-                nowIso()
-            );
-
-            redirect(
-                res,
-                "/login"
-            );
 
             return;
         }
@@ -2673,10 +2556,18 @@ async function handleRequest(
                         `
                         <div class="container">
                         <div class="card">
-                        <h1>User not found</h1>
-                        <a class="btn" href="/dashboard">
+
+                        <h1>
+                        User not found
+                        </h1>
+
+                        <a
+                            class="btn"
+                            href="/dashboard"
+                        >
                         Dashboard
                         </a>
+
                         </div>
                         </div>
                         `
@@ -2772,12 +2663,19 @@ async function handleRequest(
                 "404",
                 `
                 <div class="container">
+
                 <div class="card">
-                <h1>404</h1>
+
+                <h1>
+                404
+                </h1>
+
                 <p class="muted">
                 Not Found
                 </p>
+
                 </div>
+
                 </div>
                 `
             ),
@@ -2807,6 +2705,10 @@ async function handleRequest(
         }
     }
 }
+
+/*
+ * HTTP Server
+ */
 
 const server =
     http.createServer(
@@ -2854,6 +2756,10 @@ server.on(
     }
 );
 
+/*
+ * Start
+ */
+
 ensureDefaultAdmin();
 
 await startXray();
@@ -2884,6 +2790,10 @@ server.listen(
 
         console.log(
             `🌐 WebSocket path: ${WS_PATH}`
+        );
+
+        console.log(
+            `👤 Default login: admin / admin`
         );
 
         console.log(
