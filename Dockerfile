@@ -1,17 +1,38 @@
-FROM node:22-alpine
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --omit=dev
+# Install tools required to download and run Xray
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       curl \
+       unzip \
+    && rm -rf /var/lib/apt/lists/*
 
+# Install Node dependencies
+COPY package*.json ./
+RUN npm install
+
+# Copy application
 COPY server ./server
 
-ENV NODE_ENV=production
-ENV DATA_DIR=/app/data
+# Download Xray
+RUN mkdir -p /opt/xray \
+    && curl -L \
+       https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
+       -o /tmp/xray.zip \
+    && unzip /tmp/xray.zip -d /opt/xray \
+    && chmod +x /opt/xray/xray \
+    && rm /tmp/xray.zip
 
-RUN mkdir -p /app/data
+# Copy Xray configuration
+COPY xray ./xray
 
+# Railway HTTP port
 EXPOSE 8080
 
-CMD ["node", "server/index.js"]
+# Xray TCP port
+EXPOSE 2053
+
+CMD ["sh", "-c", "/opt/xray/xray run -config /app/xray/config.json & exec node server/index.js"]
