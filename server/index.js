@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 import net from "node:net";
 import Database from "better-sqlite3";
+import QRCode from "qrcode";
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = "0.0.0.0";
@@ -12,18 +13,26 @@ const DATA_DIR = process.env.DATA_DIR || "/app/data";
 const DB_PATH = `${DATA_DIR}/vergilpanel.db`;
 
 const XRAY_BIN = process.env.XRAY_BIN || "/opt/xray/xray";
-const XRAY_CONFIG = process.env.XRAY_CONFIG || "/app/xray/generated-config.json";
+const XRAY_CONFIG =
+    process.env.XRAY_CONFIG || "/app/xray/generated-config.json";
 
-const XRAY_XHTTP_PORT = Number(process.env.XRAY_XHTTP_PORT || 10001);
-const XRAY_WS_PORT = Number(process.env.XRAY_WS_PORT || 10002);
+const XRAY_XHTTP_PORT =
+    Number(process.env.XRAY_XHTTP_PORT || 10001);
 
-const XHTTP_PATH = process.env.XHTTP_PATH || "/xhttp";
-const WS_PATH = process.env.WS_PATH || "/ws";
+const XRAY_WS_PORT =
+    Number(process.env.XRAY_WS_PORT || 10002);
 
-const VERSION = "0.6.0";
+const XHTTP_PATH =
+    process.env.XHTTP_PATH || "/xhttp";
+
+const WS_PATH =
+    process.env.WS_PATH || "/ws";
+
+const VERSION = "0.7.0";
 
 let xrayProcess = null;
 let stoppingXray = false;
+let xrayRestarting = false;
 
 const sessions = new Map();
 
@@ -63,7 +72,7 @@ function hashPassword(password) {
         .digest("hex");
 }
 
-function randomToken(bytes = 24) {
+function randomToken(bytes = 32) {
     return crypto.randomBytes(bytes).toString("hex");
 }
 
@@ -92,7 +101,11 @@ function parseCookies(req) {
         const key = part.slice(0, index).trim();
         const value = part.slice(index + 1).trim();
 
-        result[key] = decodeURIComponent(value);
+        try {
+            result[key] = decodeURIComponent(value);
+        } catch {
+            result[key] = value;
+        }
     }
 
     return result;
@@ -108,6 +121,15 @@ function getSession(req) {
     return sessions.get(cookies.vergil_session) || null;
 }
 
+function redirect(res, location) {
+    res.writeHead(302, {
+        Location: location,
+        "Cache-Control": "no-store"
+    });
+
+    res.end();
+}
+
 function requireAuth(req, res) {
     const session = getSession(req);
 
@@ -117,15 +139,6 @@ function requireAuth(req, res) {
     }
 
     return session;
-}
-
-function redirect(res, location) {
-    res.writeHead(302, {
-        Location: location,
-        "Cache-Control": "no-store"
-    });
-
-    res.end();
 }
 
 function sendHtml(res, html, status = 200) {
@@ -154,13 +167,12 @@ async function readBody(req) {
             body += chunk;
 
             if (body.length > 1024 * 1024) {
-                req.destroy();
                 reject(new Error("Request body too large"));
+                req.destroy();
             }
         });
 
         req.on("end", () => resolve(body));
-
         req.on("error", reject);
     });
 }
@@ -170,14 +182,20 @@ async function readForm(req) {
     return new URLSearchParams(body);
 }
 
-function getPublicOrigin(req) {
+function getPublicHost(req) {
     const forwardedHost =
         req.headers["x-forwarded-host"] ||
-        req.headers.host ||
         process.env.RAILWAY_PUBLIC_DOMAIN ||
+        req.headers.host ||
         "localhost:8080";
 
-    const host = String(forwardedHost).split(",")[0].trim();
+    return String(forwardedHost)
+        .split(",")[0]
+        .trim();
+}
+
+function getPublicOrigin(req) {
+    const host = getPublicHost(req);
 
     if (
         host.startsWith("localhost") ||
@@ -188,16 +206,6 @@ function getPublicOrigin(req) {
     }
 
     return `https://${host}`;
-}
-
-function getPublicDomain(req) {
-    const forwardedHost =
-        req.headers["x-forwarded-host"] ||
-        process.env.RAILWAY_PUBLIC_DOMAIN ||
-        req.headers.host ||
-        "localhost";
-
-    return String(forwardedHost).split(",")[0].trim();
 }
 
 function activeUsers() {
@@ -240,13 +248,16 @@ function generateXrayConfig() {
                 listen: "127.0.0.1",
                 port: XRAY_XHTTP_PORT,
                 protocol: "vless",
+
                 settings: {
                     clients,
                     decryption: "none"
                 },
+
                 streamSettings: {
                     network: "xhttp",
                     security: "none",
+
                     xhttpSettings: {
                         path: XHTTP_PATH,
                         mode: "auto"
@@ -258,13 +269,16 @@ function generateXrayConfig() {
                 listen: "127.0.0.1",
                 port: XRAY_WS_PORT,
                 protocol: "vless",
+
                 settings: {
                     clients,
                     decryption: "none"
                 },
+
                 streamSettings: {
                     network: "websocket",
                     security: "none",
+
                     wsSettings: {
                         path: WS_PATH
                     }
@@ -274,8 +288,7 @@ function generateXrayConfig() {
 
         outbounds: [
             {
-                protocol: "freedom",
-                settings: {}
+                protocol: "freedom"
             }
         ]
     };
@@ -331,8 +344,12 @@ async function startXray() {
     await writeXrayConfig();
 
     console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
-    console.log(`⚔️ Starting Xray XHTTP on 127.0.0.1:${XRAY_XHTTP_PORT}`);
-    console.log(`⚔️ Starting Xray WebSocket on 127.0.0.1:${XRAY_WS_PORT}`);
+    console.log(
+        `⚔️ XHTTP: 127.0.0.1:${XRAY_XHTTP_PORT}${XHTTP_PATH}`
+    );
+    console.log(
+        `🌐 WebSocket: 127.0.0.1:${XRAY_WS_PORT}${WS_PATH}`
+    );
 
     xrayProcess = spawn(
         XRAY_BIN,
@@ -363,10 +380,15 @@ async function startXray() {
             `⚠️ Xray exited. code=${code} signal=${signal}`
         );
 
-        if (!stoppingXray) {
+        xrayProcess = null;
+
+        if (!stoppingXray && !xrayRestarting) {
             setTimeout(() => {
                 startXray().catch(error => {
-                    console.error("❌ Xray restart failed:", error);
+                    console.error(
+                        "❌ Xray restart failed:",
+                        error
+                    );
                 });
             }, 1500);
         }
@@ -374,8 +396,18 @@ async function startXray() {
 }
 
 async function restartXray() {
-    await stopXray();
-    await startXray();
+    if (xrayRestarting) {
+        return;
+    }
+
+    xrayRestarting = true;
+
+    try {
+        await stopXray();
+        await startXray();
+    } finally {
+        xrayRestarting = false;
+    }
 }
 
 function makeVlessLinks(user, origin) {
@@ -416,101 +448,216 @@ function makeSubscription(user, origin) {
     ).toString("base64");
 }
 
-function layout(title, body, extraHead = "") {
+async function qrCode(text) {
+    return QRCode.toDataURL(text, {
+        width: 260,
+        margin: 2,
+        errorCorrectionLevel: "M"
+    });
+}
+
+function layout(title, body) {
     return `
 <!doctype html>
 <html lang="en">
+
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+>
+
 <title>${escapeHtml(title)} — VergilPanel</title>
-${extraHead}
+
 <style>
+
 :root{
     color-scheme:dark;
-    --bg:#080a0f;
-    --card:#11151d;
-    --card2:#171c26;
-    --border:#252c38;
+
+    --bg:#06070b;
+    --card:#0e1118;
+    --card2:#151923;
+    --border:#252b38;
+
     --text:#f5f7fb;
-    --muted:#8d98a8;
-    --accent:#7c5cff;
+    --muted:#8e98a9;
+
+    --accent:#7857ff;
+    --accent2:#9a7cff;
+
     --green:#35d07f;
-    --red:#ff5d6c;
+    --red:#ff596b;
 }
-*{box-sizing:border-box}
+
+*{
+    box-sizing:border-box;
+}
+
 body{
     margin:0;
-    background:var(--bg);
+    background:
+        radial-gradient(
+            circle at top right,
+            rgba(120,87,255,.14),
+            transparent 35%
+        ),
+        var(--bg);
+
     color:var(--text);
-    font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+
+    font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
 }
-a{color:inherit;text-decoration:none}
-.container{max-width:1200px;margin:auto;padding:24px}
+
+a{
+    color:inherit;
+    text-decoration:none;
+}
+
+.container{
+    max-width:1250px;
+    margin:auto;
+    padding:24px;
+}
+
 .nav{
     display:flex;
     align-items:center;
     justify-content:space-between;
-    margin-bottom:28px;
+    gap:15px;
+    margin-bottom:25px;
 }
+
 .brand{
-    font-size:22px;
-    font-weight:800;
+    font-size:23px;
+    font-weight:900;
+    letter-spacing:-.5px;
 }
-.brand span{color:var(--accent)}
-.nav-right{display:flex;gap:12px;align-items:center}
+
+.brand span{
+    color:var(--accent2);
+}
+
+.nav-right{
+    display:flex;
+    gap:10px;
+    align-items:center;
+}
+
 .btn{
     display:inline-flex;
     align-items:center;
     justify-content:center;
+
     padding:10px 15px;
+
     border-radius:10px;
+
     border:1px solid var(--border);
+
     background:var(--card2);
+
     color:var(--text);
+
     cursor:pointer;
+
     font-size:14px;
+    transition:.2s;
 }
+
+.btn:hover{
+    transform:translateY(-1px);
+    border-color:#454d60;
+}
+
 .btn.primary{
     background:var(--accent);
     border-color:var(--accent);
 }
+
 .btn.danger{
-    color:#fff;
-    background:#34151b;
-    border-color:#56202a;
+    background:#32131a;
+    border-color:#56212b;
 }
+
 .grid{
     display:grid;
     grid-template-columns:repeat(4,1fr);
-    gap:16px;
+    gap:15px;
 }
+
 .card{
-    background:var(--card);
+    background:
+        linear-gradient(
+            145deg,
+            rgba(255,255,255,.025),
+            transparent
+        ),
+        var(--card);
+
     border:1px solid var(--border);
-    border-radius:16px;
+
+    border-radius:17px;
+
     padding:20px;
+
+    box-shadow:
+        0 12px 40px rgba(0,0,0,.18);
 }
-.stat-label{color:var(--muted);font-size:13px}
-.stat-value{font-size:30px;font-weight:800;margin-top:8px}
-h1{font-size:28px;margin:0 0 8px}
-h2{font-size:20px}
-.muted{color:var(--muted)}
+
+.stat-label{
+    color:var(--muted);
+    font-size:13px;
+}
+
+.stat-value{
+    font-size:30px;
+    font-weight:900;
+    margin-top:8px;
+}
+
+h1{
+    font-size:28px;
+    margin:0 0 8px;
+}
+
+h2{
+    font-size:19px;
+}
+
+.muted{
+    color:var(--muted);
+}
+
 .table-wrap{
     overflow:auto;
     margin-top:18px;
 }
+
 table{
     width:100%;
     border-collapse:collapse;
 }
-th,td{
+
+th,
+td{
     padding:14px 12px;
     text-align:left;
     border-bottom:1px solid var(--border);
     white-space:nowrap;
 }
-th{color:var(--muted);font-size:12px}
+
+th{
+    color:var(--muted);
+    font-size:12px;
+}
+
 .badge{
     display:inline-flex;
     padding:5px 9px;
@@ -518,67 +665,250 @@ th{color:var(--muted);font-size:12px}
     background:#202633;
     font-size:12px;
 }
-.badge.green{background:#123522;color:#68e9a2}
-.badge.red{background:#39171c;color:#ff8b96}
-.actions{display:flex;gap:8px}
+
+.badge.green{
+    background:#123522;
+    color:#68e9a2;
+}
+
+.badge.red{
+    background:#39171c;
+    color:#ff8b96;
+}
+
+.actions{
+    display:flex;
+    gap:8px;
+}
+
 .form{
     max-width:520px;
 }
+
 label{
     display:block;
     margin:16px 0 7px;
     color:var(--muted);
     font-size:13px;
 }
-input,select{
+
+input,
+select{
     width:100%;
     padding:13px;
-    background:#0b0e14;
+
+    background:#090c12;
+
     color:var(--text);
+
     border:1px solid var(--border);
+
     border-radius:10px;
+
     outline:none;
 }
-input:focus,select:focus{
+
+input:focus,
+select:focus{
     border-color:var(--accent);
 }
+
 .notice{
     padding:14px;
+
     border-radius:12px;
-    background:#151a23;
+
+    background:#141923;
+
     border:1px solid var(--border);
+
     margin-bottom:18px;
 }
+
 pre.config{
     white-space:pre-wrap;
     word-break:break-all;
-    background:#090c11;
+
+    background:#080a0f;
+
     border:1px solid var(--border);
+
     padding:14px;
+
     border-radius:10px;
+
+    font-size:12px;
 }
+
+.qr-grid{
+    display:grid;
+    grid-template-columns:repeat(2,1fr);
+    gap:18px;
+    margin-top:18px;
+}
+
+.qr-card{
+    text-align:center;
+    background:#0a0d13;
+    border:1px solid var(--border);
+    border-radius:15px;
+    padding:18px;
+}
+
+.qr-card img{
+    width:220px;
+    max-width:100%;
+    background:white;
+    padding:8px;
+    border-radius:12px;
+}
+
+.hero{
+    position:relative;
+    overflow:hidden;
+
+    min-height:280px;
+
+    border-radius:20px;
+
+    border:1px solid var(--border);
+
+    margin-bottom:20px;
+
+    background:
+        radial-gradient(
+            circle at 80% 30%,
+            rgba(120,87,255,.3),
+            transparent 30%
+        ),
+        linear-gradient(
+            110deg,
+            #080a10,
+            #111326
+        );
+}
+
+.hero-content{
+    position:relative;
+    z-index:2;
+
+    padding:35px;
+
+    max-width:600px;
+}
+
+.hero-title{
+    font-size:42px;
+    font-weight:950;
+    letter-spacing:-2px;
+    margin-bottom:10px;
+}
+
+.hero-sub{
+    color:var(--muted);
+    font-size:15px;
+}
+
+.hero-sword{
+    position:absolute;
+
+    right:-30px;
+    bottom:-100px;
+
+    width:55%;
+    height:320px;
+
+    transform:rotate(-18deg);
+
+    background:
+        linear-gradient(
+            90deg,
+            transparent 0%,
+            rgba(150,120,255,.05) 35%,
+            rgba(150,120,255,.45) 50%,
+            rgba(150,120,255,.04) 65%,
+            transparent 100%
+        );
+
+    filter:blur(2px);
+}
+
+.status-dot{
+    width:9px;
+    height:9px;
+    border-radius:50%;
+    display:inline-block;
+    background:var(--red);
+    margin-right:7px;
+}
+
+.status-dot.online{
+    background:var(--green);
+    box-shadow:0 0 12px var(--green);
+}
+
 .login{
     min-height:100vh;
     display:grid;
     place-items:center;
     padding:20px;
 }
-.login .card{width:min(420px,100%)}
-.small{font-size:12px}
+
+.login .card{
+    width:min(420px,100%);
+}
+
+.small{
+    font-size:12px;
+}
+
 footer{
     text-align:center;
     color:var(--muted);
     padding:30px 0 10px;
 }
-@media(max-width:800px){
-    .grid{grid-template-columns:repeat(2,1fr)}
+
+@media(max-width:850px){
+
+    .grid{
+        grid-template-columns:repeat(2,1fr);
+    }
+
+    .qr-grid{
+        grid-template-columns:1fr;
+    }
+
+    .hero-title{
+        font-size:34px;
+    }
 }
+
 @media(max-width:520px){
-    .container{padding:15px}
-    .grid{grid-template-columns:1fr}
+
+    .container{
+        padding:15px;
+    }
+
+    .grid{
+        grid-template-columns:1fr;
+    }
+
+    .hero-content{
+        padding:25px;
+    }
+
+    .hero-sword{
+        opacity:.35;
+    }
+
+    .nav{
+        align-items:flex-start;
+    }
 }
+
 </style>
 </head>
+
 <body>
 ${body}
 </body>
@@ -591,25 +921,56 @@ function loginPage(error = "") {
         "Login",
         `
 <div class="login">
+
 <div class="card">
-    <div class="brand">⚔️ Vergil<span>Panel</span></div>
-    <p class="muted">Sign in to your panel</p>
 
-    ${error ? `<div class="notice">${escapeHtml(error)}</div>` : ""}
-
-    <form method="POST" action="/login">
-        <label>Username</label>
-        <input name="username" required autocomplete="username">
-
-        <label>Password</label>
-        <input type="password" name="password" required autocomplete="current-password">
-
-        <br><br>
-        <button class="btn primary" type="submit" style="width:100%">
-            Login
-        </button>
-    </form>
+<div class="brand">
+⚔️ Vergil<span>Panel</span>
 </div>
+
+<p class="muted">
+Sign in to your panel
+</p>
+
+${
+    error
+        ? `<div class="notice">${escapeHtml(error)}</div>`
+        : ""
+}
+
+<form method="POST" action="/login">
+
+<label>Username</label>
+
+<input
+    name="username"
+    required
+    autocomplete="username"
+>
+
+<label>Password</label>
+
+<input
+    type="password"
+    name="password"
+    required
+    autocomplete="current-password"
+>
+
+<br><br>
+
+<button
+    class="btn primary"
+    type="submit"
+    style="width:100%"
+>
+Login
+</button>
+
+</form>
+
+</div>
+
 </div>
 `
     );
@@ -619,128 +980,335 @@ function dashboardPage(req) {
     const users = allUsers();
     const active = activeUsers();
 
+    const xrayOnline =
+        Boolean(
+            xrayProcess &&
+            !xrayProcess.killed
+        );
+
     return layout(
         "Dashboard",
         `
 <div class="container">
 
 <div class="nav">
-    <div class="brand">⚔️ Vergil<span>Panel</span></div>
-    <div class="nav-right">
-        <span class="muted">${escapeHtml(getSession(req)?.username || "admin")}</span>
-        <a class="btn" href="/logout">Logout</a>
-    </div>
+
+<div class="brand">
+⚔️ Vergil<span>Panel</span>
+</div>
+
+<div class="nav-right">
+
+<span class="muted">
+${escapeHtml(
+    getSession(req)?.username || "admin"
+)}
+</span>
+
+<a class="btn" href="/logout">
+Logout
+</a>
+
+</div>
+
+</div>
+
+<div class="hero">
+
+<div class="hero-content">
+
+<div class="hero-title">
+VERGILPANEL
+</div>
+
+<div class="hero-sub">
+VLESS management powered by Xray
+</div>
+
+<br>
+
+<span class="badge">
+<span class="status-dot ${
+    xrayOnline ? "online" : ""
+}"></span>
+
+Xray ${
+    xrayOnline
+        ? "Online"
+        : "Offline"
+}
+
+</span>
+
+</div>
+
+<div class="hero-sword"></div>
+
 </div>
 
 <div class="grid">
-    <div class="card">
-        <div class="stat-label">Users</div>
-        <div class="stat-value">${users.length}</div>
-    </div>
 
-    <div class="card">
-        <div class="stat-label">Active Users</div>
-        <div class="stat-value">${active.length}</div>
-    </div>
+<div class="card">
 
-    <div class="card">
-        <div class="stat-label">Transport</div>
-        <div class="stat-value" style="font-size:20px">XHTTP + WS</div>
-    </div>
+<div class="stat-label">
+Users
+</div>
 
-    <div class="card">
-        <div class="stat-label">Version</div>
-        <div class="stat-value" style="font-size:20px">v${VERSION}</div>
-    </div>
+<div class="stat-value">
+${users.length}
+</div>
+
+</div>
+
+<div class="card">
+
+<div class="stat-label">
+Active Users
+</div>
+
+<div class="stat-value">
+${active.length}
+</div>
+
+</div>
+
+<div class="card">
+
+<div class="stat-label">
+Transport
+</div>
+
+<div
+    class="stat-value"
+    style="font-size:20px"
+>
+XHTTP + WS
+</div>
+
+</div>
+
+<div class="card">
+
+<div class="stat-label">
+Version
+</div>
+
+<div
+    class="stat-value"
+    style="font-size:20px"
+>
+v${VERSION}
+</div>
+
+</div>
+
 </div>
 
 <br>
 
 <div class="card">
-    <div style="display:flex;justify-content:space-between;gap:15px;align-items:center">
-        <div>
-            <h2>Users</h2>
-            <div class="muted">Automatic Xray configuration</div>
-        </div>
 
-        <a class="btn primary" href="/users/new">＋ New User</a>
-    </div>
+<div
+    style="
+    display:flex;
+    justify-content:space-between;
+    gap:15px;
+    align-items:center
+    "
+>
 
-    <div class="table-wrap">
-    <table>
-        <thead>
-            <tr>
-                <th>Username</th>
-                <th>Protocol</th>
-                <th>UUID</th>
-                <th>Status</th>
-                <th>Configs</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
+<div>
 
-        <tbody>
-        ${
-            users.length
-                ? users.map(user => `
-            <tr>
-                <td><strong>${escapeHtml(user.username)}</strong></td>
-                <td><span class="badge">VLESS</span></td>
-                <td class="small">${escapeHtml(user.uuid)}</td>
-                <td>
-                    ${
-                        user.status === "active"
-                            ? `<span class="badge green">Active</span>`
-                            : `<span class="badge red">Disabled</span>`
-                    }
-                </td>
-                <td>
-                    <a class="btn" href="/users/config?id=${user.id}">
-                        Config
-                    </a>
-                </td>
-                <td>
-                    <div class="actions">
-                        ${
-                            user.status === "active"
-                                ? `
-                                <form method="POST" action="/users/toggle">
-                                    <input type="hidden" name="id" value="${user.id}">
-                                    <button class="btn" type="submit">Disable</button>
-                                </form>
-                                `
-                                : `
-                                <form method="POST" action="/users/toggle">
-                                    <input type="hidden" name="id" value="${user.id}">
-                                    <button class="btn" type="submit">Enable</button>
-                                </form>
-                                `
-                        }
+<h2>
+Users
+</h2>
 
-                        <form method="POST" action="/users/delete"
-                              onsubmit="return confirm('Delete this user?')">
-                            <input type="hidden" name="id" value="${user.id}">
-                            <button class="btn danger" type="submit">Delete</button>
-                        </form>
-                    </div>
-                </td>
-            </tr>
-            `).join("")
-                : `
-            <tr>
-                <td colspan="6" class="muted">
-                    No users yet.
-                </td>
-            </tr>
-            `
-        }
-        </tbody>
-    </table>
-    </div>
+<div class="muted">
+Automatic Xray configuration
+</div>
+
+</div>
+
+<a
+    class="btn primary"
+    href="/users/new"
+>
+＋ New User
+</a>
+
+</div>
+
+<div class="table-wrap">
+
+<table>
+
+<thead>
+
+<tr>
+
+<th>
+Username
+</th>
+
+<th>
+Protocol
+</th>
+
+<th>
+UUID
+</th>
+
+<th>
+Status
+</th>
+
+<th>
+Configs
+</th>
+
+<th>
+Actions
+</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+${
+    users.length
+        ? users.map(user => `
+
+<tr>
+
+<td>
+<strong>
+${escapeHtml(user.username)}
+</strong>
+</td>
+
+<td>
+<span class="badge">
+VLESS
+</span>
+</td>
+
+<td class="small">
+${escapeHtml(user.uuid)}
+</td>
+
+<td>
+
+${
+    user.status === "active"
+        ? `
+<span class="badge green">
+Active
+</span>
+`
+        : `
+<span class="badge red">
+Disabled
+</span>
+`
+}
+
+</td>
+
+<td>
+
+<a
+    class="btn"
+    href="/users/config?id=${user.id}"
+>
+Config
+</a>
+
+</td>
+
+<td>
+
+<div class="actions">
+
+<form
+    method="POST"
+    action="/users/toggle"
+>
+
+<input
+    type="hidden"
+    name="id"
+    value="${user.id}"
+>
+
+<button
+    class="btn"
+    type="submit"
+>
+
+${
+    user.status === "active"
+        ? "Disable"
+        : "Enable"
+}
+
+</button>
+
+</form>
+
+<form
+    method="POST"
+    action="/users/delete"
+    onsubmit="return confirm('Delete this user?')"
+>
+
+<input
+    type="hidden"
+    name="id"
+    value="${user.id}"
+>
+
+<button
+    class="btn danger"
+    type="submit"
+>
+Delete
+</button>
+
+</form>
+
+</div>
+
+</td>
+
+</tr>
+
+`).join("")
+        : `
+<tr>
+
+<td
+    colspan="6"
+    class="muted"
+>
+No users yet.
+</td>
+
+</tr>
+`
+}
+
+</tbody>
+
+</table>
+
+</div>
+
 </div>
 
 <footer>
-    VergilPanel v${VERSION} · Xray automatic management
+VergilPanel v${VERSION} · Xray automatic management
 </footer>
 
 </div>
@@ -755,54 +1323,100 @@ function newUserPage(error = "") {
 <div class="container">
 
 <div class="nav">
-    <div class="brand">⚔️ Vergil<span>Panel</span></div>
-    <a class="btn" href="/dashboard">← Dashboard</a>
+
+<div class="brand">
+⚔️ Vergil<span>Panel</span>
+</div>
+
+<a
+    class="btn"
+    href="/dashboard"
+>
+← Dashboard
+</a>
+
 </div>
 
 <div class="card form">
-    <h1>New User</h1>
-    <p class="muted">
-        The UUID and subscription token will be generated automatically.
-    </p>
 
-    ${
-        error
-            ? `<div class="notice">${escapeHtml(error)}</div>`
-            : ""
-    }
+<h1>
+New User
+</h1>
 
-    <form method="POST" action="/users/new">
+<p class="muted">
+UUID and subscription token are generated automatically.
+</p>
 
-        <label>Username</label>
-        <input
-            name="username"
-            required
-            maxlength="64"
-            placeholder="Vexa"
-        >
+${
+    error
+        ? `<div class="notice">${escapeHtml(error)}</div>`
+        : ""
+}
 
-        <label>Traffic Limit</label>
-        <select name="traffic_limit">
-            <option value="0">Unlimited</option>
-            <option value="10737418240">10 GB</option>
-            <option value="53687091200">50 GB</option>
-            <option value="107374182400">100 GB</option>
-            <option value="536870912000">500 GB</option>
-        </select>
+<form
+    method="POST"
+    action="/users/new"
+>
 
-        <label>Expiry</label>
-        <input
-            type="datetime-local"
-            name="expires_at"
-        >
+<label>
+Username
+</label>
 
-        <br><br>
+<input
+    name="username"
+    required
+    maxlength="64"
+    placeholder="Vexa"
+>
 
-        <button class="btn primary" type="submit">
-            Create User
-        </button>
+<label>
+Traffic Limit
+</label>
 
-    </form>
+<select name="traffic_limit">
+
+<option value="0">
+Unlimited
+</option>
+
+<option value="10737418240">
+10 GB
+</option>
+
+<option value="53687091200">
+50 GB
+</option>
+
+<option value="107374182400">
+100 GB
+</option>
+
+<option value="536870912000">
+500 GB
+</option>
+
+</select>
+
+<label>
+Expiry
+</label>
+
+<input
+    type="datetime-local"
+    name="expires_at"
+>
+
+<br><br>
+
+<button
+    class="btn primary"
+    type="submit"
+>
+Create User
+</button>
+
+</form>
+
 </div>
 
 </div>
@@ -810,12 +1424,25 @@ function newUserPage(error = "") {
     );
 }
 
-function configPage(req, user) {
+async function configPage(req, user) {
     const origin = getPublicOrigin(req);
-    const links = makeVlessLinks(user, origin);
+
+    const links = makeVlessLinks(
+        user,
+        origin
+    );
 
     const subscriptionUrl =
         `${origin}/sub/${user.subscription_token}`;
+
+    const xhttpQr =
+        await qrCode(links.xhttp);
+
+    const wsQr =
+        await qrCode(links.websocket);
+
+    const subQr =
+        await qrCode(subscriptionUrl);
 
     return layout(
         `${user.username} Config`,
@@ -823,110 +1450,250 @@ function configPage(req, user) {
 <div class="container">
 
 <div class="nav">
-    <div class="brand">⚔️ Vergil<span>Panel</span></div>
-    <a class="btn" href="/dashboard">← Dashboard</a>
+
+<div class="brand">
+⚔️ Vergil<span>Panel</span>
+</div>
+
+<a
+    class="btn"
+    href="/dashboard"
+>
+← Dashboard
+</a>
+
 </div>
 
 <div class="card">
 
-<h1>${escapeHtml(user.username)}</h1>
+<h1>
+${escapeHtml(user.username)}
+</h1>
 
 <p class="muted">
 VLESS · automatic configuration
 </p>
 
 <div class="notice">
-    <strong>Subscription URL</strong>
-    <pre class="config">${escapeHtml(subscriptionUrl)}</pre>
-    <button class="btn primary"
-        onclick="navigator.clipboard.writeText(${JSON.stringify(subscriptionUrl)})">
-        Copy Subscription
-    </button>
-</div>
 
-<h2>🚀 XHTTP</h2>
-<pre class="config">${escapeHtml(links.xhttp)}</pre>
-<button class="btn"
-    onclick="navigator.clipboard.writeText(${JSON.stringify(links.xhttp)})">
-    Copy XHTTP
+<strong>
+Subscription URL
+</strong>
+
+<pre class="config">${escapeHtml(subscriptionUrl)}</pre>
+
+<button
+    class="btn primary"
+    onclick='copyText(${JSON.stringify(subscriptionUrl)})'
+>
+Copy Subscription
 </button>
 
-<h2>🌐 WebSocket</h2>
-<pre class="config">${escapeHtml(links.websocket)}</pre>
-<button class="btn"
-    onclick="navigator.clipboard.writeText(${JSON.stringify(links.websocket)})">
-    Copy WebSocket
-</button>
-
-<h2>UUID</h2>
-<pre class="config">${escapeHtml(user.uuid)}</pre>
-
-<p class="muted small">
-Xray transport security is disabled at the Xray layer. Railway provides HTTPS/TLS at the public edge.
-</p>
-
 </div>
-</div>
-`
-    );
-}
 
-function setupPage(error = "") {
-    return layout(
-        "Setup",
-        `
-<div class="login">
-<div class="card">
+<div class="qr-grid">
 
-<div class="brand">⚔️ Vergil<span>Panel</span></div>
+<div class="qr-card">
 
-<h2>Initial Setup</h2>
+<h3>
+Subscription QR
+</h3>
 
-<p class="muted">
-Create the first administrator account.
-</p>
-
-${error ? `<div class="notice">${escapeHtml(error)}</div>` : ""}
-
-<form method="POST" action="/setup">
-
-<label>Admin Username</label>
-<input name="username" required value="admin">
-
-<label>Password</label>
-<input type="password" name="password" required minlength="6">
-
-<label>Confirm Password</label>
-<input type="password" name="confirm" required minlength="6">
+<img
+    src="${subQr}"
+    alt="Subscription QR"
+>
 
 <br><br>
 
-<button class="btn primary" type="submit" style="width:100%">
-Create Panel
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(subscriptionUrl)})'
+>
+Copy
 </button>
 
-</form>
+</div>
+
+<div class="qr-card">
+
+<h3>
+XHTTP QR
+</h3>
+
+<img
+    src="${xhttpQr}"
+    alt="XHTTP QR"
+>
+
+<br><br>
+
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(links.xhttp)})'
+>
+Copy
+</button>
 
 </div>
+
 </div>
+
+<h2>
+🚀 VLESS + XHTTP
+</h2>
+
+<pre class="config">${escapeHtml(links.xhttp)}</pre>
+
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(links.xhttp)})'
+>
+Copy XHTTP
+</button>
+
+<br><br>
+
+<h2>
+🌐 VLESS + WebSocket
+</h2>
+
+<pre class="config">${escapeHtml(links.websocket)}</pre>
+
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(links.websocket)})'
+>
+Copy WebSocket
+</button>
+
+<div class="qr-grid">
+
+<div class="qr-card">
+
+<h3>
+XHTTP
+</h3>
+
+<img
+    src="${xhttpQr}"
+    alt="XHTTP QR"
+>
+
+</div>
+
+<div class="qr-card">
+
+<h3>
+WebSocket
+</h3>
+
+<img
+    src="${wsQr}"
+    alt="WebSocket QR"
+>
+
+</div>
+
+</div>
+
+<h2>
+UUID
+</h2>
+
+<pre class="config">${escapeHtml(user.uuid)}</pre>
+
+<p class="muted small">
+Public HTTPS is provided by Railway.
+Xray itself terminates no TLS on the internal ports.
+</p>
+
+</div>
+
+</div>
+
+<script>
+
+async function copyText(text){
+
+    try{
+
+        await navigator.clipboard.writeText(text);
+
+        alert("Copied!");
+
+    }catch{
+
+        prompt(
+            "Copy this:",
+            text
+        );
+
+    }
+
+}
+
+</script>
 `
     );
 }
 
 function setupComplete() {
-    return db.prepare("SELECT COUNT(*) AS count FROM admins").get().count > 0;
+    return (
+        db
+            .prepare(
+                "SELECT COUNT(*) AS count FROM admins"
+            )
+            .get()
+            .count > 0
+    );
 }
 
 function ensureDefaultAdmin() {
-    if (setupComplete()) return;
+    const username =
+        String(
+            process.env.ADMIN_USERNAME || ""
+        ).trim();
 
-    const username = process.env.ADMIN_USERNAME;
-    const password = process.env.ADMIN_PASSWORD;
+    const password =
+        String(
+            process.env.ADMIN_PASSWORD || ""
+        );
 
-    if (!username || !password) return;
+    if (!username || !password) {
+        return;
+    }
+
+    const existing = db.prepare(`
+        SELECT id
+        FROM admins
+        WHERE username = ?
+    `).get(username);
+
+    if (existing) {
+
+        db.prepare(`
+            UPDATE admins
+            SET password_hash = ?
+            WHERE id = ?
+        `).run(
+            hashPassword(password),
+            existing.id
+        );
+
+        console.log(
+            `👤 Admin environment password synchronized: ${username}`
+        );
+
+        return;
+    }
 
     db.prepare(`
-        INSERT INTO admins(username, password_hash, created_at)
+        INSERT INTO admins(
+            username,
+            password_hash,
+            created_at
+        )
         VALUES (?, ?, ?)
     `).run(
         username,
@@ -934,7 +1701,9 @@ function ensureDefaultAdmin() {
         nowIso()
     );
 
-    console.log(`👤 Default admin created: ${username}`);
+    console.log(
+        `👤 Default admin created: ${username}`
+    );
 }
 
 function authenticate(username, password) {
@@ -944,16 +1713,27 @@ function authenticate(username, password) {
         WHERE username = ?
     `).get(username);
 
-    if (!admin) return false;
+    if (!admin) {
+        return false;
+    }
 
-    return admin.password_hash === hashPassword(password);
+    return (
+        admin.password_hash ===
+        hashPassword(password)
+    );
 }
 
 async function createUser(form) {
-    const username = String(form.get("username") || "").trim();
+
+    const username =
+        String(
+            form.get("username") || ""
+        ).trim();
 
     if (!username) {
-        throw new Error("Username is required.");
+        throw new Error(
+            "Username is required."
+        );
     }
 
     const exists = db.prepare(`
@@ -963,50 +1743,84 @@ async function createUser(form) {
     `).get(username);
 
     if (exists) {
-        throw new Error("Username already exists.");
+        throw new Error(
+            "Username already exists."
+        );
     }
 
-    const uuid = crypto.randomUUID();
-    const subscriptionToken = randomToken(32);
+    const uuid =
+        crypto.randomUUID();
+
+    const subscriptionToken =
+        randomToken(32);
 
     const trafficLimit =
-        Number(form.get("traffic_limit") || 0);
+        Number(
+            form.get("traffic_limit") || 0
+        );
 
     let expiresAt = null;
 
-    const expiry = String(form.get("expires_at") || "").trim();
+    const expiry =
+        String(
+            form.get("expires_at") || ""
+        ).trim();
 
     if (expiry) {
-        const date = new Date(expiry);
 
-        if (Number.isNaN(date.getTime())) {
-            throw new Error("Invalid expiry date.");
+        const date =
+            new Date(expiry);
+
+        if (
+            Number.isNaN(
+                date.getTime()
+            )
+        ) {
+            throw new Error(
+                "Invalid expiry date."
+            );
         }
 
-        expiresAt = date.toISOString();
+        expiresAt =
+            date.toISOString();
     }
 
-    const result = db.prepare(`
-        INSERT INTO users(
+    const result =
+        db.prepare(`
+            INSERT INTO users(
+                username,
+                uuid,
+                protocol,
+                traffic_limit_bytes,
+                traffic_used_bytes,
+                expires_at,
+                status,
+                subscription_token,
+                created_at
+            )
+            VALUES (
+                ?,
+                ?,
+                'vless',
+                ?,
+                0,
+                ?,
+                'active',
+                ?,
+                ?
+            )
+        `).run(
             username,
             uuid,
-            protocol,
-            traffic_limit_bytes,
-            traffic_used_bytes,
-            expires_at,
-            status,
-            subscription_token,
-            created_at
-        )
-        VALUES (?, ?, 'vless', ?, 0, ?, 'active', ?, ?)
-    `).run(
-        username,
-        uuid,
-        Number.isFinite(trafficLimit) ? trafficLimit : 0,
-        expiresAt,
-        subscriptionToken,
-        nowIso()
-    );
+            Number.isFinite(
+                trafficLimit
+            )
+                ? trafficLimit
+                : 0,
+            expiresAt,
+            subscriptionToken,
+            nowIso()
+        );
 
     await restartXray();
 
@@ -1014,27 +1828,38 @@ async function createUser(form) {
         SELECT *
         FROM users
         WHERE id = ?
-    `).get(result.lastInsertRowid);
+    `).get(
+        result.lastInsertRowid
+    );
 }
 
 async function deleteUser(id) {
+
     db.prepare(`
         DELETE FROM users
         WHERE id = ?
-    `).run(Number(id));
+    `).run(
+        Number(id)
+    );
 
     await restartXray();
 }
 
 async function toggleUser(id) {
-    const user = db.prepare(`
-        SELECT *
-        FROM users
-        WHERE id = ?
-    `).get(Number(id));
+
+    const user =
+        db.prepare(`
+            SELECT *
+            FROM users
+            WHERE id = ?
+        `).get(
+            Number(id)
+        );
 
     if (!user) {
-        throw new Error("User not found.");
+        throw new Error(
+            "User not found."
+        );
     }
 
     const newStatus =
@@ -1046,152 +1871,283 @@ async function toggleUser(id) {
         UPDATE users
         SET status = ?
         WHERE id = ?
-    `).run(newStatus, Number(id));
+    `).run(
+        newStatus,
+        Number(id)
+    );
 
     await restartXray();
 }
 
-function proxyHttpToXray(req, res, targetPort) {
+function proxyHttpToXray(
+    req,
+    res,
+    targetPort
+) {
+
     const options = {
         hostname: "127.0.0.1",
         port: targetPort,
         path: req.url,
         method: req.method,
+
         headers: {
             ...req.headers,
-            host: `127.0.0.1:${targetPort}`
+            host:
+                `127.0.0.1:${targetPort}`
         }
     };
 
-    const proxy = http.request(options, upstream => {
-        res.writeHead(
-            upstream.statusCode || 502,
-            upstream.headers
+    const proxy =
+        http.request(
+            options,
+            upstream => {
+
+                res.writeHead(
+                    upstream.statusCode || 502,
+                    upstream.headers
+                );
+
+                upstream.pipe(res);
+            }
         );
 
-        upstream.pipe(res);
-    });
+    proxy.on(
+        "error",
+        error => {
 
-    proxy.on("error", error => {
-        console.error("HTTP proxy error:", error);
+            console.error(
+                "HTTP proxy error:",
+                error
+            );
 
-        if (!res.headersSent) {
-            res.writeHead(502, {
-                "Content-Type": "text/plain"
-            });
+            if (!res.headersSent) {
+
+                res.writeHead(
+                    502,
+                    {
+                        "Content-Type":
+                            "text/plain"
+                    }
+                );
+            }
+
+            res.end(
+                "Bad Gateway"
+            );
         }
-
-        res.end("Bad Gateway");
-    });
+    );
 
     req.pipe(proxy);
 }
 
-function proxyWebSocket(req, clientSocket, head) {
-    const upstream = net.connect({
-        host: "127.0.0.1",
-        port: XRAY_WS_PORT
-    });
+function proxyWebSocket(
+    req,
+    clientSocket,
+    head
+) {
 
-    upstream.on("connect", () => {
-        const headers = [];
+    const upstream =
+        net.connect({
+            host: "127.0.0.1",
+            port: XRAY_WS_PORT
+        });
 
-        headers.push(
-            `${req.method} ${req.url} HTTP/${req.httpVersion}`
-        );
+    upstream.on(
+        "connect",
+        () => {
 
-        for (const [key, value] of Object.entries(req.headers)) {
-            if (Array.isArray(value)) {
-                for (const item of value) {
-                    headers.push(`${key}: ${item}`);
+            const headers = [];
+
+            headers.push(
+                `${req.method} ${req.url} HTTP/${req.httpVersion}`
+            );
+
+            for (
+                const [key, value]
+                of Object.entries(req.headers)
+            ) {
+
+                if (
+                    Array.isArray(value)
+                ) {
+
+                    for (
+                        const item
+                        of value
+                    ) {
+
+                        headers.push(
+                            `${key}: ${item}`
+                        );
+                    }
+
+                } else {
+
+                    headers.push(
+                        `${key}: ${value}`
+                    );
                 }
-            } else {
-                headers.push(`${key}: ${value}`);
             }
+
+            headers.push("");
+            headers.push("");
+
+            upstream.write(
+                headers.join("\r\n")
+            );
+
+            if (
+                head &&
+                head.length
+            ) {
+                upstream.write(head);
+            }
+
+            clientSocket.pipe(
+                upstream
+            );
+
+            upstream.pipe(
+                clientSocket
+            );
         }
+    );
 
-        headers.push("");
-        headers.push("");
+    upstream.on(
+        "error",
+        error => {
 
-        upstream.write(headers.join("\r\n"));
+            console.error(
+                "WebSocket proxy error:",
+                error
+            );
 
-        if (head?.length) {
-            upstream.write(head);
+            try {
+                clientSocket.destroy();
+            } catch {}
         }
+    );
 
-        clientSocket.pipe(upstream);
-        upstream.pipe(clientSocket);
-    });
+    clientSocket.on(
+        "error",
+        () => {
 
-    upstream.on("error", error => {
-        console.error("WebSocket proxy error:", error);
+            try {
+                upstream.destroy();
+            } catch {}
+        }
+    );
 
-        try {
-            clientSocket.destroy();
-        } catch {}
-    });
+    clientSocket.on(
+        "close",
+        () => {
 
-    clientSocket.on("error", () => {
-        try {
-            upstream.destroy();
-        } catch {}
-    });
+            try {
+                upstream.destroy();
+            } catch {}
+        }
+    );
 }
 
-async function subscriptionResponse(req, res, token) {
-    const user = db.prepare(`
-        SELECT *
-        FROM users
-        WHERE subscription_token = ?
-    `).get(token);
+async function subscriptionResponse(
+    req,
+    res,
+    token
+) {
+
+    const user =
+        db.prepare(`
+            SELECT *
+            FROM users
+            WHERE subscription_token = ?
+        `).get(token);
 
     if (!user) {
-        sendJson(res, {
-            ok: false,
-            error: "Subscription not found."
-        }, 404);
+
+        sendJson(
+            res,
+            {
+                ok: false,
+                error:
+                    "Subscription not found."
+            },
+            404
+        );
 
         return;
     }
 
-    if (user.status !== "active") {
-        sendJson(res, {
-            ok: false,
-            error: "Subscription disabled."
-        }, 403);
+    if (
+        user.status !== "active"
+    ) {
+
+        sendJson(
+            res,
+            {
+                ok: false,
+                error:
+                    "Subscription disabled."
+            },
+            403
+        );
 
         return;
     }
 
-    const origin = getPublicOrigin(req);
+    const origin =
+        getPublicOrigin(req);
 
-    const content = makeSubscription(user, origin);
+    const content =
+        makeSubscription(
+            user,
+            origin
+        );
 
-    res.writeHead(200, {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Cache-Control": "no-store"
-    });
+    res.writeHead(
+        200,
+        {
+            "Content-Type":
+                "text/plain; charset=utf-8",
+
+            "Cache-Control":
+                "no-store",
+
+            "Profile-Update-Interval":
+                "24"
+        }
+    );
 
     res.end(content);
 }
 
-async function handleRequest(req, res) {
-    try {
-        const url = new URL(
-            req.url,
-            `http://${req.headers.host || "localhost"}`
-        );
+async function handleRequest(
+    req,
+    res
+) {
 
-        const pathname = url.pathname;
+    try {
+
+        const url =
+            new URL(
+                req.url,
+                `http://${req.headers.host || "localhost"}`
+            );
+
+        const pathname =
+            url.pathname;
 
         /*
-         * XHTTP must reach Xray directly through the internal
-         * HTTP reverse proxy.
+         * XHTTP
          */
+
         if (
             pathname === XHTTP_PATH ||
-            pathname.startsWith(`${XHTTP_PATH}/`)
+            pathname.startsWith(
+                `${XHTTP_PATH}/`
+            )
         ) {
+
             proxyHttpToXray(
                 req,
                 res,
@@ -1202,10 +2158,17 @@ async function handleRequest(req, res) {
         }
 
         /*
-         * Subscription endpoint.
+         * Subscription
          */
-        if (pathname.startsWith("/sub/")) {
-            const token = pathname.slice("/sub/".length);
+
+        if (
+            pathname.startsWith("/sub/")
+        ) {
+
+            const token =
+                pathname.slice(
+                    "/sub/".length
+                );
 
             await subscriptionResponse(
                 req,
@@ -1217,64 +2180,124 @@ async function handleRequest(req, res) {
         }
 
         /*
-         * Health check.
+         * Health
          */
-        if (pathname === "/health") {
-            sendJson(res, {
-                ok: true,
-                panel: `v${VERSION}`,
-                xray: Boolean(xrayProcess && !xrayProcess.killed)
-            });
+
+        if (
+            pathname === "/health"
+        ) {
+
+            sendJson(
+                res,
+                {
+                    ok: true,
+                    panel: VERSION,
+                    xray:
+                        Boolean(
+                            xrayProcess &&
+                            !xrayProcess.killed
+                        ),
+                    transports: [
+                        "xhttp",
+                        "websocket"
+                    ]
+                }
+            );
 
             return;
         }
 
         /*
-         * Login.
+         * Login
          */
-        if (pathname === "/login" && req.method === "GET") {
-            if (getSession(req)) {
-                redirect(res, "/dashboard");
+
+        if (
+            pathname === "/login" &&
+            req.method === "GET"
+        ) {
+
+            if (
+                getSession(req)
+            ) {
+
+                redirect(
+                    res,
+                    "/dashboard"
+                );
+
                 return;
             }
 
-            sendHtml(res, loginPage());
+            sendHtml(
+                res,
+                loginPage()
+            );
+
             return;
         }
 
-        if (pathname === "/login" && req.method === "POST") {
-            const form = await readForm(req);
+        if (
+            pathname === "/login" &&
+            req.method === "POST"
+        ) {
 
-            const username = String(
-                form.get("username") || ""
-            ).trim();
+            const form =
+                await readForm(req);
 
-            const password = String(
-                form.get("password") || ""
-            );
+            const username =
+                String(
+                    form.get(
+                        "username"
+                    ) || ""
+                ).trim();
 
-            if (!authenticate(username, password)) {
+            const password =
+                String(
+                    form.get(
+                        "password"
+                    ) || ""
+                );
+
+            if (
+                !authenticate(
+                    username,
+                    password
+                )
+            ) {
+
                 sendHtml(
                     res,
-                    loginPage("Invalid username or password."),
+                    loginPage(
+                        "Invalid username or password."
+                    ),
                     401
                 );
 
                 return;
             }
 
-            const token = randomToken(32);
+            const token =
+                randomToken(32);
 
-            sessions.set(token, {
-                username,
-                createdAt: Date.now()
-            });
+            sessions.set(
+                token,
+                {
+                    username,
+                    createdAt:
+                        Date.now()
+                }
+            );
 
-            res.writeHead(302, {
-                Location: "/dashboard",
-                "Set-Cookie":
-                    `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Secure`
-            });
+            res.writeHead(
+                302,
+                {
+                    Location:
+                        "/dashboard",
+
+                    "Set-Cookie":
+                        `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Secure`
+                }
+            );
 
             res.end();
 
@@ -1282,62 +2305,187 @@ async function handleRequest(req, res) {
         }
 
         /*
-         * Setup.
+         * Setup
          */
-        if (pathname === "/setup" && req.method === "GET") {
-            if (setupComplete()) {
-                redirect(res, "/login");
+
+        if (
+            pathname === "/setup" &&
+            req.method === "GET"
+        ) {
+
+            if (
+                setupComplete()
+            ) {
+
+                redirect(
+                    res,
+                    "/login"
+                );
+
                 return;
             }
 
-            sendHtml(res, setupPage());
+            sendHtml(
+                res,
+                `
+                ${layout(
+                    "Setup",
+                    `
+                    <div class="login">
+                    <div class="card">
+
+                    <div class="brand">
+                    ⚔️ Vergil<span>Panel</span>
+                    </div>
+
+                    <h2>
+                    Initial Setup
+                    </h2>
+
+                    <p class="muted">
+                    Create the first administrator account.
+                    </p>
+
+                    <form
+                        method="POST"
+                        action="/setup"
+                    >
+
+                    <label>
+                    Username
+                    </label>
+
+                    <input
+                        name="username"
+                        required
+                        value="admin"
+                    >
+
+                    <label>
+                    Password
+                    </label>
+
+                    <input
+                        type="password"
+                        name="password"
+                        required
+                        minlength="6"
+                    >
+
+                    <label>
+                    Confirm Password
+                    </label>
+
+                    <input
+                        type="password"
+                        name="confirm"
+                        required
+                        minlength="6"
+                    >
+
+                    <br><br>
+
+                    <button
+                        class="btn primary"
+                        type="submit"
+                        style="width:100%"
+                    >
+                    Create Panel
+                    </button>
+
+                    </form>
+
+                    </div>
+                    </div>
+                    `
+                )}
+                `
+            );
+
             return;
         }
 
-        if (pathname === "/setup" && req.method === "POST") {
-            if (setupComplete()) {
-                redirect(res, "/login");
+        if (
+            pathname === "/setup" &&
+            req.method === "POST"
+        ) {
+
+            if (
+                setupComplete()
+            ) {
+
+                redirect(
+                    res,
+                    "/login"
+                );
+
                 return;
             }
 
-            const form = await readForm(req);
+            const form =
+                await readForm(req);
 
-            const username = String(
-                form.get("username") || ""
-            ).trim();
+            const username =
+                String(
+                    form.get(
+                        "username"
+                    ) || ""
+                ).trim();
 
-            const password = String(
-                form.get("password") || ""
-            );
+            const password =
+                String(
+                    form.get(
+                        "password"
+                    ) || ""
+                );
 
-            const confirm = String(
-                form.get("confirm") || ""
-            );
+            const confirm =
+                String(
+                    form.get(
+                        "confirm"
+                    ) || ""
+                );
 
-            if (!username || !password) {
+            if (
+                !username ||
+                !password
+            ) {
+
                 sendHtml(
                     res,
-                    setupPage("Username and password are required."),
+                    loginPage(
+                        "Username and password are required."
+                    ),
                     400
                 );
 
                 return;
             }
 
-            if (password.length < 6) {
+            if (
+                password.length < 6
+            ) {
+
                 sendHtml(
                     res,
-                    setupPage("Password must contain at least 6 characters."),
+                    loginPage(
+                        "Password must contain at least 6 characters."
+                    ),
                     400
                 );
 
                 return;
             }
 
-            if (password !== confirm) {
+            if (
+                password !== confirm
+            ) {
+
                 sendHtml(
                     res,
-                    setupPage("Passwords do not match."),
+                    loginPage(
+                        "Passwords do not match."
+                    ),
                     400
                 );
 
@@ -1357,26 +2505,44 @@ async function handleRequest(req, res) {
                 nowIso()
             );
 
-            redirect(res, "/login");
+            redirect(
+                res,
+                "/login"
+            );
 
             return;
         }
 
         /*
-         * Logout.
+         * Logout
          */
-        if (pathname === "/logout") {
-            const cookies = parseCookies(req);
 
-            if (cookies.vergil_session) {
-                sessions.delete(cookies.vergil_session);
+        if (
+            pathname === "/logout"
+        ) {
+
+            const cookies =
+                parseCookies(req);
+
+            if (
+                cookies.vergil_session
+            ) {
+
+                sessions.delete(
+                    cookies.vergil_session
+                );
             }
 
-            res.writeHead(302, {
-                Location: "/login",
-                "Set-Cookie":
-                    "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
-            });
+            res.writeHead(
+                302,
+                {
+                    Location:
+                        "/login",
+
+                    "Set-Cookie":
+                        "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
+                }
+            );
 
             res.end();
 
@@ -1384,27 +2550,67 @@ async function handleRequest(req, res) {
         }
 
         /*
-         * Everything below this point requires login.
+         * Authentication
          */
-        const session = requireAuth(req, res);
 
-        if (!session) return;
+        const session =
+            requireAuth(
+                req,
+                res
+            );
 
-        if (pathname === "/" || pathname === "/dashboard") {
-            sendHtml(res, dashboardPage(req));
+        if (!session) {
             return;
         }
 
-        if (pathname === "/users/new" && req.method === "GET") {
-            sendHtml(res, newUserPage());
+        /*
+         * Dashboard
+         */
+
+        if (
+            pathname === "/" ||
+            pathname === "/dashboard"
+        ) {
+
+            sendHtml(
+                res,
+                dashboardPage(req)
+            );
+
             return;
         }
 
-        if (pathname === "/users/new" && req.method === "POST") {
+        /*
+         * New User
+         */
+
+        if (
+            pathname === "/users/new" &&
+            req.method === "GET"
+        ) {
+
+            sendHtml(
+                res,
+                newUserPage()
+            );
+
+            return;
+        }
+
+        if (
+            pathname === "/users/new" &&
+            req.method === "POST"
+        ) {
+
             try {
-                const form = await readForm(req);
 
-                const user = await createUser(form);
+                const form =
+                    await readForm(req);
+
+                const user =
+                    await createUser(
+                        form
+                    );
 
                 console.log(
                     `👤 User created: ${user.username} (${user.uuid})`
@@ -1414,7 +2620,9 @@ async function handleRequest(req, res) {
                     res,
                     `/users/config?id=${user.id}`
                 );
+
             } catch (error) {
+
                 console.error(
                     "User creation failed:",
                     error
@@ -1433,19 +2641,46 @@ async function handleRequest(req, res) {
             return;
         }
 
-        if (pathname === "/users/config" && req.method === "GET") {
-            const id = Number(url.searchParams.get("id"));
+        /*
+         * User Config
+         */
 
-            const user = db.prepare(`
-                SELECT *
-                FROM users
-                WHERE id = ?
-            `).get(id);
+        if (
+            pathname === "/users/config" &&
+            req.method === "GET"
+        ) {
+
+            const id =
+                Number(
+                    url.searchParams.get(
+                        "id"
+                    )
+                );
+
+            const user =
+                db.prepare(`
+                    SELECT *
+                    FROM users
+                    WHERE id = ?
+                `).get(id);
 
             if (!user) {
+
                 sendHtml(
                     res,
-                    "<h1>User not found</h1>",
+                    layout(
+                        "Not Found",
+                        `
+                        <div class="container">
+                        <div class="card">
+                        <h1>User not found</h1>
+                        <a class="btn" href="/dashboard">
+                        Dashboard
+                        </a>
+                        </div>
+                        </div>
+                        `
+                    ),
                     404
                 );
 
@@ -1454,102 +2689,170 @@ async function handleRequest(req, res) {
 
             sendHtml(
                 res,
-                configPage(req, user)
+                await configPage(
+                    req,
+                    user
+                )
             );
 
             return;
         }
 
+        /*
+         * Toggle User
+         */
+
         if (
             pathname === "/users/toggle" &&
             req.method === "POST"
         ) {
-            const form = await readForm(req);
+
+            const form =
+                await readForm(req);
 
             try {
-                await toggleUser(form.get("id"));
+
+                await toggleUser(
+                    form.get("id")
+                );
+
             } catch (error) {
+
                 console.error(
                     "Toggle user failed:",
                     error
                 );
             }
 
-            redirect(res, "/dashboard");
+            redirect(
+                res,
+                "/dashboard"
+            );
+
             return;
         }
+
+        /*
+         * Delete User
+         */
 
         if (
             pathname === "/users/delete" &&
             req.method === "POST"
         ) {
-            const form = await readForm(req);
+
+            const form =
+                await readForm(req);
 
             try {
-                await deleteUser(form.get("id"));
+
+                await deleteUser(
+                    form.get("id")
+                );
+
             } catch (error) {
+
                 console.error(
                     "Delete user failed:",
                     error
                 );
             }
 
-            redirect(res, "/dashboard");
-            return;
-        }
-
-        sendHtml(
-            res,
-            "<h1>404</h1><p>Not Found</p>",
-            404
-        );
-    } catch (error) {
-        console.error(
-            "Unhandled server error:",
-            error
-        );
-
-        if (!res.headersSent) {
-            sendJson(res, {
-                ok: false,
-                error: "Internal Server Error"
-            }, 500);
-        }
-    }
-}
-
-const server = http.createServer(
-    handleRequest
-);
-
-/*
- * WebSocket upgrade.
- */
-server.on("upgrade", (req, socket, head) => {
-    try {
-        const url = new URL(
-            req.url,
-            `http://${req.headers.host || "localhost"}`
-        );
-
-        if (
-            url.pathname === WS_PATH ||
-            url.pathname.startsWith(`${WS_PATH}/`)
-        ) {
-            proxyWebSocket(
-                req,
-                socket,
-                head
+            redirect(
+                res,
+                "/dashboard"
             );
 
             return;
         }
 
-        socket.destroy();
-    } catch {
-        socket.destroy();
+        sendHtml(
+            res,
+            layout(
+                "404",
+                `
+                <div class="container">
+                <div class="card">
+                <h1>404</h1>
+                <p class="muted">
+                Not Found
+                </p>
+                </div>
+                </div>
+                `
+            ),
+            404
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Unhandled server error:",
+            error
+        );
+
+        if (
+            !res.headersSent
+        ) {
+
+            sendJson(
+                res,
+                {
+                    ok: false,
+                    error:
+                        "Internal Server Error"
+                },
+                500
+            );
+        }
     }
-});
+}
+
+const server =
+    http.createServer(
+        handleRequest
+    );
+
+/*
+ * WebSocket Upgrade
+ */
+
+server.on(
+    "upgrade",
+    (req, socket, head) => {
+
+        try {
+
+            const url =
+                new URL(
+                    req.url,
+                    `http://${req.headers.host || "localhost"}`
+                );
+
+            if (
+                url.pathname === WS_PATH ||
+                url.pathname.startsWith(
+                    `${WS_PATH}/`
+                )
+            ) {
+
+                proxyWebSocket(
+                    req,
+                    socket,
+                    head
+                );
+
+                return;
+            }
+
+            socket.destroy();
+
+        } catch {
+
+            socket.destroy();
+        }
+    }
+);
 
 ensureDefaultAdmin();
 
@@ -1559,6 +2862,7 @@ server.listen(
     PORT,
     HOST,
     () => {
+
         console.log(
             `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
         );
@@ -1568,7 +2872,10 @@ server.listen(
         );
 
         console.log(
-            `🌐 Public domain: ${process.env.RAILWAY_PUBLIC_DOMAIN || "detected from request"}`
+            `🌐 Public domain: ${
+                process.env.RAILWAY_PUBLIC_DOMAIN ||
+                "detected from request"
+            }`
         );
 
         console.log(
@@ -1586,7 +2893,10 @@ server.listen(
 );
 
 async function shutdown(signal) {
-    console.log(`\nReceived ${signal}`);
+
+    console.log(
+        `\nReceived ${signal}`
+    );
 
     stoppingXray = true;
 
@@ -1601,10 +2911,12 @@ async function shutdown(signal) {
     process.exit(0);
 }
 
-process.on("SIGTERM", () => {
-    shutdown("SIGTERM");
-});
+process.on(
+    "SIGTERM",
+    () => shutdown("SIGTERM")
+);
 
-process.on("SIGINT", () => {
-    shutdown("SIGINT");
-});
+process.on(
+    "SIGINT",
+    () => shutdown("SIGINT")
+);
