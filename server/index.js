@@ -12,9 +12,12 @@ const HOST = "0.0.0.0";
 const DATA_DIR = process.env.DATA_DIR || "/app/data";
 const DB_PATH = `${DATA_DIR}/vergilpanel.db`;
 
-const XRAY_BIN = process.env.XRAY_BIN || "/opt/xray/xray";
+const XRAY_BIN =
+    process.env.XRAY_BIN || "/opt/xray/xray";
+
 const XRAY_CONFIG =
-    process.env.XRAY_CONFIG || "/app/xray/generated-config.json";
+    process.env.XRAY_CONFIG ||
+    "/app/xray/generated-config.json";
 
 const XRAY_XHTTP_PORT =
     Number(process.env.XRAY_XHTTP_PORT || 10001);
@@ -28,7 +31,7 @@ const XHTTP_PATH =
 const WS_PATH =
     process.env.WS_PATH || "/ws";
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 
 let xrayProcess = null;
 let stoppingXray = false;
@@ -76,6 +79,10 @@ function randomToken(bytes = 32) {
     return crypto.randomBytes(bytes).toString("hex");
 }
 
+function nowIso() {
+    return new Date().toISOString();
+}
+
 function escapeHtml(value = "") {
     return String(value)
         .replaceAll("&", "&amp;")
@@ -83,10 +90,6 @@ function escapeHtml(value = "") {
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
-}
-
-function nowIso() {
-    return new Date().toISOString();
 }
 
 function parseCookies(req) {
@@ -130,17 +133,6 @@ function redirect(res, location) {
     res.end();
 }
 
-function requireAuth(req, res) {
-    const session = getSession(req);
-
-    if (!session) {
-        redirect(res, "/login");
-        return null;
-    }
-
-    return session;
-}
-
 function sendHtml(res, html, status = 200) {
     res.writeHead(status, {
         "Content-Type": "text/html; charset=utf-8",
@@ -178,18 +170,33 @@ async function readBody(req) {
 }
 
 async function readForm(req) {
-    const body = await readBody(req);
-    return new URLSearchParams(body);
+    return new URLSearchParams(
+        await readBody(req)
+    );
+}
+
+function requireAuth(req, res) {
+    const session = getSession(req);
+
+    if (!session) {
+        redirect(res, "/login");
+        return null;
+    }
+
+    return session;
 }
 
 function getPublicHost(req) {
-    const forwardedHost =
-        req.headers["x-forwarded-host"] ||
+    const forwarded =
+        req.headers["x-forwarded-host"];
+
+    const host =
+        forwarded ||
         process.env.RAILWAY_PUBLIC_DOMAIN ||
         req.headers.host ||
         "localhost:8080";
 
-    return String(forwardedHost)
+    return String(host)
         .split(",")[0]
         .trim();
 }
@@ -213,11 +220,11 @@ function activeUsers() {
         SELECT *
         FROM users
         WHERE status = 'active'
-          AND (
-              expires_at IS NULL
-              OR expires_at = ''
-              OR expires_at > ?
-          )
+        AND (
+            expires_at IS NULL
+            OR expires_at = ''
+            OR expires_at > ?
+        )
         ORDER BY id DESC
     `).all(nowIso());
 }
@@ -230,10 +237,17 @@ function allUsers() {
     `).all();
 }
 
-function generateXrayConfig() {
-    const users = activeUsers();
+function getAdmin() {
+    return db.prepare(`
+        SELECT *
+        FROM admins
+        ORDER BY id ASC
+        LIMIT 1
+    `).get();
+}
 
-    const clients = users.map(user => ({
+function generateXrayConfig() {
+    const clients = activeUsers().map(user => ({
         id: user.uuid,
         email: user.username
     }));
@@ -344,12 +358,6 @@ async function startXray() {
     await writeXrayConfig();
 
     console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
-    console.log(
-        `⚔️ XHTTP: 127.0.0.1:${XRAY_XHTTP_PORT}${XHTTP_PATH}`
-    );
-    console.log(
-        `🌐 WebSocket: 127.0.0.1:${XRAY_WS_PORT}${WS_PATH}`
-    );
 
     xrayProcess = spawn(
         XRAY_BIN,
@@ -385,7 +393,10 @@ async function startXray() {
 
         xrayProcess = null;
 
-        if (!stoppingXray && !xrayRestarting) {
+        if (
+            !stoppingXray &&
+            !xrayRestarting
+        ) {
             setTimeout(() => {
                 startXray().catch(error => {
                     console.error(
@@ -399,9 +410,7 @@ async function startXray() {
 }
 
 async function restartXray() {
-    if (xrayRestarting) {
-        return;
-    }
+    if (xrayRestarting) return;
 
     xrayRestarting = true;
 
@@ -414,24 +423,27 @@ async function restartXray() {
 }
 
 function makeVlessLinks(user, origin) {
-    const domain = new URL(origin).hostname;
+    const domain =
+        new URL(origin).hostname;
 
-    const xhttpParams = new URLSearchParams({
-        encryption: "none",
-        security: "tls",
-        type: "xhttp",
-        path: XHTTP_PATH,
-        host: domain,
-        mode: "auto"
-    });
+    const xhttpParams =
+        new URLSearchParams({
+            encryption: "none",
+            security: "tls",
+            type: "xhttp",
+            path: XHTTP_PATH,
+            host: domain,
+            mode: "auto"
+        });
 
-    const wsParams = new URLSearchParams({
-        encryption: "none",
-        security: "tls",
-        type: "ws",
-        path: WS_PATH,
-        host: domain
-    });
+    const wsParams =
+        new URLSearchParams({
+            encryption: "none",
+            security: "tls",
+            type: "ws",
+            path: WS_PATH,
+            host: domain
+        });
 
     return {
         xhttp:
@@ -442,11 +454,44 @@ function makeVlessLinks(user, origin) {
     };
 }
 
+/*
+ * Dummy configuration
+ *
+ * این کانفیگ عمداً کار نمی‌کند.
+ * فقط برای نمایش پیام مالک/برند داخل Subscription است.
+ */
+
+function makeDummyConfig() {
+    const params =
+        new URLSearchParams({
+            encryption: "none",
+            security: "none",
+            type: "tcp"
+        });
+
+    return (
+        `vless://00000000-0000-0000-0000-000000000000@0.0.0.0:443?${params.toString()}#${encodeURIComponent(
+            "ساخته شده توسط یاسین - کاملا رایگان و غیرقابل فروش"
+        )}`
+    );
+}
+
 function makeSubscription(user, origin) {
-    const links = makeVlessLinks(user, origin);
+    const links =
+        makeVlessLinks(
+            user,
+            origin
+        );
+
+    const dummy =
+        makeDummyConfig();
 
     return Buffer.from(
-        `${links.xhttp}\n${links.websocket}`,
+        [
+            links.xhttp,
+            links.websocket,
+            dummy
+        ].join("\n"),
         "utf8"
     ).toString("base64");
 }
@@ -462,7 +507,8 @@ async function qrCode(text) {
 function layout(title, body) {
     return `
 <!doctype html>
-<html lang="en">
+
+<html lang="fa" dir="rtl">
 
 <head>
 
@@ -480,47 +526,84 @@ ${escapeHtml(title)} — VergilPanel
 <style>
 
 :root{
-    color-scheme:dark;
+    --bg:#03070d;
+    --bg2:#07111d;
+    --card:rgba(10,22,36,.78);
+    --card2:rgba(12,30,48,.9);
+    --border:rgba(100,210,255,.16);
 
-    --bg:#06070b;
-    --card:#0e1118;
-    --card2:#151923;
-    --border:#252b38;
+    --text:#eefaff;
+    --muted:#7895a8;
 
-    --text:#f5f7fb;
-    --muted:#8e98a9;
+    --blue:#38cfff;
+    --cyan:#79e7ff;
+    --deep:#075b83;
 
-    --accent:#7857ff;
-    --accent2:#9a7cff;
+    --green:#38e39a;
+    --red:#ff5d73;
 
-    --green:#35d07f;
-    --red:#ff596b;
+    --shadow:
+        0 20px 70px rgba(0,0,0,.45);
 }
 
 *{
     box-sizing:border-box;
 }
 
+html{
+    scroll-behavior:smooth;
+}
+
 body{
     margin:0;
-
-    background:
-        radial-gradient(
-            circle at top right,
-            rgba(120,87,255,.14),
-            transparent 35%
-        ),
-        var(--bg);
 
     color:var(--text);
 
     font-family:
-        Inter,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
+        Vazirmatn,
+        Tahoma,
+        Arial,
         sans-serif;
+
+    background:
+        radial-gradient(
+            circle at 80% 5%,
+            rgba(35,198,255,.16),
+            transparent 28%
+        ),
+        radial-gradient(
+            circle at 10% 90%,
+            rgba(0,94,145,.16),
+            transparent 30%
+        ),
+        linear-gradient(
+            135deg,
+            #02050a,
+            #06111d 50%,
+            #02070d
+        );
+
+    min-height:100vh;
+}
+
+body::before{
+    content:"";
+
+    position:fixed;
+
+    inset:0;
+
+    pointer-events:none;
+
+    background:
+        linear-gradient(
+            120deg,
+            transparent 30%,
+            rgba(92,221,255,.025),
+            transparent 70%
+        );
+
+    z-index:-1;
 }
 
 a{
@@ -529,7 +612,7 @@ a{
 }
 
 .container{
-    max-width:1250px;
+    width:min(1250px,100%);
     margin:auto;
     padding:24px;
 }
@@ -539,23 +622,56 @@ a{
     align-items:center;
     justify-content:space-between;
     gap:15px;
-    margin-bottom:25px;
+    margin-bottom:24px;
 }
 
 .brand{
+    display:flex;
+    align-items:center;
+    gap:10px;
+
     font-size:23px;
-    font-weight:900;
-    letter-spacing:-.5px;
+    font-weight:1000;
+
+    letter-spacing:-1px;
+}
+
+.brand-icon{
+    width:39px;
+    height:39px;
+
+    display:grid;
+    place-items:center;
+
+    border-radius:12px;
+
+    background:
+        linear-gradient(
+            145deg,
+            rgba(111,227,255,.22),
+            rgba(0,92,145,.18)
+        );
+
+    border:1px solid
+        rgba(94,218,255,.25);
+
+    box-shadow:
+        0 0 30px
+        rgba(39,201,255,.15);
 }
 
 .brand span{
-    color:var(--accent2);
+    color:var(--cyan);
+
+    text-shadow:
+        0 0 25px
+        rgba(64,210,255,.45);
 }
 
 .nav-right{
     display:flex;
-    gap:10px;
     align-items:center;
+    gap:9px;
 }
 
 .btn{
@@ -563,41 +679,75 @@ a{
     align-items:center;
     justify-content:center;
 
-    padding:10px 15px;
-
-    border-radius:10px;
-
     border:1px solid var(--border);
 
-    background:var(--card2);
+    background:
+        rgba(12,28,44,.8);
 
     color:var(--text);
 
+    padding:10px 15px;
+
+    border-radius:11px;
+
     cursor:pointer;
 
-    font-size:14px;
+    font-size:13px;
 
-    transition:.2s;
+    transition:
+        .2s ease;
+
+    box-shadow:
+        inset 0 1px
+        rgba(255,255,255,.03);
 }
 
 .btn:hover{
-    transform:translateY(-1px);
-    border-color:#454d60;
+    transform:translateY(-2px);
+
+    border-color:
+        rgba(91,221,255,.45);
+
+    box-shadow:
+        0 8px 25px
+        rgba(0,150,210,.12);
 }
 
 .btn.primary{
-    background:var(--accent);
-    border-color:var(--accent);
+    color:#001018;
+
+    background:
+        linear-gradient(
+            135deg,
+            var(--cyan),
+            var(--blue)
+        );
+
+    border-color:var(--blue);
+
+    font-weight:900;
+
+    box-shadow:
+        0 0 25px
+        rgba(54,207,255,.2);
 }
 
 .btn.danger{
-    background:#32131a;
-    border-color:#56212b;
+    background:
+        rgba(91,18,32,.45);
+
+    border-color:
+        rgba(255,75,100,.25);
+
+    color:#ff9aa8;
 }
 
 .grid{
     display:grid;
-    grid-template-columns:repeat(4,1fr);
+
+    grid-template-columns:
+        repeat(4,1fr);
+
     gap:15px;
 }
 
@@ -605,267 +755,501 @@ a{
     background:
         linear-gradient(
             145deg,
-            rgba(255,255,255,.025),
-            transparent
-        ),
-        var(--card);
+            rgba(27,68,94,.15),
+            rgba(5,13,22,.82)
+        );
 
     border:1px solid var(--border);
 
-    border-radius:17px;
+    border-radius:19px;
 
     padding:20px;
 
-    box-shadow:
-        0 12px 40px rgba(0,0,0,.18);
+    box-shadow:var(--shadow);
+
+    backdrop-filter:
+        blur(16px);
 }
 
 .stat-label{
     color:var(--muted);
-    font-size:13px;
+    font-size:12px;
 }
 
 .stat-value{
     font-size:30px;
+    font-weight:1000;
+    margin-top:7px;
+
+    direction:ltr;
+    text-align:right;
+}
+
+.hero{
+    position:relative;
+
+    min-height:350px;
+
+    overflow:hidden;
+
+    border-radius:25px;
+
+    border:1px solid
+        rgba(94,218,255,.2);
+
+    margin-bottom:20px;
+
+    background:
+        radial-gradient(
+            circle at 80% 55%,
+            rgba(47,210,255,.22),
+            transparent 23%
+        ),
+        linear-gradient(
+            110deg,
+            #02060b,
+            #071522 55%,
+            #02070d
+        );
+
+    box-shadow:
+        0 30px 100px
+        rgba(0,0,0,.5),
+        inset 0 0 100px
+        rgba(45,195,255,.04);
+}
+
+.hero::after{
+    content:"";
+
+    position:absolute;
+
+    right:-10%;
+    bottom:-65%;
+
+    width:70%;
+    height:120%;
+
+    background:
+        radial-gradient(
+            ellipse,
+            rgba(61,220,255,.24),
+            transparent 62%
+        );
+
+    filter:blur(25px);
+
+    transform:
+        rotate(-15deg);
+
+    pointer-events:none;
+}
+
+.hero-content{
+    position:relative;
+
+    z-index:3;
+
+    padding:46px;
+
+    max-width:650px;
+
+    text-align:right;
+}
+
+.hero-kicker{
+    color:var(--cyan);
+
+    font-size:12px;
+
+    letter-spacing:4px;
+
     font-weight:900;
-    margin-top:8px;
+
+    margin-bottom:12px;
+
+    direction:ltr;
+    text-align:right;
+}
+
+.hero-title{
+    direction:ltr;
+    text-align:left;
+
+    font-size:
+        clamp(42px,7vw,75px);
+
+    line-height:.95;
+
+    font-weight:1000;
+
+    letter-spacing:-5px;
+
+    background:
+        linear-gradient(
+            120deg,
+            #ffffff,
+            #8eeeff 50%,
+            #28bce9
+        );
+
+    -webkit-background-clip:text;
+    background-clip:text;
+
+    color:transparent;
+
+    filter:
+        drop-shadow(
+            0 0 25px
+            rgba(58,210,255,.25)
+        );
+}
+
+.hero-sub{
+    margin-top:18px;
+
+    color:#a5c0ce;
+
+    font-size:15px;
+
+    max-width:500px;
+}
+
+.powered{
+    margin-top:20px;
+
+    font-size:11px;
+
+    letter-spacing:3px;
+
+    color:
+        rgba(136,226,255,.7);
+
+    direction:ltr;
+    text-align:left;
+}
+
+.flame{
+    position:absolute;
+
+    right:2%;
+    bottom:-20%;
+
+    width:54%;
+    height:125%;
+
+    opacity:.8;
+
+    transform:
+        rotate(-18deg);
+
+    background:
+        radial-gradient(
+            ellipse at 50% 75%,
+            rgba(42,218,255,.55),
+            rgba(13,124,177,.22) 32%,
+            transparent 67%
+        );
+
+    filter:
+        blur(9px);
+
+    mix-blend-mode:
+        screen;
+}
+
+.sword{
+    position:absolute;
+
+    right:15%;
+    top:-10%;
+
+    width:5px;
+    height:125%;
+
+    transform:
+        rotate(22deg);
+
+    background:
+        linear-gradient(
+            180deg,
+            transparent,
+            #d8faff 25%,
+            #4edaff 55%,
+            transparent
+        );
+
+    box-shadow:
+        0 0 30px
+        rgba(63,218,255,.75);
+
+    opacity:.7;
+}
+
+.status{
+    display:inline-flex;
+
+    align-items:center;
+
+    padding:7px 11px;
+
+    border-radius:999px;
+
+    background:
+        rgba(11,30,43,.8);
+
+    border:1px solid
+        rgba(85,220,255,.14);
+
+    font-size:12px;
+
+    margin-top:20px;
+}
+
+.status-dot{
+    width:8px;
+    height:8px;
+
+    border-radius:50%;
+
+    background:var(--red);
+
+    margin-left:7px;
+}
+
+.status-dot.online{
+    background:var(--green);
+
+    box-shadow:
+        0 0 14px
+        var(--green);
+}
+
+.table-wrap{
+    overflow:auto;
+
+    margin-top:18px;
+}
+
+table{
+    width:100%;
+
+    border-collapse:
+        collapse;
+}
+
+th,
+td{
+    padding:14px 12px;
+
+    text-align:right;
+
+    border-bottom:
+        1px solid
+        rgba(120,190,220,.09);
+
+    white-space:nowrap;
+}
+
+th{
+    color:var(--muted);
+
+    font-size:11px;
+}
+
+.badge{
+    display:inline-flex;
+
+    align-items:center;
+
+    padding:5px 9px;
+
+    border-radius:999px;
+
+    background:
+        rgba(110,150,175,.09);
+
+    border:1px solid
+        rgba(130,190,215,.08);
+
+    font-size:11px;
+}
+
+.badge.green{
+    color:#6ff0ae;
+
+    background:
+        rgba(26,100,68,.2);
+
+    border-color:
+        rgba(64,221,142,.14);
+}
+
+.badge.red{
+    color:#ff8999;
+
+    background:
+        rgba(112,24,40,.2);
+}
+
+.actions{
+    display:flex;
+    gap:7px;
 }
 
 h1{
-    font-size:28px;
     margin:0 0 8px;
+
+    font-size:28px;
 }
 
 h2{
     font-size:19px;
 }
 
+h3{
+    font-size:15px;
+}
+
 .muted{
     color:var(--muted);
 }
 
-.table-wrap{
-    overflow:auto;
-    margin-top:18px;
-}
-
-table{
-    width:100%;
-    border-collapse:collapse;
-}
-
-th,
-td{
-    padding:14px 12px;
-    text-align:left;
-    border-bottom:1px solid var(--border);
-    white-space:nowrap;
-}
-
-th{
-    color:var(--muted);
-    font-size:12px;
-}
-
-.badge{
-    display:inline-flex;
-    align-items:center;
-    padding:5px 9px;
-    border-radius:999px;
-    background:#202633;
-    font-size:12px;
-}
-
-.badge.green{
-    background:#123522;
-    color:#68e9a2;
-}
-
-.badge.red{
-    background:#39171c;
-    color:#ff8b96;
-}
-
-.actions{
-    display:flex;
-    gap:8px;
+.small{
+    font-size:11px;
 }
 
 .form{
-    max-width:520px;
+    max-width:600px;
+    margin:auto;
 }
 
 label{
     display:block;
-    margin:16px 0 7px;
-    color:var(--muted);
-    font-size:13px;
+
+    margin:
+        17px 0 7px;
+
+    color:#9ab7c7;
+
+    font-size:12px;
 }
 
 input,
 select{
     width:100%;
-    padding:13px;
 
-    background:#090c12;
+    padding:13px 14px;
+
+    background:
+        rgba(2,9,15,.75);
 
     color:var(--text);
 
-    border:1px solid var(--border);
+    border:
+        1px solid
+        rgba(100,200,235,.13);
 
-    border-radius:10px;
+    border-radius:11px;
 
     outline:none;
+
+    font-family:inherit;
 }
 
 input:focus,
 select:focus{
-    border-color:var(--accent);
+    border-color:
+        rgba(65,211,255,.55);
+
+    box-shadow:
+        0 0 0 3px
+        rgba(50,200,255,.07);
 }
 
 .notice{
-    padding:14px;
+    padding:15px;
 
-    border-radius:12px;
+    border-radius:13px;
 
-    background:#141923;
+    background:
+        rgba(18,49,67,.35);
 
-    border:1px solid var(--border);
+    border:
+        1px solid
+        rgba(73,208,255,.13);
 
-    margin-bottom:18px;
+    margin:
+        15px 0;
 }
 
 pre.config{
     white-space:pre-wrap;
+
     word-break:break-all;
 
-    background:#080a0f;
+    direction:ltr;
 
-    border:1px solid var(--border);
+    text-align:left;
+
+    background:
+        rgba(1,7,12,.8);
+
+    border:
+        1px solid
+        rgba(94,218,255,.1);
 
     padding:14px;
 
-    border-radius:10px;
+    border-radius:11px;
 
-    font-size:12px;
+    font-size:11px;
+
+    line-height:1.7;
 }
 
 .qr-grid{
     display:grid;
-    grid-template-columns:repeat(2,1fr);
+
+    grid-template-columns:
+        repeat(2,1fr);
+
     gap:18px;
+
     margin-top:18px;
 }
 
 .qr-card{
     text-align:center;
 
-    background:#0a0d13;
+    background:
+        rgba(3,12,20,.72);
 
-    border:1px solid var(--border);
+    border:
+        1px solid
+        rgba(90,210,245,.1);
 
-    border-radius:15px;
+    border-radius:17px;
 
     padding:18px;
 }
 
 .qr-card img{
     width:220px;
+
     max-width:100%;
 
-    background:white;
+    background:#fff;
 
     padding:8px;
 
     border-radius:12px;
 }
 
-.hero{
-    position:relative;
-    overflow:hidden;
+.settings-icon{
+    font-size:40px;
 
-    min-height:280px;
-
-    border-radius:20px;
-
-    border:1px solid var(--border);
-
-    margin-bottom:20px;
-
-    background:
-        radial-gradient(
-            circle at 80% 30%,
-            rgba(120,87,255,.3),
-            transparent 30%
-        ),
-        linear-gradient(
-            110deg,
-            #080a10,
-            #111326
-        );
-}
-
-.hero-content{
-    position:relative;
-    z-index:2;
-
-    padding:35px;
-
-    max-width:600px;
-}
-
-.hero-title{
-    font-size:42px;
-    font-weight:950;
-    letter-spacing:-2px;
     margin-bottom:10px;
-}
-
-.hero-sub{
-    color:var(--muted);
-    font-size:15px;
-}
-
-.hero-sword{
-    position:absolute;
-
-    right:-30px;
-    bottom:-100px;
-
-    width:55%;
-    height:320px;
-
-    transform:rotate(-18deg);
-
-    background:
-        linear-gradient(
-            90deg,
-            transparent 0%,
-            rgba(150,120,255,.05) 35%,
-            rgba(150,120,255,.45) 50%,
-            rgba(150,120,255,.04) 65%,
-            transparent 100%
-        );
-
-    filter:blur(2px);
-}
-
-.status-dot{
-    width:9px;
-    height:9px;
-
-    border-radius:50%;
-
-    display:inline-block;
-
-    background:var(--red);
-
-    margin-right:7px;
-}
-
-.status-dot.online{
-    background:var(--green);
-    box-shadow:0 0 12px var(--green);
 }
 
 .login{
@@ -878,56 +1262,141 @@ pre.config{
     padding:20px;
 }
 
-.login .card{
-    width:min(420px,100%);
+.login-card{
+    width:min(440px,100%);
+
+    position:relative;
+
+    overflow:hidden;
 }
 
-.small{
+.login-card::before{
+    content:"";
+
+    position:absolute;
+
+    width:250px;
+    height:250px;
+
+    right:-100px;
+    top:-120px;
+
+    background:
+        radial-gradient(
+            circle,
+            rgba(43,211,255,.25),
+            transparent 65%
+        );
+
+    pointer-events:none;
+}
+
+.login-logo{
+    text-align:center;
+
+    font-size:34px;
+
+    font-weight:1000;
+
+    direction:ltr;
+}
+
+.login-logo span{
+    color:var(--cyan);
+}
+
+.login-sub{
+    text-align:center;
+
+    color:var(--muted);
+
+    margin-bottom:25px;
+
     font-size:12px;
 }
 
-footer{
+.section-title{
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    gap:10px;
+}
+
+.footer{
     text-align:center;
-    color:var(--muted);
-    padding:30px 0 10px;
+
+    color:
+        rgba(115,160,180,.55);
+
+    padding:35px 0 10px;
+
+    font-size:10px;
+
+    letter-spacing:2px;
+
+    direction:ltr;
 }
 
 @media(max-width:850px){
 
     .grid{
-        grid-template-columns:repeat(2,1fr);
+        grid-template-columns:
+            repeat(2,1fr);
     }
 
     .qr-grid{
         grid-template-columns:1fr;
     }
 
-    .hero-title{
-        font-size:34px;
+    .hero-content{
+        padding:35px;
     }
+
+    .flame{
+        opacity:.35;
+        width:80%;
+    }
+
 }
 
-@media(max-width:520px){
+@media(max-width:550px){
 
     .container{
-        padding:15px;
+        padding:14px;
     }
 
     .grid{
         grid-template-columns:1fr;
     }
 
-    .hero-content{
-        padding:25px;
-    }
-
-    .hero-sword{
-        opacity:.35;
-    }
-
     .nav{
         align-items:flex-start;
     }
+
+    .nav-right{
+        flex-wrap:wrap;
+        justify-content:flex-end;
+    }
+
+    .hero{
+        min-height:330px;
+    }
+
+    .hero-title{
+        font-size:43px;
+    }
+
+    .hero-content{
+        padding:27px;
+    }
+
+    .hero-sub{
+        font-size:13px;
+    }
+
 }
 
 </style>
@@ -950,19 +1419,23 @@ function loginPage(error = "") {
         `
 <div class="login">
 
-<div class="card">
+<div class="card login-card">
 
-<div class="brand">
-⚔️ Vergil<span>Panel</span>
+<div class="login-logo">
+⚔️ VERGIL<span>PANEL</span>
 </div>
 
-<p class="muted">
-Sign in to your panel
-</p>
+<div class="login-sub">
+X R A Y   M A N A G E M E N T   S Y S T E M
+</div>
 
 ${
     error
-        ? `<div class="notice">${escapeHtml(error)}</div>`
+        ? `
+<div class="notice">
+${escapeHtml(error)}
+</div>
+`
         : ""
 }
 
@@ -972,17 +1445,18 @@ ${
 >
 
 <label>
-Username
+نام کاربری
 </label>
 
 <input
     name="username"
     required
     autocomplete="username"
+    dir="ltr"
 >
 
 <label>
-Password
+رمز عبور
 </label>
 
 <input
@@ -990,19 +1464,24 @@ Password
     name="password"
     required
     autocomplete="current-password"
+    dir="ltr"
 >
 
-<br><br>
+<br>
 
 <button
     class="btn primary"
     type="submit"
     style="width:100%"
 >
-Login
+ورود به پنل
 </button>
 
 </form>
+
+<div class="footer">
+POWERED BY YASIN BEHZAD
+</div>
 
 </div>
 
@@ -1012,15 +1491,17 @@ Login
 }
 
 function dashboardPage(req) {
-
     const users = allUsers();
     const active = activeUsers();
 
-    const xrayOnline =
+    const online =
         Boolean(
             xrayProcess &&
             !xrayProcess.killed
         );
+
+    const admin =
+        getAdmin();
 
     return layout(
         "Dashboard",
@@ -1029,23 +1510,41 @@ function dashboardPage(req) {
 
 <div class="nav">
 
-<div class="brand">
-⚔️ Vergil<span>Panel</span>
+<a
+    href="/dashboard"
+    class="brand"
+>
+
+<div class="brand-icon">
+⚔️
 </div>
+
+<div>
+VERGIL<span>PANEL</span>
+</div>
+
+</a>
 
 <div class="nav-right">
 
-<span class="muted">
+<span class="muted small">
 ${escapeHtml(
-    getSession(req)?.username || "admin"
+    admin?.username || "admin"
 )}
 </span>
 
 <a
     class="btn"
+    href="/settings"
+>
+⚙️ تنظیمات
+</a>
+
+<a
+    class="btn danger"
     href="/logout"
 >
-Logout
+خروج
 </a>
 
 </div>
@@ -1056,35 +1555,44 @@ Logout
 
 <div class="hero-content">
 
+<div class="hero-kicker">
+XRAY MANAGEMENT SYSTEM
+</div>
+
 <div class="hero-title">
-VERGILPANEL
+VERGIL
 </div>
 
 <div class="hero-sub">
-VLESS management powered by Xray
+مدیریت هوشمند VLESS با Xray
+<br>
+XHTTP + WebSocket
 </div>
 
-<br>
+<div class="powered">
+POWERED BY YASIN BEHZAD
+</div>
 
-<span class="badge">
+<div class="status">
 
 <span
     class="status-dot ${
-        xrayOnline ? "online" : ""
+        online ? "online" : ""
     }"
 ></span>
 
 Xray ${
-    xrayOnline
-        ? "Online"
-        : "Offline"
+    online
+        ? "ONLINE"
+        : "OFFLINE"
 }
-
-</span>
 
 </div>
 
-<div class="hero-sword"></div>
+</div>
+
+<div class="flame"></div>
+<div class="sword"></div>
 
 </div>
 
@@ -1093,7 +1601,7 @@ Xray ${
 <div class="card">
 
 <div class="stat-label">
-Users
+کاربران
 </div>
 
 <div class="stat-value">
@@ -1105,7 +1613,7 @@ ${users.length}
 <div class="card">
 
 <div class="stat-label">
-Active Users
+کاربران فعال
 </div>
 
 <div class="stat-value">
@@ -1150,23 +1658,16 @@ v${VERSION}
 
 <div class="card">
 
-<div
-    style="
-    display:flex;
-    justify-content:space-between;
-    gap:15px;
-    align-items:center
-    "
->
+<div class="section-title">
 
 <div>
 
 <h2>
-Users
+👤 کاربران
 </h2>
 
 <div class="muted">
-Automatic Xray configuration
+مدیریت خودکار کانفیگ‌های Xray
 </div>
 
 </div>
@@ -1175,7 +1676,7 @@ Automatic Xray configuration
     class="btn primary"
     href="/users/new"
 >
-＋ New User
+＋ کاربر جدید
 </a>
 
 </div>
@@ -1189,27 +1690,23 @@ Automatic Xray configuration
 <tr>
 
 <th>
-Username
+نام کاربری
 </th>
 
 <th>
-Protocol
+پروتکل
 </th>
 
 <th>
-UUID
+وضعیت
 </th>
 
 <th>
-Status
+کانفیگ
 </th>
 
 <th>
-Configs
-</th>
-
-<th>
-Actions
+عملیات
 </th>
 
 </tr>
@@ -1236,22 +1733,18 @@ VLESS
 </span>
 </td>
 
-<td class="small">
-${escapeHtml(user.uuid)}
-</td>
-
 <td>
 
 ${
     user.status === "active"
         ? `
 <span class="badge green">
-Active
+● فعال
 </span>
 `
         : `
 <span class="badge red">
-Disabled
+● غیرفعال
 </span>
 `
 }
@@ -1264,7 +1757,7 @@ Disabled
     class="btn"
     href="/users/config?id=${user.id}"
 >
-Config
+⚙️ کانفیگ
 </a>
 
 </td>
@@ -1291,8 +1784,8 @@ Config
 
 ${
     user.status === "active"
-        ? "Disable"
-        : "Enable"
+        ? "خاموش"
+        : "فعال"
 }
 
 </button>
@@ -1302,7 +1795,7 @@ ${
 <form
     method="POST"
     action="/users/delete"
-    onsubmit="return confirm('Delete this user?')"
+    onsubmit="return confirm('این کاربر حذف شود؟')"
 >
 
 <input
@@ -1315,7 +1808,7 @@ ${
     class="btn danger"
     type="submit"
 >
-Delete
+حذف
 </button>
 
 </form>
@@ -1331,10 +1824,10 @@ Delete
 <tr>
 
 <td
-    colspan="6"
+    colspan="5"
     class="muted"
 >
-No users yet.
+هنوز کاربری ساخته نشده است.
 </td>
 
 </tr>
@@ -1349,9 +1842,9 @@ No users yet.
 
 </div>
 
-<footer>
-VergilPanel v${VERSION} · Xray automatic management
-</footer>
+<div class="footer">
+VERGILPANEL v${VERSION} · POWERED BY YASIN BEHZAD
+</div>
 
 </div>
 `
@@ -1366,32 +1859,43 @@ function newUserPage(error = "") {
 
 <div class="nav">
 
-<div class="brand">
-⚔️ Vergil<span>Panel</span>
-</div>
+<a
+    href="/dashboard"
+    class="brand"
+>
+⚔️ VERGIL<span>PANEL</span>
+</a>
 
 <a
     class="btn"
     href="/dashboard"
 >
-← Dashboard
+← داشبورد
 </a>
 
 </div>
 
 <div class="card form">
 
+<div class="settings-icon">
+👤
+</div>
+
 <h1>
-New User
+ساخت کاربر
 </h1>
 
 <p class="muted">
-UUID and subscription token are generated automatically.
+UUID و Subscription به صورت خودکار ساخته می‌شوند.
 </p>
 
 ${
     error
-        ? `<div class="notice">${escapeHtml(error)}</div>`
+        ? `
+<div class="notice">
+${escapeHtml(error)}
+</div>
+`
         : ""
 }
 
@@ -1401,24 +1905,25 @@ ${
 >
 
 <label>
-Username
+نام کاربری
 </label>
 
 <input
     name="username"
     required
     maxlength="64"
-    placeholder="Vexa"
+    placeholder="User-01"
+    dir="ltr"
 >
 
 <label>
-Traffic Limit
+محدودیت ترافیک
 </label>
 
 <select name="traffic_limit">
 
 <option value="0">
-Unlimited
+نامحدود
 </option>
 
 <option value="10737418240">
@@ -1440,12 +1945,13 @@ Unlimited
 </select>
 
 <label>
-Expiry
+تاریخ انقضا
 </label>
 
 <input
     type="datetime-local"
     name="expires_at"
+    dir="ltr"
 >
 
 <br><br>
@@ -1454,7 +1960,7 @@ Expiry
     class="btn primary"
     type="submit"
 >
-Create User
+⚔️ ساخت کاربر
 </button>
 
 </form>
@@ -1466,8 +1972,152 @@ Create User
     );
 }
 
-async function configPage(req, user) {
+function settingsPage(
+    req,
+    message = "",
+    error = ""
+) {
+    const admin =
+        getAdmin();
 
+    return layout(
+        "Settings",
+        `
+<div class="container">
+
+<div class="nav">
+
+<a
+    href="/dashboard"
+    class="brand"
+>
+⚔️ VERGIL<span>PANEL</span>
+</a>
+
+<a
+    class="btn"
+    href="/dashboard"
+>
+← داشبورد
+</a>
+
+</div>
+
+<div class="card form">
+
+<div class="settings-icon">
+⚙️
+</div>
+
+<h1>
+تنظیمات مدیر
+</h1>
+
+<p class="muted">
+نام کاربری و رمز عبور ورود به پنل را تغییر دهید.
+</p>
+
+${
+    message
+        ? `
+<div class="notice">
+✅ ${escapeHtml(message)}
+</div>
+`
+        : ""
+}
+
+${
+    error
+        ? `
+<div class="notice">
+❌ ${escapeHtml(error)}
+</div>
+`
+        : ""
+}
+
+<form
+    method="POST"
+    action="/settings"
+>
+
+<label>
+نام کاربری جدید
+</label>
+
+<input
+    name="username"
+    value="${escapeHtml(
+        admin?.username || "admin"
+    )}"
+    required
+    maxlength="64"
+    dir="ltr"
+>
+
+<label>
+رمز عبور جدید
+</label>
+
+<input
+    type="password"
+    name="password"
+    placeholder="حداقل 4 کاراکتر"
+    minlength="4"
+    dir="ltr"
+>
+
+<label>
+تکرار رمز عبور
+</label>
+
+<input
+    type="password"
+    name="password_confirm"
+    placeholder="تکرار رمز عبور"
+    minlength="4"
+    dir="ltr"
+>
+
+<br><br>
+
+<button
+    class="btn primary"
+    type="submit"
+>
+💾 ذخیره تغییرات
+</button>
+
+</form>
+
+<br>
+
+<div class="notice">
+
+<strong>
+🔐 اطلاعات ورود
+</strong>
+
+<br><br>
+
+اگر رمز عبور را خالی بگذارید،
+رمز فعلی تغییر نمی‌کند.
+
+</div>
+
+</div>
+
+<div class="footer">
+POWERED BY YASIN BEHZAD
+</div>
+
+</div>
+`
+    );
+}
+
+async function configPage(req, user) {
     const origin =
         getPublicOrigin(req);
 
@@ -1502,15 +2152,18 @@ async function configPage(req, user) {
 
 <div class="nav">
 
-<div class="brand">
-⚔️ Vergil<span>Panel</span>
-</div>
+<a
+    href="/dashboard"
+    class="brand"
+>
+⚔️ VERGIL<span>PANEL</span>
+</a>
 
 <a
     class="btn"
     href="/dashboard"
 >
-← Dashboard
+← داشبورد
 </a>
 
 </div>
@@ -1518,26 +2171,30 @@ async function configPage(req, user) {
 <div class="card">
 
 <h1>
-${escapeHtml(user.username)}
+⚔️ ${escapeHtml(user.username)}
 </h1>
 
 <p class="muted">
-VLESS · automatic configuration
+VLESS · XHTTP + WebSocket
 </p>
 
 <div class="notice">
 
 <strong>
-Subscription URL
+📡 Subscription
 </strong>
 
-<pre class="config">${escapeHtml(subscriptionUrl)}</pre>
+<pre class="config">${escapeHtml(
+    subscriptionUrl
+)}</pre>
 
 <button
     class="btn primary"
-    onclick='copyText(${JSON.stringify(subscriptionUrl)})'
+    onclick='copyText(${JSON.stringify(
+        subscriptionUrl
+    )})'
 >
-Copy Subscription
+📋 کپی Subscription
 </button>
 
 </div>
@@ -1547,7 +2204,7 @@ Copy Subscription
 <div class="qr-card">
 
 <h3>
-Subscription QR
+📡 Subscription QR
 </h3>
 
 <img
@@ -1559,9 +2216,11 @@ Subscription QR
 
 <button
     class="btn"
-    onclick='copyText(${JSON.stringify(subscriptionUrl)})'
+    onclick='copyText(${JSON.stringify(
+        subscriptionUrl
+    )})'
 >
-Copy
+کپی لینک
 </button>
 
 </div>
@@ -1569,7 +2228,7 @@ Copy
 <div class="qr-card">
 
 <h3>
-XHTTP QR
+🔥 XHTTP QR
 </h3>
 
 <img
@@ -1581,9 +2240,11 @@ XHTTP QR
 
 <button
     class="btn"
-    onclick='copyText(${JSON.stringify(links.xhttp)})'
+    onclick='copyText(${JSON.stringify(
+        links.xhttp
+    )})'
 >
-Copy
+کپی
 </button>
 
 </div>
@@ -1594,13 +2255,17 @@ Copy
 🚀 VLESS + XHTTP
 </h2>
 
-<pre class="config">${escapeHtml(links.xhttp)}</pre>
+<pre class="config">${escapeHtml(
+    links.xhttp
+)}</pre>
 
 <button
     class="btn"
-    onclick='copyText(${JSON.stringify(links.xhttp)})'
+    onclick='copyText(${JSON.stringify(
+        links.xhttp
+    )})'
 >
-Copy XHTTP
+📋 Copy XHTTP
 </button>
 
 <br><br>
@@ -1609,13 +2274,17 @@ Copy XHTTP
 🌐 VLESS + WebSocket
 </h2>
 
-<pre class="config">${escapeHtml(links.websocket)}</pre>
+<pre class="config">${escapeHtml(
+    links.websocket
+)}</pre>
 
 <button
     class="btn"
-    onclick='copyText(${JSON.stringify(links.websocket)})'
+    onclick='copyText(${JSON.stringify(
+        links.websocket
+    )})'
 >
-Copy WebSocket
+📋 Copy WebSocket
 </button>
 
 <div class="qr-grid">
@@ -1623,7 +2292,7 @@ Copy WebSocket
 <div class="qr-card">
 
 <h3>
-XHTTP
+🔥 XHTTP
 </h3>
 
 <img
@@ -1636,7 +2305,7 @@ XHTTP
 <div class="qr-card">
 
 <h3>
-WebSocket
+🌐 WebSocket
 </h3>
 
 <img
@@ -1648,16 +2317,37 @@ WebSocket
 
 </div>
 
+<br>
+
+<div class="notice">
+
+<strong>
+💙 ساخته شده توسط یاسین
+</strong>
+
+<br>
+
+کاملاً رایگان و غیرقابل فروش
+
+<br><br>
+
+<span class="muted small">
+این پیام داخل Subscription نیز قرار گرفته است.
+</span>
+
+</div>
+
 <h2>
-UUID
+🆔 UUID
 </h2>
 
-<pre class="config">${escapeHtml(user.uuid)}</pre>
+<pre class="config">${escapeHtml(
+    user.uuid
+)}</pre>
 
-<p class="muted small">
-Public HTTPS is provided by Railway.
-Xray itself terminates no TLS on the internal ports.
-</p>
+<div class="footer">
+POWERED BY YASIN BEHZAD
+</div>
 
 </div>
 
@@ -1671,12 +2361,12 @@ async function copyText(text){
 
         await navigator.clipboard.writeText(text);
 
-        alert("Copied!");
+        alert("کپی شد ✅");
 
     }catch{
 
         prompt(
-            "Copy this:",
+            "متن را کپی کنید:",
             text
         );
 
@@ -1690,19 +2380,13 @@ async function copyText(text){
 }
 
 /*
- * Default admin
+ * Default Admin
  *
- * اگر Railway Variable وجود داشته باشد:
+ * Fresh deployment:
  *
- * ADMIN_USERNAME
- * ADMIN_PASSWORD
+ * admin / admin
  *
- * از آنها استفاده می‌شود.
- *
- * اگر وجود نداشته باشند:
- *
- * Username = admin
- * Password = admin
+ * Railway Variables can override it.
  */
 
 function ensureDefaultAdmin() {
@@ -1764,7 +2448,6 @@ function authenticate(
     username,
     password
 ) {
-
     const admin =
         db.prepare(`
             SELECT *
@@ -1791,7 +2474,7 @@ async function createUser(form) {
 
     if (!username) {
         throw new Error(
-            "Username is required."
+            "نام کاربری الزامی است."
         );
     }
 
@@ -1804,7 +2487,7 @@ async function createUser(form) {
 
     if (exists) {
         throw new Error(
-            "Username already exists."
+            "این نام کاربری قبلاً وجود دارد."
         );
     }
 
@@ -1837,7 +2520,7 @@ async function createUser(form) {
             )
         ) {
             throw new Error(
-                "Invalid expiry date."
+                "تاریخ انقضا نامعتبر است."
             );
         }
 
@@ -1939,29 +2622,101 @@ async function toggleUser(id) {
     await restartXray();
 }
 
+function updateAdmin(
+    username,
+    password
+) {
+    const admin =
+        getAdmin();
+
+    if (!admin) {
+        throw new Error(
+            "Admin account not found."
+        );
+    }
+
+    const cleanUsername =
+        String(
+            username || ""
+        ).trim();
+
+    if (!cleanUsername) {
+        throw new Error(
+            "نام کاربری نمی‌تواند خالی باشد."
+        );
+    }
+
+    if (
+        cleanUsername !==
+        admin.username
+    ) {
+
+        const duplicate =
+            db.prepare(`
+                SELECT id
+                FROM admins
+                WHERE username = ?
+                AND id != ?
+            `).get(
+                cleanUsername,
+                admin.id
+            );
+
+        if (duplicate) {
+            throw new Error(
+                "این نام کاربری قبلاً استفاده شده است."
+            );
+        }
+    }
+
+    if (password) {
+
+        if (
+            String(password).length < 4
+        ) {
+            throw new Error(
+                "رمز عبور باید حداقل 4 کاراکتر باشد."
+            );
+        }
+
+        db.prepare(`
+            UPDATE admins
+            SET
+                username = ?,
+                password_hash = ?
+            WHERE id = ?
+        `).run(
+            cleanUsername,
+            hashPassword(password),
+            admin.id
+        );
+
+    } else {
+
+        db.prepare(`
+            UPDATE admins
+            SET username = ?
+            WHERE id = ?
+        `).run(
+            cleanUsername,
+            admin.id
+        );
+    }
+}
+
 function proxyHttpToXray(
     req,
     res,
     targetPort
 ) {
-
     const options = {
-
-        hostname:
-            "127.0.0.1",
-
-        port:
-            targetPort,
-
-        path:
-            req.url,
-
-        method:
-            req.method,
+        hostname: "127.0.0.1",
+        port: targetPort,
+        path: req.url,
+        method: req.method,
 
         headers: {
             ...req.headers,
-
             host:
                 `127.0.0.1:${targetPort}`
         }
@@ -2001,9 +2756,7 @@ function proxyHttpToXray(
                 );
             }
 
-            res.end(
-                "Bad Gateway"
-            );
+            res.end("Bad Gateway");
         }
     );
 
@@ -2015,14 +2768,10 @@ function proxyWebSocket(
     clientSocket,
     head
 ) {
-
     const upstream =
         net.connect({
-            host:
-                "127.0.0.1",
-
-            port:
-                XRAY_WS_PORT
+            host: "127.0.0.1",
+            port: XRAY_WS_PORT
         });
 
     upstream.on(
@@ -2037,9 +2786,7 @@ function proxyWebSocket(
 
             for (
                 const [key, value]
-                of Object.entries(
-                    req.headers
-                )
+                of Object.entries(req.headers)
             ) {
 
                 if (
@@ -2075,19 +2822,11 @@ function proxyWebSocket(
                 head &&
                 head.length
             ) {
-
-                upstream.write(
-                    head
-                );
+                upstream.write(head);
             }
 
-            clientSocket.pipe(
-                upstream
-            );
-
-            upstream.pipe(
-                clientSocket
-            );
+            clientSocket.pipe(upstream);
+            upstream.pipe(clientSocket);
         }
     );
 
@@ -2132,7 +2871,6 @@ async function subscriptionResponse(
     res,
     token
 ) {
-
     const user =
         db.prepare(`
             SELECT *
@@ -2190,13 +2928,10 @@ async function subscriptionResponse(
         return;
     }
 
-    const origin =
-        getPublicOrigin(req);
-
     const content =
         makeSubscription(
             user,
-            origin
+            getPublicOrigin(req)
         );
 
     res.writeHead(
@@ -2217,7 +2952,6 @@ async function handleRequest(
     req,
     res
 ) {
-
     try {
 
         const url =
@@ -2258,9 +2992,7 @@ async function handleRequest(
         ) {
 
             const token =
-                pathname.slice(
-                    "/sub/".length
-                );
+                pathname.slice(5);
 
             await subscriptionResponse(
                 req,
@@ -2283,9 +3015,7 @@ async function handleRequest(
                 res,
                 {
                     ok: true,
-
-                    panel:
-                        VERSION,
+                    panel: VERSION,
 
                     xray:
                         Boolean(
@@ -2312,9 +3042,7 @@ async function handleRequest(
             req.method === "GET"
         ) {
 
-            if (
-                getSession(req)
-            ) {
+            if (getSession(req)) {
 
                 redirect(
                     res,
@@ -2360,7 +3088,7 @@ async function handleRequest(
                 sendHtml(
                     res,
                     loginPage(
-                        "Invalid username or password."
+                        "نام کاربری یا رمز عبور اشتباه است."
                     ),
                     401
                 );
@@ -2380,11 +3108,26 @@ async function handleRequest(
                 }
             );
 
+            /*
+             * اگر ورود با admin/admin باشد،
+             * کاربر را برای تغییر اطلاعات به Settings می‌فرستیم.
+             */
+
+            const admin =
+                getAdmin();
+
+            const isDefaultLogin =
+                admin &&
+                username === "admin" &&
+                password === "admin";
+
             res.writeHead(
                 302,
                 {
                     Location:
-                        "/dashboard",
+                        isDefaultLogin
+                            ? "/settings"
+                            : "/dashboard",
 
                     "Set-Cookie":
                         `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Secure`
@@ -2419,8 +3162,7 @@ async function handleRequest(
             res.writeHead(
                 302,
                 {
-                    Location:
-                        "/login",
+                    Location: "/login",
 
                     "Set-Cookie":
                         "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
@@ -2433,7 +3175,7 @@ async function handleRequest(
         }
 
         /*
-         * Authentication
+         * Protected routes
          */
 
         const session =
@@ -2459,6 +3201,94 @@ async function handleRequest(
                 res,
                 dashboardPage(req)
             );
+
+            return;
+        }
+
+        /*
+         * Settings
+         */
+
+        if (
+            pathname === "/settings" &&
+            req.method === "GET"
+        ) {
+
+            sendHtml(
+                res,
+                settingsPage(req)
+            );
+
+            return;
+        }
+
+        if (
+            pathname === "/settings" &&
+            req.method === "POST"
+        ) {
+
+            try {
+
+                const form =
+                    await readForm(req);
+
+                const username =
+                    String(
+                        form.get("username") || ""
+                    ).trim();
+
+                const password =
+                    String(
+                        form.get("password") || ""
+                    );
+
+                const confirm =
+                    String(
+                        form.get(
+                            "password_confirm"
+                        ) || ""
+                    );
+
+                if (
+                    password &&
+                    password !== confirm
+                ) {
+
+                    throw new Error(
+                        "رمزهای عبور یکسان نیستند."
+                    );
+                }
+
+                updateAdmin(
+                    username,
+                    password
+                );
+
+                /*
+                 * تمام Sessionهای قبلی حذف می‌شوند
+                 * تا با اطلاعات جدید دوباره Login شود.
+                 */
+
+                sessions.clear();
+
+                redirect(
+                    res,
+                    "/login"
+                );
+
+            } catch (error) {
+
+                sendHtml(
+                    res,
+                    settingsPage(
+                        req,
+                        "",
+                        error?.message ||
+                            "خطا در ذخیره تنظیمات."
+                    ),
+                    400
+                );
+            }
 
             return;
         }
@@ -2496,7 +3326,7 @@ async function handleRequest(
                     );
 
                 console.log(
-                    `👤 User created: ${user.username} (${user.uuid})`
+                    `👤 User created: ${user.username}`
                 );
 
                 redirect(
@@ -2506,16 +3336,11 @@ async function handleRequest(
 
             } catch (error) {
 
-                console.error(
-                    "User creation failed:",
-                    error
-                );
-
                 sendHtml(
                     res,
                     newUserPage(
                         error?.message ||
-                        "Failed to create user."
+                        "خطا در ساخت کاربر."
                     ),
                     500
                 );
@@ -2535,9 +3360,7 @@ async function handleRequest(
 
             const id =
                 Number(
-                    url.searchParams.get(
-                        "id"
-                    )
+                    url.searchParams.get("id")
                 );
 
             const user =
@@ -2552,25 +3375,27 @@ async function handleRequest(
                 sendHtml(
                     res,
                     layout(
-                        "Not Found",
+                        "404",
                         `
-                        <div class="container">
-                        <div class="card">
+<div class="container">
 
-                        <h1>
-                        User not found
-                        </h1>
+<div class="card">
 
-                        <a
-                            class="btn"
-                            href="/dashboard"
-                        >
-                        Dashboard
-                        </a>
+<h1>
+کاربر پیدا نشد
+</h1>
 
-                        </div>
-                        </div>
-                        `
+<a
+    class="btn"
+    href="/dashboard"
+>
+داشبورد
+</a>
+
+</div>
+
+</div>
+`
                     ),
                     404
                 );
@@ -2590,7 +3415,7 @@ async function handleRequest(
         }
 
         /*
-         * Toggle User
+         * Toggle
          */
 
         if (
@@ -2610,7 +3435,6 @@ async function handleRequest(
             } catch (error) {
 
                 console.error(
-                    "Toggle user failed:",
                     error
                 );
             }
@@ -2624,7 +3448,7 @@ async function handleRequest(
         }
 
         /*
-         * Delete User
+         * Delete
          */
 
         if (
@@ -2644,7 +3468,6 @@ async function handleRequest(
             } catch (error) {
 
                 console.error(
-                    "Delete user failed:",
                     error
                 );
             }
@@ -2662,22 +3485,29 @@ async function handleRequest(
             layout(
                 "404",
                 `
-                <div class="container">
+<div class="container">
 
-                <div class="card">
+<div class="card">
 
-                <h1>
-                404
-                </h1>
+<h1>
+404
+</h1>
 
-                <p class="muted">
-                Not Found
-                </p>
+<p class="muted">
+صفحه مورد نظر پیدا نشد.
+</p>
 
-                </div>
+<a
+    class="btn"
+    href="/dashboard"
+>
+بازگشت
+</a>
 
-                </div>
-                `
+</div>
+
+</div>
+`
             ),
             404
         );
@@ -2689,9 +3519,7 @@ async function handleRequest(
             error
         );
 
-        if (
-            !res.headersSent
-        ) {
+        if (!res.headersSent) {
 
             sendJson(
                 res,
@@ -2706,18 +3534,10 @@ async function handleRequest(
     }
 }
 
-/*
- * HTTP Server
- */
-
 const server =
     http.createServer(
         handleRequest
     );
-
-/*
- * WebSocket Upgrade
- */
 
 server.on(
     "upgrade",
@@ -2756,10 +3576,6 @@ server.on(
     }
 );
 
-/*
- * Start
- */
-
 ensureDefaultAdmin();
 
 await startXray();
@@ -2774,30 +3590,15 @@ server.listen(
         );
 
         console.log(
-            `📦 Database: ${DB_PATH}`
+            `👤 Login: admin / admin`
         );
 
         console.log(
-            `🌐 Public domain: ${
-                process.env.RAILWAY_PUBLIC_DOMAIN ||
-                "detected from request"
-            }`
+            `💙 POWERED BY YASIN BEHZAD`
         );
 
         console.log(
-            `🚀 XHTTP path: ${XHTTP_PATH}`
-        );
-
-        console.log(
-            `🌐 WebSocket path: ${WS_PATH}`
-        );
-
-        console.log(
-            `👤 Default login: admin / admin`
-        );
-
-        console.log(
-            `⚔️ Railway TCP Proxy is NOT required`
+            `⚔️ Railway TCP Proxy NOT required`
         );
     }
 );
@@ -2805,7 +3606,7 @@ server.listen(
 async function shutdown(signal) {
 
     console.log(
-        `\nReceived ${signal}`
+        `Received ${signal}`
     );
 
     stoppingXray = true;
