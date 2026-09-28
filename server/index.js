@@ -1,48 +1,45 @@
-const http = require("http");
-const crypto = require("crypto");
-const fs = require("fs/promises");
-const Database = require("better-sqlite3");
+import http from "node:http";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import Database from "better-sqlite3";
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = "0.0.0.0";
 
 const DATA_DIR = process.env.DATA_DIR || "/app/data";
 const DB_PATH = `${DATA_DIR}/vergilpanel.db`;
+const VERSION = "0.4.0";
 
-let db;
+await fs.mkdir(DATA_DIR, { recursive: true });
 
-async function ensureDataDir() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-}
+const db = new Database(DB_PATH);
 
-async function initDatabase() {
-  await ensureDataDir();
+db.pragma("journal_mode = WAL");
 
-  db = new Database(DB_PATH);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
 
-  db.pragma("journal_mode = WAL");
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    uuid TEXT NOT NULL UNIQUE,
+    protocol TEXT NOT NULL DEFAULT 'vless',
+    traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
+    traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL
+  );
+`);
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS admins (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
+const sessions = new Map();
 
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT NOT NULL UNIQUE,
-      uuid TEXT NOT NULL UNIQUE,
-      protocol TEXT NOT NULL DEFAULT 'vless',
-      traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
-      traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
-      expires_at TEXT,
-      status TEXT NOT NULL DEFAULT 'active',
-      created_at TEXT NOT NULL
-    );
-  `);
-}
+const startedAt = Date.now();
 
 function hashPassword(password) {
   return crypto
@@ -51,44 +48,111 @@ function hashPassword(password) {
     .digest("hex");
 }
 
-function generateUUID() {
-  return crypto.randomUUID();
+function escapeHtml(value = "") {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-function nowISO() {
-  return new Date().toISOString();
+function formatUptime(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (days > 0) {
+    return `${days}d ${hours}h ${minutes}m`;
+  }
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+
+  return `${seconds}s`;
 }
 
-const sessions = new Map();
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
 
-function createSession(adminId, username) {
+  if (value === 0) {
+    return "Unlimited";
+  }
+
+  if (value < 1024 ** 3) {
+    return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  }
+
+  return `${(value / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function formatDate(date) {
+  if (!date) {
+    return "—";
+  }
+
+  return new Date(date).toLocaleDateString("en-GB");
+}
+
+function send(res, statusCode, body, contentType = "text/html; charset=utf-8") {
+  res.writeHead(statusCode, {
+    "Content-Type": contentType,
+    "Cache-Control": "no-store",
+  });
+
+  res.end(body);
+}
+
+function redirect(res, location) {
+  res.writeHead(302, {
+    Location: location,
+    "Cache-Control": "no-store",
+  });
+
+  res.end();
+}
+
+function getCookie(req, name) {
+  const cookieHeader = req.headers.cookie;
+
+  if (!cookieHeader) {
+    return null;
+  }
+
+  const cookies = cookieHeader.split(";");
+
+  for (const cookie of cookies) {
+    const [key, ...parts] = cookie.trim().split("=");
+
+    if (key === name) {
+      return decodeURIComponent(parts.join("="));
+    }
+  }
+
+  return null;
+}
+
+function createSession(username) {
   const token = crypto.randomBytes(32).toString("hex");
 
   sessions.set(token, {
-    adminId,
     username,
-    createdAt: Date.now()
+    createdAt: Date.now(),
   });
 
   return token;
 }
 
-function deleteSession(token) {
-  if (token) {
-    sessions.delete(token);
-  }
-}
-
-function getSessionToken(req) {
-  const cookie = req.headers.cookie || "";
-
-  const match = cookie.match(/(?:^|;\s*)vergil_session=([^;]+)/);
-
-  return match ? match[1] : null;
-}
-
 function getSession(req) {
-  const token = getSessionToken(req);
+  const token = getCookie(req, "vergil_session");
 
   if (!token) {
     return null;
@@ -97,17 +161,31 @@ function getSession(req) {
   return sessions.get(token) || null;
 }
 
+function deleteSession(req) {
+  const token = getCookie(req, "vergil_session");
+
+  if (token) {
+    sessions.delete(token);
+  }
+}
+
+function requireAuth(req, res) {
+  const session = getSession(req);
+
+  if (!session) {
+    redirect(res, "/login");
+    return null;
+  }
+
+  return session;
+}
+
 async function readBody(req) {
-  return new Promise((resolve, reject) => {
+  return await new Promise((resolve, reject) => {
     let body = "";
 
-    req.on("data", chunk => {
+    req.on("data", (chunk) => {
       body += chunk.toString();
-
-      if (body.length > 1024 * 1024) {
-        reject(new Error("Request body too large"));
-        req.destroy();
-      }
     });
 
     req.on("end", () => {
@@ -125,6 +203,7 @@ async function readBody(req) {
           )
         ) {
           const params = new URLSearchParams(body);
+
           const result = {};
 
           for (const [key, value] of params.entries()) {
@@ -145,113 +224,13 @@ async function readBody(req) {
   });
 }
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-function formatUptime(seconds) {
-  seconds = Math.floor(seconds);
-
-  const days = Math.floor(seconds / 86400);
-  seconds %= 86400;
-
-  const hours = Math.floor(seconds / 3600);
-  seconds %= 3600;
-
-  const minutes = Math.floor(seconds / 60);
-  seconds %= 60;
-
-  const parts = [];
-
-  if (days) parts.push(`${days}d`);
-  if (hours) parts.push(`${hours}h`);
-  if (minutes) parts.push(`${minutes}m`);
-
-  parts.push(`${seconds}s`);
-
-  return parts.join(" ");
-}
-
-function formatBytes(bytes) {
-  const value = Number(bytes || 0);
-
-  if (value === 0) {
-    return "Unlimited";
-  }
-
-  const units = ["B", "KB", "MB", "GB", "TB"];
-
-  let size = value;
-  let index = 0;
-
-  while (size >= 1024 && index < units.length - 1) {
-    size /= 1024;
-    index++;
-  }
-
-  return `${size.toFixed(index === 0 ? 0 : 2)} ${units[index]}`;
-}
-
-function formatDate(date) {
-  if (!date) {
-    return "No expiry";
-  }
-
-  const d = new Date(date);
-
-  if (Number.isNaN(d.getTime())) {
-    return "Invalid date";
-  }
-
-  return d.toLocaleDateString("en-GB", {
-    year: "numeric",
-    month: "short",
-    day: "numeric"
-  });
-}
-
-function redirect(res, location) {
-  res.writeHead(302, {
-    Location: location
-  });
-
-  res.end();
-}
-
-function sendJson(res, statusCode, data) {
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
-  });
-
-  res.end(JSON.stringify(data));
-}
-
-function sendHtml(res, statusCode, html) {
-  res.writeHead(statusCode, {
-    "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store"
-  });
-
-  res.end(html);
-}
-
-function page(title, content, session = null) {
-  return `
-<!DOCTYPE html>
+function page(title, content, username = null) {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
-  >
-  <title>${escapeHtml(title)} — VergilPanel</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)} - VergilPanel</title>
 
   <style>
     * {
@@ -262,18 +241,21 @@ function page(title, content, session = null) {
       margin: 0;
       font-family:
         Inter,
+        system-ui,
         -apple-system,
         BlinkMacSystemFont,
         "Segoe UI",
         sans-serif;
+
       background:
         radial-gradient(
-          circle at top right,
-          rgba(88, 28, 135, 0.22),
-          transparent 35%
-        ),
-        #070711;
-      color: #f5f5f5;
+          circle at top,
+          #18223b 0,
+          #090d17 45%,
+          #05070d 100%
+        );
+
+      color: #f5f7ff;
       min-height: 100vh;
     }
 
@@ -283,131 +265,42 @@ function page(title, content, session = null) {
     }
 
     .container {
-      width: min(1150px, calc(100% - 32px));
+      width: min(1100px, calc(100% - 32px));
       margin: 0 auto;
     }
 
-    .navbar {
-      border-bottom: 1px solid rgba(255,255,255,0.08);
-      background: rgba(7,7,17,0.82);
-      backdrop-filter: blur(14px);
-      position: sticky;
-      top: 0;
-      z-index: 10;
+    .nav {
+      padding: 22px 0;
+      border-bottom: 1px solid rgba(255,255,255,.08);
     }
 
     .nav-inner {
-      min-height: 70px;
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      align-items: center;
       gap: 20px;
     }
 
     .brand {
       font-size: 21px;
       font-weight: 800;
-      letter-spacing: -0.5px;
+      letter-spacing: -.5px;
     }
 
     .brand span {
-      color: #a855f7;
+      color: #8da2ff;
     }
 
     .nav-right {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 14px;
       flex-wrap: wrap;
     }
 
-    .admin-badge {
-      padding: 8px 12px;
-      border-radius: 10px;
-      background: rgba(255,255,255,0.06);
-      color: #cfcfe5;
-      font-size: 13px;
-    }
-
-    .logout {
-      border: 0;
-      cursor: pointer;
-      padding: 8px 13px;
-      border-radius: 10px;
-      background: rgba(239,68,68,0.12);
-      color: #fca5a5;
-      font-weight: 600;
-    }
-
-    main {
-      padding: 38px 0 60px;
-    }
-
-    h1 {
-      margin: 0;
-      font-size: 32px;
-      letter-spacing: -1px;
-    }
-
-    h2 {
-      margin-top: 0;
-    }
-
-    .subtitle {
-      margin-top: 8px;
-      color: #9999ad;
-    }
-
-    .cards {
-      display: grid;
-      grid-template-columns:
-        repeat(auto-fit, minmax(190px, 1fr));
-      gap: 16px;
-      margin-top: 28px;
-    }
-
-    .card {
-      background: rgba(255,255,255,0.045);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 17px;
-      padding: 20px;
-      box-shadow:
-        0 10px 40px rgba(0,0,0,0.18);
-    }
-
-    .card-label {
-      color: #9696aa;
-      font-size: 13px;
-      margin-bottom: 10px;
-    }
-
-    .card-value {
-      font-size: 25px;
-      font-weight: 800;
-    }
-
-    .green {
-      color: #4ade80;
-    }
-
-    .yellow {
-      color: #facc15;
-    }
-
-    .muted {
-      color: #9696aa;
-    }
-
-    .section {
-      margin-top: 28px;
-    }
-
-    .section-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      margin-bottom: 16px;
+    .admin {
+      color: #aeb8d3;
+      font-size: 14px;
     }
 
     .btn {
@@ -415,72 +308,134 @@ function page(title, content, session = null) {
       align-items: center;
       justify-content: center;
       border: 0;
-      cursor: pointer;
+      border-radius: 10px;
       padding: 11px 16px;
-      border-radius: 11px;
-      font-weight: 700;
       font-size: 14px;
-    }
-
-    .btn-primary {
-      background: linear-gradient(
-        135deg,
-        #9333ea,
-        #6d28d9
-      );
+      font-weight: 700;
+      cursor: pointer;
       color: white;
-      box-shadow:
-        0 8px 25px rgba(124,58,237,0.25);
+      background: #536dfe;
+      transition: .2s;
     }
 
-    .btn-danger {
-      background: rgba(239,68,68,0.12);
-      color: #fca5a5;
+    .btn:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.08);
     }
 
-    .btn-secondary {
-      background: rgba(255,255,255,0.07);
-      color: #ddd;
+    .btn.secondary {
+      background: rgba(255,255,255,.08);
+    }
+
+    .btn.danger {
+      background: #d9445c;
+    }
+
+    .hero {
+      padding: 42px 0 28px;
+    }
+
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: clamp(28px, 5vw, 42px);
+      letter-spacing: -1px;
+    }
+
+    .hero p {
+      margin: 0;
+      color: #99a4c0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+
+    .card {
+      background: rgba(15,21,36,.82);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 16px;
+      padding: 22px;
+      box-shadow: 0 12px 35px rgba(0,0,0,.2);
+    }
+
+    .card-title {
+      color: #8f9ab7;
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
+
+    .card-value {
+      font-size: 25px;
+      font-weight: 800;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #36d399;
+      display: inline-block;
+    }
+
+    .dot.off {
+      background: #8a93a8;
+    }
+
+    .section {
+      margin-top: 24px;
+    }
+
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 15px;
+      margin-bottom: 16px;
+    }
+
+    .section-header h2 {
+      margin: 0;
+      font-size: 21px;
     }
 
     .table-wrap {
       overflow-x: auto;
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 16px;
-      background: rgba(255,255,255,0.035);
     }
 
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 850px;
+      min-width: 720px;
     }
 
     th,
     td {
-      padding: 15px 16px;
       text-align: left;
-      border-bottom:
-        1px solid rgba(255,255,255,0.06);
-      white-space: nowrap;
+      padding: 15px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.07);
     }
 
     th {
-      color: #9696aa;
+      color: #8e99b5;
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
+      letter-spacing: .5px;
     }
 
     td {
+      color: #dce2f1;
       font-size: 14px;
     }
 
-    tr:last-child td {
-      border-bottom: 0;
-    }
-
-    .status {
+    .badge {
       display: inline-flex;
       padding: 5px 9px;
       border-radius: 999px;
@@ -488,39 +443,25 @@ function page(title, content, session = null) {
       font-weight: 700;
     }
 
-    .status-active {
-      background: rgba(34,197,94,0.12);
-      color: #4ade80;
+    .badge.active {
+      background: rgba(54,211,153,.12);
+      color: #63e6b1;
     }
 
-    .status-disabled {
-      background: rgba(239,68,68,0.12);
-      color: #fca5a5;
-    }
-
-    .empty {
-      padding: 55px 20px;
-      text-align: center;
-      color: #8e8ea1;
+    .badge.disabled {
+      background: rgba(217,68,92,.12);
+      color: #ff7f91;
     }
 
     .form-card {
-      max-width: 650px;
-      margin: 35px auto 0;
-      background: rgba(255,255,255,0.045);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 18px;
-      padding: 25px;
-    }
-
-    .field {
-      margin-bottom: 18px;
+      max-width: 620px;
+      margin: 45px auto;
     }
 
     label {
       display: block;
-      margin-bottom: 8px;
-      color: #d8d8e4;
+      margin-bottom: 7px;
+      color: #b5bfd6;
       font-size: 14px;
       font-weight: 600;
     }
@@ -528,87 +469,86 @@ function page(title, content, session = null) {
     input,
     select {
       width: 100%;
-      padding: 12px 13px;
-      border-radius: 11px;
-      border: 1px solid rgba(255,255,255,0.1);
-      background: #11111d;
+      padding: 13px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.1);
+      background: #0b101d;
       color: white;
       outline: none;
+      margin-bottom: 18px;
       font-size: 14px;
     }
 
     input:focus,
     select:focus {
-      border-color: #9333ea;
+      border-color: #536dfe;
     }
 
-    .help {
-      margin-top: 7px;
-      color: #77778b;
-      font-size: 12px;
+    .login-card {
+      max-width: 430px;
+      margin: 90px auto;
     }
 
-    .actions {
-      display: flex;
-      gap: 10px;
-      margin-top: 22px;
-      flex-wrap: wrap;
+    .login-logo {
+      text-align: center;
+      font-size: 32px;
+      font-weight: 900;
+      margin-bottom: 8px;
     }
 
-    .notice {
-      padding: 13px 15px;
-      border-radius: 12px;
+    .login-subtitle {
+      text-align: center;
+      color: #8f9ab7;
+      margin-bottom: 28px;
+    }
+
+    .error {
+      background: rgba(217,68,92,.12);
+      border: 1px solid rgba(217,68,92,.25);
+      color: #ff8b9a;
+      padding: 12px 14px;
+      border-radius: 10px;
       margin-bottom: 18px;
       font-size: 14px;
     }
 
-    .notice-error {
-      background: rgba(239,68,68,0.1);
-      color: #fca5a5;
-      border: 1px solid rgba(239,68,68,0.15);
-    }
-
     footer {
-      border-top: 1px solid rgba(255,255,255,0.06);
-      padding: 22px 0;
+      padding: 45px 0 30px;
       text-align: center;
-      color: #666679;
+      color: #66718d;
       font-size: 12px;
     }
 
-    .back {
-      display: inline-block;
-      margin-bottom: 22px;
-      color: #a855f7;
-      font-size: 14px;
-      font-weight: 600;
+    .empty {
+      text-align: center;
+      padding: 45px 20px;
+      color: #7e89a5;
     }
 
-    .uuid {
-      font-family: monospace;
-      font-size: 12px;
-      color: #aaaabd;
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
     }
 
-    @media (max-width: 650px) {
+    @media (max-width: 850px) {
+      .grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 560px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
       .nav-inner {
-        min-height: 62px;
-      }
-
-      .admin-badge {
-        display: none;
-      }
-
-      main {
-        padding-top: 28px;
-      }
-
-      h1 {
-        font-size: 27px;
-      }
-
-      .section-head {
         align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .hero {
+        padding-top: 30px;
       }
     }
   </style>
@@ -616,36 +556,38 @@ function page(title, content, session = null) {
 
 <body>
 
-  <nav class="navbar">
+  ${
+    username
+      ? `
+  <nav class="nav">
     <div class="container nav-inner">
       <a href="/dashboard" class="brand">
         ⚔️ Vergil<span>Panel</span>
       </a>
 
-      ${
-        session
-          ? `
-            <div class="nav-right">
-              <div class="admin-badge">
-                Admin: ${escapeHtml(session.username)}
-              </div>
+      <div class="nav-right">
+        <span class="admin">
+          Admin: ${escapeHtml(username)}
+        </span>
 
-              <form method="POST" action="/logout">
-                <button class="logout" type="submit">
-                  Logout
-                </button>
-              </form>
-            </div>
-          `
-          : ""
-      }
+        <a href="/dashboard" class="btn secondary">
+          Dashboard
+        </a>
+
+        <form method="POST" action="/logout" style="margin:0;">
+          <button class="btn danger" type="submit">
+            Logout
+          </button>
+        </form>
+      </div>
     </div>
   </nav>
+  `
+      : ""
+  }
 
-  <main>
-    <div class="container">
-      ${content}
-    </div>
+  <main class="container">
+    ${content}
   </main>
 
   <footer>
@@ -653,288 +595,294 @@ function page(title, content, session = null) {
   </footer>
 
 </body>
-</html>
-`;
+</html>`;
 }
 
-function requireSession(req, res) {
-  const session = getSession(req);
+function loginPage(error = "") {
+  return page(
+    "Login",
+    `
+    <div class="card login-card">
 
-  if (!session) {
-    redirect(res, "/login");
-    return null;
-  }
+      <div class="login-logo">
+        ⚔️ VergilPanel
+      </div>
 
-  return session;
-}
-
-function renderLogin(res, error = "") {
-  const content = `
-    <div class="form-card">
-      <h1>Welcome back 👋</h1>
-
-      <p class="subtitle">
-        Login to your VergilPanel administrator account.
-      </p>
+      <div class="login-subtitle">
+        Administrator Login
+      </div>
 
       ${
         error
-          ? `
-            <div class="notice notice-error">
-              ${escapeHtml(error)}
-            </div>
-          `
+          ? `<div class="error">${escapeHtml(error)}</div>`
           : ""
       }
 
       <form method="POST" action="/login">
 
-        <div class="field">
-          <label>Username</label>
-          <input
-            type="text"
-            name="username"
-            required
-            autocomplete="username"
-          >
-        </div>
+        <label>Username</label>
+        <input
+          type="text"
+          name="username"
+          autocomplete="username"
+          required
+        >
 
-        <div class="field">
-          <label>Password</label>
-          <input
-            type="password"
-            name="password"
-            required
-            autocomplete="current-password"
-          >
-        </div>
+        <label>Password</label>
+        <input
+          type="password"
+          name="password"
+          autocomplete="current-password"
+          required
+        >
 
-        <button class="btn btn-primary" type="submit">
+        <button class="btn" type="submit" style="width:100%;">
           Login
         </button>
 
       </form>
-    </div>
-  `;
 
-  sendHtml(
-    res,
-    200,
-    page("Login", content)
+    </div>
+    `
   );
 }
 
-function renderSetup(res, error = "") {
-  const content = `
-    <div class="form-card">
-      <h1>⚔️ Setup VergilPanel</h1>
+function setupPage(error = "") {
+  return page(
+    "Setup",
+    `
+    <div class="card login-card">
 
-      <p class="subtitle">
-        Create your first administrator account.
-      </p>
+      <div class="login-logo">
+        ⚔️ VergilPanel
+      </div>
+
+      <div class="login-subtitle">
+        Initial Setup
+      </div>
 
       ${
         error
-          ? `
-            <div class="notice notice-error">
-              ${escapeHtml(error)}
-            </div>
-          `
+          ? `<div class="error">${escapeHtml(error)}</div>`
           : ""
       }
 
       <form method="POST" action="/setup">
 
-        <div class="field">
-          <label>Username</label>
-          <input
-            type="text"
-            name="username"
-            required
-            autocomplete="username"
-          >
-        </div>
+        <label>Admin Username</label>
+        <input
+          type="text"
+          name="username"
+          autocomplete="username"
+          required
+        >
 
-        <div class="field">
-          <label>Password</label>
-          <input
-            type="password"
-            name="password"
-            required
-            minlength="6"
-            autocomplete="new-password"
-          >
-        </div>
+        <label>Admin Password</label>
+        <input
+          type="password"
+          name="password"
+          autocomplete="new-password"
+          required
+        >
 
-        <button class="btn btn-primary" type="submit">
+        <button class="btn" type="submit" style="width:100%;">
           Create Administrator
         </button>
 
       </form>
-    </div>
-  `;
 
-  sendHtml(
-    res,
-    200,
-    page("Setup", content)
+    </div>
+    `
   );
 }
 
-function renderDashboard(res, session) {
-  const adminCount = db
-    .prepare("SELECT COUNT(*) AS count FROM admins")
-    .get().count;
-
-  const userCount = db
+function dashboardPage(username) {
+  const totalUsers = db
     .prepare("SELECT COUNT(*) AS count FROM users")
     .get().count;
 
-  const activeUserCount = db
+  const activeUsers = db
     .prepare(
       "SELECT COUNT(*) AS count FROM users WHERE status = 'active'"
     )
     .get().count;
 
-  const content = `
-    <h1>Dashboard</h1>
+  const totalAdmins = db
+    .prepare("SELECT COUNT(*) AS count FROM admins")
+    .get().count;
 
-    <p class="subtitle">
-      Welcome back, ${escapeHtml(session.username)} 👋
-    </p>
+  return page(
+    "Dashboard",
+    `
+    <div class="hero">
+      <h1>Dashboard</h1>
+      <p>
+        Welcome back, ${escapeHtml(username)} 👋
+      </p>
+    </div>
 
-    <div class="cards">
+    <div class="grid">
 
       <div class="card">
-        <div class="card-label">
+        <div class="card-title">
           Panel Status
         </div>
-        <div class="card-value green">
-          🟢 Online
+
+        <div class="card-value status">
+          <span class="dot"></span>
+          Online
         </div>
       </div>
 
       <div class="card">
-        <div class="card-label">
+        <div class="card-title">
           Database
         </div>
-        <div class="card-value green">
-          🟢 Connected
+
+        <div class="card-value status">
+          <span class="dot"></span>
+          Connected
         </div>
       </div>
 
       <div class="card">
-        <div class="card-label">
-          Xray
-        </div>
-        <div class="card-value yellow">
-          ⚪ Not configured
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-label">
-          Administrators
-        </div>
-        <div class="card-value">
-          ${adminCount}
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-label">
+        <div class="card-title">
           Users
         </div>
+
         <div class="card-value">
-          ${userCount}
+          ${totalUsers}
         </div>
       </div>
 
       <div class="card">
-        <div class="card-label">
+        <div class="card-title">
           Active Users
         </div>
-        <div class="card-value green">
-          ${activeUserCount}
-        </div>
-      </div>
 
-      <div class="card">
-        <div class="card-label">
-          Uptime
-        </div>
         <div class="card-value">
-          ${formatUptime(
-            process.uptime()
-          )}
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-label">
-          Version
-        </div>
-        <div class="card-value">
-          v0.4.0
+          ${activeUsers}
         </div>
       </div>
 
     </div>
 
     <div class="section">
-      <div class="section-head">
-        <h2>Management</h2>
+
+      <div class="section-header">
+        <h2>System</h2>
       </div>
 
-      <div class="cards">
+      <div class="grid">
+
+        <div class="card">
+          <div class="card-title">
+            Administrators
+          </div>
+
+          <div class="card-value">
+            ${totalAdmins}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            Xray
+          </div>
+
+          <div class="card-value status">
+            <span class="dot off"></span>
+            Not configured
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            Uptime
+          </div>
+
+          <div class="card-value">
+            ${formatUptime(Date.now() - startedAt)}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            Version
+          </div>
+
+          <div class="card-value">
+            v${VERSION}
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+    <div class="section">
+
+      <div class="section-header">
+        <h2>Management</h2>
+
+        <a href="/users/new" class="btn">
+          + New User
+        </a>
+      </div>
+
+      <div class="grid">
 
         <a href="/users" class="card">
-          <div style="font-size:30px">👥</div>
+          <div class="card-title">
+            Users
+          </div>
 
-          <h3>Users</h3>
-
-          <p class="muted">
-            Manage VPN users, UUIDs,
-            traffic limits and expiry.
-          </p>
+          <div class="card-value">
+            Manage →
+          </div>
         </a>
 
         <div class="card">
-          <div style="font-size:30px">⚡</div>
+          <div class="card-title">
+            Xray
+          </div>
 
-          <h3>Xray</h3>
-
-          <p class="muted">
-            Xray configuration will be
-            connected in a later version.
-          </p>
+          <div class="card-value">
+            Coming soon
+          </div>
         </div>
 
         <div class="card">
-          <div style="font-size:30px">⚙️</div>
+          <div class="card-title">
+            Settings
+          </div>
 
-          <h3>Settings</h3>
+          <div class="card-value">
+            Coming soon
+          </div>
+        </div>
 
-          <p class="muted">
-            Panel settings are coming soon.
-          </p>
+        <div class="card">
+          <div class="card-title">
+            API
+          </div>
+
+          <div class="card-value">
+            Coming soon
+          </div>
         </div>
 
       </div>
-    </div>
-  `;
 
-  sendHtml(
-    res,
-    200,
-    page("Dashboard", content, session)
+    </div>
+    `,
+    username
   );
 }
 
-function renderUsers(res, session) {
+function usersPage(username) {
   const users = db
-    .prepare(
-      `
+    .prepare(`
       SELECT
         id,
         username,
@@ -947,269 +895,228 @@ function renderUsers(res, session) {
         created_at
       FROM users
       ORDER BY id DESC
-      `
-    )
+    `)
     .all();
 
-  let tableContent = "";
+  const rows = users.length
+    ? users
+        .map(
+          (user) => `
+      <tr>
 
-  if (users.length === 0) {
-    tableContent = `
+        <td>
+          <strong>${escapeHtml(user.username)}</strong>
+        </td>
+
+        <td>
+          ${escapeHtml(user.protocol.toUpperCase())}
+        </td>
+
+        <td style="font-family:monospace;font-size:12px;">
+          ${escapeHtml(user.uuid)}
+        </td>
+
+        <td>
+          ${formatBytes(user.traffic_limit_bytes)}
+        </td>
+
+        <td>
+          ${formatBytes(user.traffic_used_bytes)}
+        </td>
+
+        <td>
+          ${formatDate(user.expires_at)}
+        </td>
+
+        <td>
+          <span class="badge ${
+            user.status === "active"
+              ? "active"
+              : "disabled"
+          }">
+            ${escapeHtml(user.status)}
+          </span>
+        </td>
+
+        <td>
+          <form method="POST" action="/users/delete">
+            <input
+              type="hidden"
+              name="id"
+              value="${user.id}"
+            >
+
+            <button
+              class="btn danger"
+              type="submit"
+              onclick="return confirm('Delete this user?')"
+            >
+              Delete
+            </button>
+          </form>
+        </td>
+
+      </tr>
+    `
+        )
+        .join("")
+    : `
       <tr>
         <td colspan="8">
           <div class="empty">
-            <div style="font-size:40px">👤</div>
-            <h3>No users yet</h3>
-            <p>
-              Create your first VPN user
-              to get started.
-            </p>
+            No users yet.
           </div>
         </td>
       </tr>
     `;
-  } else {
-    tableContent = users
-      .map(user => {
-        const statusClass =
-          user.status === "active"
-            ? "status-active"
-            : "status-disabled";
 
-        const statusText =
-          user.status === "active"
-            ? "Active"
-            : "Disabled";
+  return page(
+    "Users",
+    `
+    <div class="hero">
 
-        return `
-          <tr>
+      <h1>Users</h1>
 
-            <td>
-              <strong>
-                ${escapeHtml(user.username)}
-              </strong>
-            </td>
+      <p>
+        Manage your VLESS users.
+      </p>
 
-            <td>
-              <span class="uuid">
-                ${escapeHtml(user.uuid)}
-              </span>
-            </td>
+    </div>
 
-            <td>
-              ${escapeHtml(
-                user.protocol.toUpperCase()
-              )}
-            </td>
+    <div class="card">
 
-            <td>
-              ${formatBytes(
-                user.traffic_used_bytes
-              )}
-              /
-              ${formatBytes(
-                user.traffic_limit_bytes
-              )}
-            </td>
+      <div class="section-header">
 
-            <td>
-              ${formatDate(user.expires_at)}
-            </td>
+        <h2>User Management</h2>
 
-            <td>
-              <span class="status ${statusClass}">
-                ${statusText}
-              </span>
-            </td>
+        <div class="actions">
 
-            <td>
-              ${formatDate(user.created_at)}
-            </td>
+          <a
+            href="/dashboard"
+            class="btn secondary"
+          >
+            Dashboard
+          </a>
 
-            <td>
-              <form
-                method="POST"
-                action="/users/delete"
-                onsubmit="
-                  return confirm(
-                    'Delete this user?'
-                  );
-                "
-              >
-                <input
-                  type="hidden"
-                  name="id"
-                  value="${user.id}"
-                >
+          <a
+            href="/users/new"
+            class="btn"
+          >
+            + New User
+          </a>
 
-                <button
-                  type="submit"
-                  class="btn btn-danger"
-                >
-                  Delete
-                </button>
-              </form>
-            </td>
+        </div>
 
-          </tr>
-        `;
-      })
-      .join("");
-  }
-
-  const content = `
-    <a href="/dashboard" class="back">
-      ← Back to Dashboard
-    </a>
-
-    <div class="section-head">
-      <div>
-        <h1>👥 Users</h1>
-
-        <p class="subtitle">
-          Manage your VPN users.
-        </p>
       </div>
 
-      <a
-        href="/users/new"
-        class="btn btn-primary"
-      >
-        + Add User
-      </a>
-    </div>
+      <div class="table-wrap">
 
-    <div class="table-wrap">
+        <table>
 
-      <table>
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Protocol</th>
+              <th>UUID</th>
+              <th>Limit</th>
+              <th>Used</th>
+              <th>Expires</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
 
-        <thead>
-          <tr>
-            <th>Username</th>
-            <th>UUID</th>
-            <th>Protocol</th>
-            <th>Traffic</th>
-            <th>Expiry</th>
-            <th>Status</th>
-            <th>Created</th>
-            <th>Action</th>
-          </tr>
-        </thead>
+          <tbody>
+            ${rows}
+          </tbody>
 
-        <tbody>
-          ${tableContent}
-        </tbody>
+        </table>
 
-      </table>
+      </div>
 
     </div>
-  `;
-
-  sendHtml(
-    res,
-    200,
-    page("Users", content, session)
+    `,
+    username
   );
 }
 
-function renderNewUser(res, session, error = "") {
-  const content = `
-    <a href="/users" class="back">
-      ← Back to Users
-    </a>
+function newUserPage(username, error = "") {
+  return page(
+    "New User",
+    `
+    <div class="hero">
+      <h1>New User</h1>
+      <p>Create a new VLESS user.</p>
+    </div>
 
-    <div class="form-card">
-
-      <h1>➕ Add User</h1>
-
-      <p class="subtitle">
-        Create a new VPN user.
-      </p>
+    <div class="card form-card">
 
       ${
         error
-          ? `
-            <div class="notice notice-error">
-              ${escapeHtml(error)}
-            </div>
-          `
+          ? `<div class="error">${escapeHtml(error)}</div>`
           : ""
       }
 
       <form method="POST" action="/users/new">
 
-        <div class="field">
-          <label>
-            Username
-          </label>
+        <label>
+          Username
+        </label>
 
-          <input
-            type="text"
-            name="username"
-            required
-            maxlength="50"
-            placeholder="e.g. yasin"
-          >
-        </div>
+        <input
+          type="text"
+          name="username"
+          placeholder="e.g. user01"
+          required
+        >
 
-        <div class="field">
-          <label>
-            Protocol
-          </label>
+        <label>
+          Protocol
+        </label>
 
-          <select name="protocol">
-            <option value="vless">
-              VLESS
-            </option>
-          </select>
-        </div>
+        <select name="protocol">
+          <option value="vless">
+            VLESS
+          </option>
+        </select>
 
-        <div class="field">
-          <label>
-            Traffic Limit (GB)
-          </label>
+        <label>
+          Traffic Limit (GB)
+        </label>
 
-          <input
-            type="number"
-            name="traffic_limit_gb"
-            min="0"
-            step="0.1"
-            value="0"
-            placeholder="0 = Unlimited"
-          >
+        <input
+          type="number"
+          name="traffic_limit_gb"
+          min="0"
+          step="0.1"
+          value="0"
+        >
 
-          <div class="help">
-            Set 0 for unlimited traffic.
-          </div>
-        </div>
+        <small style="display:block;color:#77829e;margin-top:-10px;margin-bottom:18px;">
+          0 = Unlimited
+        </small>
 
-        <div class="field">
-          <label>
-            Expiry Date
-          </label>
+        <label>
+          Expiry Date
+        </label>
 
-          <input
-            type="date"
-            name="expires_at"
-          >
-
-          <div class="help">
-            Leave empty for no expiration.
-          </div>
-        </div>
+        <input
+          type="date"
+          name="expires_at"
+        >
 
         <div class="actions">
 
           <button
+            class="btn"
             type="submit"
-            class="btn btn-primary"
           >
             Create User
           </button>
 
           <a
             href="/users"
-            class="btn btn-secondary"
+            class="btn secondary"
           >
             Cancel
           </a>
@@ -1219,12 +1126,8 @@ function renderNewUser(res, session, error = "") {
       </form>
 
     </div>
-  `;
-
-  sendHtml(
-    res,
-    200,
-    page("Add User", content, session)
+    `,
+    username
   );
 }
 
@@ -1234,285 +1137,321 @@ async function handleRequest(req, res) {
     `http://${req.headers.host || "localhost"}`
   );
 
-  const pathname = url.pathname;
+  const path = url.pathname;
   const method = req.method;
 
-  // HEALTH
-  if (
-    pathname === "/health" &&
-    method === "GET"
-  ) {
-    return sendJson(res, 200, {
-      ok: true,
-      service: "VergilPanel",
-      version: "0.4.0",
-      database: "sqlite",
-      uptime: process.uptime()
-    });
+  /*
+   * HEALTH
+   */
+  if (method === "GET" && path === "/health") {
+    send(
+      res,
+      200,
+      JSON.stringify(
+        {
+          ok: true,
+          service: "VergilPanel",
+          version: VERSION,
+          database: "sqlite",
+        },
+        null,
+        2
+      ),
+      "application/json; charset=utf-8"
+    );
+
+    return;
   }
 
-  // SETUP STATUS
-  if (
-    pathname === "/api/setup/status" &&
-    method === "GET"
-  ) {
-    const count = db
-      .prepare(
-        "SELECT COUNT(*) AS count FROM admins"
-      )
-      .get().count;
+  /*
+   * SETUP STATUS
+   */
+  if (method === "GET" && path === "/api/setup/status") {
+    const admin = db
+      .prepare("SELECT id FROM admins LIMIT 1")
+      .get();
 
-    return sendJson(res, 200, {
-      setupRequired: count === 0
-    });
+    send(
+      res,
+      200,
+      JSON.stringify({
+        setupRequired: !admin,
+      }),
+      "application/json; charset=utf-8"
+    );
+
+    return;
   }
 
-  // ROOT
-  if (
-    pathname === "/" &&
-    method === "GET"
-  ) {
+  /*
+   * ROOT
+   */
+  if (method === "GET" && path === "/") {
+    const admin = db
+      .prepare("SELECT id FROM admins LIMIT 1")
+      .get();
+
+    if (!admin) {
+      redirect(res, "/setup");
+      return;
+    }
+
     const session = getSession(req);
 
     if (session) {
-      return redirect(res, "/dashboard");
+      redirect(res, "/dashboard");
+      return;
     }
 
-    const count = db
-      .prepare(
-        "SELECT COUNT(*) AS count FROM admins"
-      )
-      .get().count;
-
-    if (count === 0) {
-      return redirect(res, "/setup");
-    }
-
-    return redirect(res, "/login");
+    redirect(res, "/login");
+    return;
   }
 
-  // SETUP GET
-  if (
-    pathname === "/setup" &&
-    method === "GET"
-  ) {
-    const count = db
-      .prepare(
-        "SELECT COUNT(*) AS count FROM admins"
-      )
-      .get().count;
+  /*
+   * SETUP GET
+   */
+  if (method === "GET" && path === "/setup") {
+    const admin = db
+      .prepare("SELECT id FROM admins LIMIT 1")
+      .get();
 
-    if (count > 0) {
-      return redirect(res, "/login");
+    if (admin) {
+      redirect(res, "/login");
+      return;
     }
 
-    return renderSetup(res);
+    send(res, 200, setupPage());
+    return;
   }
 
-  // SETUP POST
-  if (
-    pathname === "/setup" &&
-    method === "POST"
-  ) {
-    const count = db
-      .prepare(
-        "SELECT COUNT(*) AS count FROM admins"
-      )
-      .get().count;
+  /*
+   * SETUP POST
+   */
+  if (method === "POST" && path === "/setup") {
+    const admin = db
+      .prepare("SELECT id FROM admins LIMIT 1")
+      .get();
 
-    if (count > 0) {
-      return redirect(res, "/login");
+    if (admin) {
+      redirect(res, "/login");
+      return;
     }
 
     try {
       const body = await readBody(req);
 
-      const username =
-        String(body.username || "").trim();
-
-      const password =
-        String(body.password || "");
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
 
       if (!username || !password) {
-        return renderSetup(
+        send(
           res,
-          "Username and password are required."
+          400,
+          setupPage("Username and password are required.")
         );
+
+        return;
       }
 
       if (password.length < 6) {
-        return renderSetup(
+        send(
           res,
-          "Password must be at least 6 characters."
+          400,
+          setupPage(
+            "Password must be at least 6 characters."
+          )
         );
+
+        return;
       }
 
-      db.prepare(
-        `
+      db.prepare(`
         INSERT INTO admins
-          (username, password_hash, created_at)
-        VALUES
-          (?, ?, ?)
-        `
-      ).run(
+        (username, password_hash, created_at)
+        VALUES (?, ?, ?)
+      `).run(
         username,
         hashPassword(password),
-        nowISO()
+        new Date().toISOString()
       );
 
-      return redirect(res, "/login");
-
+      redirect(res, "/login");
+      return;
     } catch (error) {
       console.error(error);
 
-      return renderSetup(
+      send(
         res,
-        "Unable to create administrator."
+        500,
+        setupPage("Unable to complete setup.")
       );
+
+      return;
     }
   }
 
-  // LOGIN GET
-  if (
-    pathname === "/login" &&
-    method === "GET"
-  ) {
+  /*
+   * LOGIN GET
+   */
+  if (method === "GET" && path === "/login") {
+    const admin = db
+      .prepare("SELECT id FROM admins LIMIT 1")
+      .get();
+
+    if (!admin) {
+      redirect(res, "/setup");
+      return;
+    }
+
     const session = getSession(req);
 
     if (session) {
-      return redirect(res, "/dashboard");
+      redirect(res, "/dashboard");
+      return;
     }
 
-    return renderLogin(res);
+    send(res, 200, loginPage());
+    return;
   }
 
-  // LOGIN POST
-  if (
-    pathname === "/login" &&
-    method === "POST"
-  ) {
+  /*
+   * LOGIN POST
+   */
+  if (method === "POST" && path === "/login") {
     try {
       const body = await readBody(req);
 
-      const username =
-        String(body.username || "").trim();
-
-      const password =
-        String(body.password || "");
+      const username = String(body.username || "").trim();
+      const password = String(body.password || "");
 
       const admin = db
-        .prepare(
-          `
+        .prepare(`
           SELECT *
           FROM admins
           WHERE username = ?
           LIMIT 1
-          `
-        )
+        `)
         .get(username);
 
       if (
         !admin ||
-        admin.password_hash !==
-          hashPassword(password)
+        admin.password_hash !== hashPassword(password)
       ) {
-        return renderLogin(
+        send(
           res,
-          "Invalid username or password."
+          401,
+          loginPage("Invalid username or password.")
         );
+
+        return;
       }
 
-      const token = createSession(
-        admin.id,
-        admin.username
-      );
+      const token = createSession(username);
 
       res.writeHead(302, {
         Location: "/dashboard",
-        "Set-Cookie":
-          `vergil_session=${token}; ` +
-          "HttpOnly; Path=/; SameSite=Lax"
+        "Set-Cookie": [
+          `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax`,
+        ],
+        "Cache-Control": "no-store",
       });
 
-      return res.end();
+      res.end();
 
+      return;
     } catch (error) {
       console.error(error);
 
-      return renderLogin(
+      send(
         res,
-        "Login failed."
+        500,
+        loginPage("Login failed.")
       );
+
+      return;
     }
   }
 
-  // LOGOUT
-  if (
-    pathname === "/logout" &&
-    method === "POST"
-  ) {
-    const token = getSessionToken(req);
-
-    deleteSession(token);
+  /*
+   * LOGOUT
+   */
+  if (method === "POST" && path === "/logout") {
+    deleteSession(req);
 
     res.writeHead(302, {
       Location: "/login",
       "Set-Cookie":
-        "vergil_session=; " +
-        "HttpOnly; Path=/; Max-Age=0; SameSite=Lax"
+        "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax",
+      "Cache-Control": "no-store",
     });
 
-    return res.end();
+    res.end();
+
+    return;
   }
 
-  // DASHBOARD
-  if (
-    pathname === "/dashboard" &&
-    method === "GET"
-  ) {
-    const session = requireSession(req, res);
+  /*
+   * DASHBOARD
+   */
+  if (method === "GET" && path === "/dashboard") {
+    const session = requireAuth(req, res);
 
     if (!session) {
       return;
     }
 
-    return renderDashboard(res, session);
+    send(
+      res,
+      200,
+      dashboardPage(session.username)
+    );
+
+    return;
   }
 
-  // USERS
-  if (
-    pathname === "/users" &&
-    method === "GET"
-  ) {
-    const session = requireSession(req, res);
+  /*
+   * USERS
+   */
+  if (method === "GET" && path === "/users") {
+    const session = requireAuth(req, res);
 
     if (!session) {
       return;
     }
 
-    return renderUsers(res, session);
+    send(
+      res,
+      200,
+      usersPage(session.username)
+    );
+
+    return;
   }
 
-  // NEW USER FORM
-  if (
-    pathname === "/users/new" &&
-    method === "GET"
-  ) {
-    const session = requireSession(req, res);
+  /*
+   * NEW USER GET
+   */
+  if (method === "GET" && path === "/users/new") {
+    const session = requireAuth(req, res);
 
     if (!session) {
       return;
     }
 
-    return renderNewUser(res, session);
+    send(
+      res,
+      200,
+      newUserPage(session.username)
+    );
+
+    return;
   }
 
-  // CREATE USER
-  if (
-    pathname === "/users/new" &&
-    method === "POST"
-  ) {
-    const session = requireSession(req, res);
+  /*
+   * NEW USER POST
+   */
+  if (method === "POST" && path === "/users/new") {
+    const session = requireAuth(req, res);
 
     if (!session) {
       return;
@@ -1521,146 +1460,145 @@ async function handleRequest(req, res) {
     try {
       const body = await readBody(req);
 
-      const username =
-        String(body.username || "").trim();
+      const username = String(body.username || "").trim();
+      const protocol = String(
+        body.protocol || "vless"
+      ).toLowerCase();
 
-      const protocol =
-        String(body.protocol || "vless")
-          .trim()
-          .toLowerCase();
+      const trafficLimitGb = Number(
+        body.traffic_limit_gb || 0
+      );
 
-      const trafficLimitGB =
-        Number(body.traffic_limit_gb || 0);
-
-      const expiresInput =
-        String(body.expires_at || "").trim();
+      const expiresAtRaw = String(
+        body.expires_at || ""
+      ).trim();
 
       if (!username) {
-        return renderNewUser(
+        send(
           res,
-          session,
-          "Username is required."
+          400,
+          newUserPage(
+            session.username,
+            "Username is required."
+          )
         );
-      }
 
-      if (!/^[a-zA-Z0-9_.-]+$/.test(username)) {
-        return renderNewUser(
-          res,
-          session,
-          "Username can only contain letters, numbers, dots, underscores and hyphens."
-        );
+        return;
       }
 
       if (protocol !== "vless") {
-        return renderNewUser(
+        send(
           res,
-          session,
-          "Only VLESS is currently supported."
+          400,
+          newUserPage(
+            session.username,
+            "Only VLESS is currently supported."
+          )
         );
+
+        return;
       }
 
       if (
-        !Number.isFinite(trafficLimitGB) ||
-        trafficLimitGB < 0
+        !Number.isFinite(trafficLimitGb) ||
+        trafficLimitGb < 0
       ) {
-        return renderNewUser(
+        send(
           res,
-          session,
-          "Traffic limit is invalid."
+          400,
+          newUserPage(
+            session.username,
+            "Traffic limit is invalid."
+          )
         );
+
+        return;
       }
 
-      if (trafficLimitGB > 10240) {
-        return renderNewUser(
+      const existing = db
+        .prepare(`
+          SELECT id
+          FROM users
+          WHERE username = ?
+          LIMIT 1
+        `)
+        .get(username);
+
+      if (existing) {
+        send(
           res,
-          session,
-          "Traffic limit cannot exceed 10240 GB."
-        );
-      }
-
-      let expiresAt = null;
-
-      if (expiresInput) {
-        const parsed = new Date(
-          `${expiresInput}T23:59:59.999Z`
+          400,
+          newUserPage(
+            session.username,
+            "This username already exists."
+          )
         );
 
-        if (Number.isNaN(parsed.getTime())) {
-          return renderNewUser(
-            res,
-            session,
-            "Expiry date is invalid."
-          );
-        }
-
-        expiresAt = parsed.toISOString();
+        return;
       }
 
-      const uuid = generateUUID();
+      const uuid = crypto.randomUUID();
 
       const trafficLimitBytes = Math.floor(
-        trafficLimitGB *
-        1024 *
-        1024 *
-        1024
+        trafficLimitGb * 1024 ** 3
       );
 
-      db.prepare(
-        `
+      const expiresAt = expiresAtRaw
+        ? new Date(
+            `${expiresAtRaw}T23:59:59.000Z`
+          ).toISOString()
+        : null;
+
+      db.prepare(`
         INSERT INTO users
-          (
-            username,
-            uuid,
-            protocol,
-            traffic_limit_bytes,
-            traffic_used_bytes,
-            expires_at,
-            status,
-            created_at
-          )
-        VALUES
-          (?, ?, ?, ?, 0, ?, 'active', ?)
-        `
-      ).run(
+        (
+          username,
+          uuid,
+          protocol,
+          traffic_limit_bytes,
+          traffic_used_bytes,
+          expires_at,
+          status,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
         username,
         uuid,
         protocol,
         trafficLimitBytes,
+        0,
         expiresAt,
-        nowISO()
+        "active",
+        new Date().toISOString()
       );
 
-      return redirect(res, "/users");
-
+      redirect(res, "/users");
+      return;
     } catch (error) {
       console.error(error);
 
-      if (
-        String(error.message || "")
-          .toLowerCase()
-          .includes("unique")
-      ) {
-        return renderNewUser(
-          res,
-          session,
-          "Username already exists."
-        );
-      }
-
-      return renderNewUser(
+      send(
         res,
-        session,
-        "Unable to create user."
+        500,
+        newUserPage(
+          session.username,
+          "Unable to create user."
+        )
       );
+
+      return;
     }
   }
 
-  // DELETE USER
+  /*
+   * DELETE USER
+   */
   if (
-    pathname === "/users/delete" &&
-    method === "POST"
+    method === "POST" &&
+    path === "/users/delete"
   ) {
-    const session = requireSession(req, res);
+    const session = requireAuth(req, res);
 
     if (!session) {
       return;
@@ -1671,110 +1609,80 @@ async function handleRequest(req, res) {
 
       const id = Number(body.id);
 
-      if (!Number.isInteger(id) || id <= 0) {
-        return redirect(res, "/users");
+      if (!Number.isInteger(id)) {
+        redirect(res, "/users");
+        return;
       }
 
       db.prepare(
         "DELETE FROM users WHERE id = ?"
       ).run(id);
 
-      return redirect(res, "/users");
-
+      redirect(res, "/users");
+      return;
     } catch (error) {
       console.error(error);
 
-      return redirect(res, "/users");
+      send(
+        res,
+        500,
+        "Unable to delete user."
+      );
+
+      return;
     }
   }
 
-  // 404
-  return sendHtml(
+  /*
+   * 404
+   */
+  send(
     res,
     404,
     page(
       "404",
       `
-        <div class="form-card">
-          <h1>404</h1>
+      <div class="hero">
+        <h1>404</h1>
+        <p>
+          The page you are looking for does not exist.
+        </p>
+      </div>
 
-          <p class="subtitle">
-            Page not found.
-          </p>
-
-          <div class="actions">
-            <a
-              href="/dashboard"
-              class="btn btn-primary"
-            >
-              Back to Dashboard
-            </a>
-          </div>
-        </div>
+      <a href="/" class="btn">
+        Go Home
+      </a>
       `
     )
   );
 }
 
-async function start() {
-  try {
-    await initDatabase();
+const server = http.createServer(
+  async (req, res) => {
+    try {
+      await handleRequest(req, res);
+    } catch (error) {
+      console.error("Unhandled server error:", error);
 
-    const server = http.createServer(
-      async (req, res) => {
-        try {
-          await handleRequest(req, res);
-        } catch (error) {
-          console.error(
-            "Request error:",
-            error
-          );
-
-          if (!res.headersSent) {
-            sendHtml(
-              res,
-              500,
-              page(
-                "Server Error",
-                `
-                  <div class="form-card">
-                    <h1>500</h1>
-                    <p class="subtitle">
-                      Internal server error.
-                    </p>
-                  </div>
-                `
-              )
-            );
-          } else {
-            res.end();
-          }
-        }
-      }
-    );
-
-    server.listen(
-      PORT,
-      HOST,
-      () => {
-        console.log(
-          `⚔️ VergilPanel v0.4.0 running on ${HOST}:${PORT}`
+      if (!res.headersSent) {
+        send(
+          res,
+          500,
+          "Internal Server Error"
         );
-
-        console.log(
-          `📦 Database: ${DB_PATH}`
-        );
+      } else {
+        res.end();
       }
-    );
-
-  } catch (error) {
-    console.error(
-      "Failed to start VergilPanel:",
-      error
-    );
-
-    process.exit(1);
+    }
   }
-}
+);
 
-start();
+server.listen(PORT, HOST, () => {
+  console.log(
+    `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
+  );
+
+  console.log(
+    `📦 Database: ${DB_PATH}`
+  );
+});
