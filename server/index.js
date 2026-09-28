@@ -2,6 +2,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
+import net from "node:net";
 import Database from "better-sqlite3";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -10,2616 +11,1600 @@ const HOST = "0.0.0.0";
 const DATA_DIR = process.env.DATA_DIR || "/app/data";
 const DB_PATH = `${DATA_DIR}/vergilpanel.db`;
 
-const XRAY_PATH = process.env.XRAY_PATH || "/opt/xray/xray";
-const XRAY_DIR = process.env.XRAY_DIR || "/app/xray";
-const XRAY_CONFIG_PATH = `${XRAY_DIR}/generated-config.json`;
+const XRAY_BIN = process.env.XRAY_BIN || "/opt/xray/xray";
+const XRAY_CONFIG = process.env.XRAY_CONFIG || "/app/xray/generated-config.json";
 
-const XRAY_PORT = Number(
-  process.env.XRAY_PORT ||
-  process.env.RAILWAY_TCP_APPLICATION_PORT ||
-  2053
-);
+const XRAY_XHTTP_PORT = Number(process.env.XRAY_XHTTP_PORT || 10001);
+const XRAY_WS_PORT = Number(process.env.XRAY_WS_PORT || 10002);
 
-const VERSION = "0.5.0";
+const XHTTP_PATH = process.env.XHTTP_PATH || "/xhttp";
+const WS_PATH = process.env.WS_PATH || "/ws";
+
+const VERSION = "0.6.0";
+
+let xrayProcess = null;
+let stoppingXray = false;
+
+const sessions = new Map();
 
 await fs.mkdir(DATA_DIR, { recursive: true });
-await fs.mkdir(XRAY_DIR, { recursive: true });
+await fs.mkdir("/app/xray", { recursive: true });
 
 const db = new Database(DB_PATH);
 
 db.pragma("journal_mode = WAL");
 
 db.exec(`
-  CREATE TABLE IF NOT EXISTS admins (
+CREATE TABLE IF NOT EXISTS admins (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
+    username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     created_at TEXT NOT NULL
-  );
+);
 
-  CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
-    uuid TEXT NOT NULL UNIQUE,
+    username TEXT UNIQUE NOT NULL,
+    uuid TEXT UNIQUE NOT NULL,
     protocol TEXT NOT NULL DEFAULT 'vless',
     traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
     traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
     expires_at TEXT,
     status TEXT NOT NULL DEFAULT 'active',
+    subscription_token TEXT UNIQUE,
     created_at TEXT NOT NULL
-  );
+);
 `);
 
-const sessions = new Map();
-
-let xrayProcess = null;
-let xrayStarting = false;
-
-const startedAt = Date.now();
-
 function hashPassword(password) {
-  return crypto
-    .createHash("sha256")
-    .update(password)
-    .digest("hex");
+    return crypto
+        .createHash("sha256")
+        .update(String(password))
+        .digest("hex");
+}
+
+function randomToken(bytes = 24) {
+    return crypto.randomBytes(bytes).toString("hex");
 }
 
 function escapeHtml(value = "") {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
 }
 
-function formatUptime(ms) {
-  const totalSeconds = Math.floor(ms / 1000);
-
-  const days = Math.floor(totalSeconds / 86400);
-  const hours = Math.floor((totalSeconds % 86400) / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (days > 0) {
-    return `${days}d ${hours}h ${minutes}m`;
-  }
-
-  if (hours > 0) {
-    return `${hours}h ${minutes}m ${seconds}s`;
-  }
-
-  if (minutes > 0) {
-    return `${minutes}m ${seconds}s`;
-  }
-
-  return `${seconds}s`;
+function nowIso() {
+    return new Date().toISOString();
 }
 
-function formatBytes(bytes) {
-  const value = Number(bytes || 0);
+function parseCookies(req) {
+    const header = req.headers.cookie || "";
+    const result = {};
 
-  if (value === 0) {
-    return "Unlimited";
-  }
+    for (const part of header.split(";")) {
+        const index = part.indexOf("=");
 
-  if (value < 1024 ** 3) {
-    return `${(value / 1024 ** 2).toFixed(1)} MB`;
-  }
+        if (index === -1) continue;
 
-  return `${(value / 1024 ** 3).toFixed(2)} GB`;
-}
+        const key = part.slice(0, index).trim();
+        const value = part.slice(index + 1).trim();
 
-function formatDate(date) {
-  if (!date) {
-    return "—";
-  }
-
-  return new Date(date).toLocaleDateString("en-GB");
-}
-
-function send(
-  res,
-  statusCode,
-  body,
-  contentType = "text/html; charset=utf-8"
-) {
-  res.writeHead(statusCode, {
-    "Content-Type": contentType,
-    "Cache-Control": "no-store",
-  });
-
-  res.end(body);
-}
-
-function redirect(res, location) {
-  res.writeHead(302, {
-    Location: location,
-    "Cache-Control": "no-store",
-  });
-
-  res.end();
-}
-
-function getCookie(req, name) {
-  const cookieHeader = req.headers.cookie;
-
-  if (!cookieHeader) {
-    return null;
-  }
-
-  const cookies = cookieHeader.split(";");
-
-  for (const cookie of cookies) {
-    const [key, ...parts] = cookie.trim().split("=");
-
-    if (key === name) {
-      return decodeURIComponent(parts.join("="));
+        result[key] = decodeURIComponent(value);
     }
-  }
 
-  return null;
-}
-
-function createSession(username) {
-  const token = crypto.randomBytes(32).toString("hex");
-
-  sessions.set(token, {
-    username,
-    createdAt: Date.now(),
-  });
-
-  return token;
+    return result;
 }
 
 function getSession(req) {
-  const token = getCookie(req, "vergil_session");
+    const cookies = parseCookies(req);
 
-  if (!token) {
-    return null;
-  }
+    if (!cookies.vergil_session) {
+        return null;
+    }
 
-  return sessions.get(token) || null;
-}
-
-function deleteSession(req) {
-  const token = getCookie(req, "vergil_session");
-
-  if (token) {
-    sessions.delete(token);
-  }
+    return sessions.get(cookies.vergil_session) || null;
 }
 
 function requireAuth(req, res) {
-  const session = getSession(req);
-
-  if (!session) {
-    redirect(res, "/login");
-    return null;
-  }
-
-  return session;
-}
-
-async function readBody(req) {
-  return await new Promise((resolve, reject) => {
-    let body = "";
-
-    req.on("data", (chunk) => {
-      body += chunk.toString();
-    });
-
-    req.on("end", () => {
-      try {
-        const contentType = req.headers["content-type"] || "";
-
-        if (contentType.includes("application/json")) {
-          resolve(body ? JSON.parse(body) : {});
-          return;
-        }
-
-        if (
-          contentType.includes(
-            "application/x-www-form-urlencoded"
-          )
-        ) {
-          const params = new URLSearchParams(body);
-
-          const result = {};
-
-          for (const [key, value] of params.entries()) {
-            result[key] = value;
-          }
-
-          resolve(result);
-          return;
-        }
-
-        resolve({});
-      } catch (error) {
-        reject(error);
-      }
-    });
-
-    req.on("error", reject);
-  });
-}
-
-/*
- * ---------------------------------------------------------
- * RAILWAY / VLESS
- * ---------------------------------------------------------
- */
-
-function getTcpDomain() {
-  return (
-    process.env.RAILWAY_TCP_PROXY_DOMAIN ||
-    ""
-  ).trim();
-}
-
-function getTcpPort() {
-  return Number(
-    process.env.RAILWAY_TCP_PROXY_PORT || 0
-  );
-}
-
-function getVlessLink(user) {
-  const domain = getTcpDomain();
-  const port = getTcpPort();
-
-  if (!domain || !port) {
-    return null;
-  }
-
-  const params = new URLSearchParams();
-
-  params.set("type", "tcp");
-  params.set("security", "none");
-
-  return `vless://${user.uuid}@${domain}:${port}?${params.toString()}#${encodeURIComponent(
-    user.username
-  )}`;
-}
-
-/*
- * ---------------------------------------------------------
- * XRAY CONFIGURATION
- * ---------------------------------------------------------
- */
-
-function getXrayUsers() {
-  const users = db
-    .prepare(`
-      SELECT
-        id,
-        username,
-        uuid,
-        status,
-        expires_at
-      FROM users
-      ORDER BY id ASC
-    `)
-    .all();
-
-  const now = Date.now();
-
-  return users
-    .filter((user) => {
-      if (user.status !== "active") {
-        return false;
-      }
-
-      if (!user.expires_at) {
-        return true;
-      }
-
-      return new Date(user.expires_at).getTime() >= now;
-    })
-    .map((user) => ({
-      id: user.uuid,
-      level: 0,
-      email: user.username,
-    }));
-}
-
-async function buildXrayConfig() {
-  const users = getXrayUsers();
-
-  const config = {
-    log: {
-      loglevel: "warning",
-    },
-
-    inbounds: [
-      {
-        tag: "vless-tcp",
-        listen: "0.0.0.0",
-        port: XRAY_PORT,
-        protocol: "vless",
-
-        settings: {
-          clients: users,
-          decryption: "none",
-        },
-
-        streamSettings: {
-          network: "tcp",
-          security: "none",
-        },
-      },
-    ],
-
-    outbounds: [
-      {
-        tag: "direct",
-        protocol: "freedom",
-        settings: {},
-      },
-    ],
-  };
-
-  await fs.writeFile(
-    XRAY_CONFIG_PATH,
-    JSON.stringify(config, null, 2),
-    "utf8"
-  );
-
-  return config;
-}
-
-async function stopXray() {
-  if (!xrayProcess) {
-    return;
-  }
-
-  const processToStop = xrayProcess;
-
-  xrayProcess = null;
-
-  try {
-    processToStop.kill("SIGTERM");
-  } catch {
-    // Process may already be gone.
-  }
-
-  await new Promise((resolve) => {
-    const timer = setTimeout(resolve, 3000);
-
-    processToStop.once("exit", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-}
-
-async function startXray() {
-  if (xrayStarting) {
-    return;
-  }
-
-  xrayStarting = true;
-
-  try {
-    await buildXrayConfig();
-
-    await stopXray();
-
-    console.log(
-      `⚔️ Starting Xray on ${HOST}:${XRAY_PORT}`
-    );
-
-    xrayProcess = spawn(
-      XRAY_PATH,
-      [
-        "run",
-        "-config",
-        XRAY_CONFIG_PATH,
-      ],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-      }
-    );
-
-    xrayProcess.stdout.on(
-      "data",
-      (data) => {
-        process.stdout.write(
-          `[XRAY] ${data.toString()}`
-        );
-      }
-    );
-
-    xrayProcess.stderr.on(
-      "data",
-      (data) => {
-        process.stderr.write(
-          `[XRAY] ${data.toString()}`
-        );
-      }
-    );
-
-    xrayProcess.on(
-      "error",
-      (error) => {
-        console.error(
-          "Xray process error:",
-          error
-        );
-      }
-    );
-
-    xrayProcess.on(
-      "exit",
-      (code, signal) => {
-        console.log(
-          `⚔️ Xray exited. code=${code} signal=${signal}`
-        );
-
-        if (xrayProcess) {
-          xrayProcess = null;
-        }
-      }
-    );
-
-    console.log(
-      `⚙️ Xray config synced: ${getXrayUsers().length} active user(s)`
-    );
-  } finally {
-    xrayStarting = false;
-  }
-}
-
-async function syncXray() {
-  try {
-    await startXray();
-    return true;
-  } catch (error) {
-    console.error(
-      "Xray sync failed:",
-      error
-    );
-
-    return false;
-  }
-}
-
-function isXrayRunning() {
-  return Boolean(
-    xrayProcess &&
-    xrayProcess.exitCode === null &&
-    !xrayProcess.killed
-  );
-}
-
-/*
- * ---------------------------------------------------------
- * HTML
- * ---------------------------------------------------------
- */
-
-function page(title, content, username = null) {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${escapeHtml(title)} - VergilPanel</title>
-
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      font-family:
-        Inter,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-
-      background:
-        radial-gradient(
-          circle at top,
-          #18223b 0,
-          #090d17 45%,
-          #05070d 100%
-        );
-
-      color: #f5f7ff;
-      min-height: 100vh;
-    }
-
-    a {
-      color: inherit;
-      text-decoration: none;
-    }
-
-    .container {
-      width: min(1150px, calc(100% - 32px));
-      margin: 0 auto;
-    }
-
-    .nav {
-      padding: 22px 0;
-      border-bottom: 1px solid rgba(255,255,255,.08);
-    }
-
-    .nav-inner {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 20px;
-    }
-
-    .brand {
-      font-size: 21px;
-      font-weight: 800;
-      letter-spacing: -.5px;
-    }
-
-    .brand span {
-      color: #8da2ff;
-    }
-
-    .nav-right {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      flex-wrap: wrap;
-    }
-
-    .admin {
-      color: #aeb8d3;
-      font-size: 14px;
-    }
-
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      border: 0;
-      border-radius: 10px;
-      padding: 11px 16px;
-      font-size: 14px;
-      font-weight: 700;
-      cursor: pointer;
-      color: white;
-      background: #536dfe;
-      transition: .2s;
-    }
-
-    .btn:hover {
-      transform: translateY(-1px);
-      filter: brightness(1.08);
-    }
-
-    .btn.secondary {
-      background: rgba(255,255,255,.08);
-    }
-
-    .btn.danger {
-      background: #d9445c;
-    }
-
-    .btn.success {
-      background: #239b73;
-    }
-
-    .hero {
-      padding: 42px 0 28px;
-    }
-
-    .hero h1 {
-      margin: 0 0 8px;
-      font-size: clamp(28px, 5vw, 42px);
-      letter-spacing: -1px;
-    }
-
-    .hero p {
-      margin: 0;
-      color: #99a4c0;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 16px;
-    }
-
-    .card {
-      background: rgba(15,21,36,.82);
-      border: 1px solid rgba(255,255,255,.08);
-      border-radius: 16px;
-      padding: 22px;
-      box-shadow: 0 12px 35px rgba(0,0,0,.2);
-    }
-
-    .card-title {
-      color: #8f9ab7;
-      font-size: 13px;
-      margin-bottom: 12px;
-    }
-
-    .card-value {
-      font-size: 25px;
-      font-weight: 800;
-    }
-
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-    }
-
-    .dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-      background: #36d399;
-      display: inline-block;
-    }
-
-    .dot.off {
-      background: #d9445c;
-    }
-
-    .section {
-      margin-top: 24px;
-    }
-
-    .section-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 15px;
-      margin-bottom: 16px;
-    }
-
-    .section-header h2 {
-      margin: 0;
-      font-size: 21px;
-    }
-
-    .table-wrap {
-      overflow-x: auto;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 850px;
-    }
-
-    th,
-    td {
-      text-align: left;
-      padding: 15px 12px;
-      border-bottom: 1px solid rgba(255,255,255,.07);
-    }
-
-    th {
-      color: #8e99b5;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .5px;
-    }
-
-    td {
-      color: #dce2f1;
-      font-size: 14px;
-    }
-
-    .badge {
-      display: inline-flex;
-      padding: 5px 9px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 700;
-    }
-
-    .badge.active {
-      background: rgba(54,211,153,.12);
-      color: #63e6b1;
-    }
-
-    .badge.disabled {
-      background: rgba(217,68,92,.12);
-      color: #ff7f91;
-    }
-
-    .badge.warning {
-      background: rgba(255,193,7,.12);
-      color: #ffd86b;
-    }
-
-    .form-card {
-      max-width: 620px;
-      margin: 45px auto;
-    }
-
-    label {
-      display: block;
-      margin-bottom: 7px;
-      color: #b5bfd6;
-      font-size: 14px;
-      font-weight: 600;
-    }
-
-    input,
-    select {
-      width: 100%;
-      padding: 13px 14px;
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,.1);
-      background: #0b101d;
-      color: white;
-      outline: none;
-      margin-bottom: 18px;
-      font-size: 14px;
-    }
-
-    input:focus,
-    select:focus {
-      border-color: #536dfe;
-    }
-
-    .login-card {
-      max-width: 430px;
-      margin: 90px auto;
-    }
-
-    .login-logo {
-      text-align: center;
-      font-size: 32px;
-      font-weight: 900;
-      margin-bottom: 8px;
-    }
-
-    .login-subtitle {
-      text-align: center;
-      color: #8f9ab7;
-      margin-bottom: 28px;
-    }
-
-    .error {
-      background: rgba(217,68,92,.12);
-      border: 1px solid rgba(217,68,92,.25);
-      color: #ff8b9a;
-      padding: 12px 14px;
-      border-radius: 10px;
-      margin-bottom: 18px;
-      font-size: 14px;
-    }
-
-    .success-box {
-      background: rgba(54,211,153,.10);
-      border: 1px solid rgba(54,211,153,.20);
-      color: #7ceabd;
-      padding: 14px;
-      border-radius: 10px;
-      margin-bottom: 18px;
-    }
-
-    .link-box {
-      display: flex;
-      gap: 8px;
-      margin-top: 10px;
-    }
-
-    .link-box input {
-      margin: 0;
-      font-family: monospace;
-      font-size: 12px;
-    }
-
-    .mono {
-      font-family: monospace;
-      font-size: 12px;
-      word-break: break-all;
-    }
-
-    .xray-box {
-      background: rgba(83,109,254,.08);
-      border: 1px solid rgba(83,109,254,.20);
-      border-radius: 14px;
-      padding: 18px;
-    }
-
-    footer {
-      padding: 45px 0 30px;
-      text-align: center;
-      color: #66718d;
-      font-size: 12px;
-    }
-
-    .empty {
-      text-align: center;
-      padding: 45px 20px;
-      color: #7e89a5;
-    }
-
-    .actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
-    @media (max-width: 850px) {
-      .grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
-    }
-
-    @media (max-width: 560px) {
-      .grid {
-        grid-template-columns: 1fr;
-      }
-
-      .nav-inner {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .hero {
-        padding-top: 30px;
-      }
-
-      .link-box {
-        flex-direction: column;
-      }
-    }
-  </style>
-</head>
-
-<body>
-
-  ${
-    username
-      ? `
-  <nav class="nav">
-    <div class="container nav-inner">
-      <a href="/dashboard" class="brand">
-        ⚔️ Vergil<span>Panel</span>
-      </a>
-
-      <div class="nav-right">
-        <span class="admin">
-          Admin: ${escapeHtml(username)}
-        </span>
-
-        <a href="/dashboard" class="btn secondary">
-          Dashboard
-        </a>
-
-        <form method="POST" action="/logout" style="margin:0;">
-          <button class="btn danger" type="submit">
-            Logout
-          </button>
-        </form>
-      </div>
-    </div>
-  </nav>
-  `
-      : ""
-  }
-
-  <main class="container">
-    ${content}
-  </main>
-
-  <footer>
-    Powered by Yasin Behzad © 2026
-  </footer>
-
-</body>
-</html>`;
-}
-
-function loginPage(error = "") {
-  return page(
-    "Login",
-    `
-    <div class="card login-card">
-
-      <div class="login-logo">
-        ⚔️ VergilPanel
-      </div>
-
-      <div class="login-subtitle">
-        Administrator Login
-      </div>
-
-      ${
-        error
-          ? `<div class="error">${escapeHtml(error)}</div>`
-          : ""
-      }
-
-      <form method="POST" action="/login">
-
-        <label>Username</label>
-
-        <input
-          type="text"
-          name="username"
-          autocomplete="username"
-          required
-        >
-
-        <label>Password</label>
-
-        <input
-          type="password"
-          name="password"
-          autocomplete="current-password"
-          required
-        >
-
-        <button class="btn" type="submit" style="width:100%;">
-          Login
-        </button>
-
-      </form>
-
-    </div>
-    `
-  );
-}
-
-function setupPage(error = "") {
-  return page(
-    "Setup",
-    `
-    <div class="card login-card">
-
-      <div class="login-logo">
-        ⚔️ VergilPanel
-      </div>
-
-      <div class="login-subtitle">
-        Initial Setup
-      </div>
-
-      ${
-        error
-          ? `<div class="error">${escapeHtml(error)}</div>`
-          : ""
-      }
-
-      <form method="POST" action="/setup">
-
-        <label>Admin Username</label>
-
-        <input
-          type="text"
-          name="username"
-          autocomplete="username"
-          required
-        >
-
-        <label>Admin Password</label>
-
-        <input
-          type="password"
-          name="password"
-          autocomplete="new-password"
-          required
-        >
-
-        <button class="btn" type="submit" style="width:100%;">
-          Create Administrator
-        </button>
-
-      </form>
-
-    </div>
-    `
-  );
-}
-
-function dashboardPage(username) {
-  const totalUsers = db
-    .prepare("SELECT COUNT(*) AS count FROM users")
-    .get().count;
-
-  const activeUsers = db
-    .prepare(
-      "SELECT COUNT(*) AS count FROM users WHERE status = 'active'"
-    )
-    .get().count;
-
-  const totalAdmins = db
-    .prepare("SELECT COUNT(*) AS count FROM admins")
-    .get().count;
-
-  const xrayRunning = isXrayRunning();
-
-  const tcpDomain = getTcpDomain();
-  const tcpPort = getTcpPort();
-
-  return page(
-    "Dashboard",
-    `
-    <div class="hero">
-
-      <h1>Dashboard</h1>
-
-      <p>
-        Welcome back, ${escapeHtml(username)} 👋
-      </p>
-
-    </div>
-
-    <div class="grid">
-
-      <div class="card">
-
-        <div class="card-title">
-          Panel Status
-        </div>
-
-        <div class="card-value status">
-          <span class="dot"></span>
-          Online
-        </div>
-
-      </div>
-
-      <div class="card">
-
-        <div class="card-title">
-          Database
-        </div>
-
-        <div class="card-value status">
-          <span class="dot"></span>
-          Connected
-        </div>
-
-      </div>
-
-      <div class="card">
-
-        <div class="card-title">
-          Users
-        </div>
-
-        <div class="card-value">
-          ${totalUsers}
-        </div>
-
-      </div>
-
-      <div class="card">
-
-        <div class="card-title">
-          Active Users
-        </div>
-
-        <div class="card-value">
-          ${activeUsers}
-        </div>
-
-      </div>
-
-    </div>
-
-    <div class="section">
-
-      <div class="section-header">
-        <h2>System</h2>
-      </div>
-
-      <div class="grid">
-
-        <div class="card">
-
-          <div class="card-title">
-            Administrators
-          </div>
-
-          <div class="card-value">
-            ${totalAdmins}
-          </div>
-
-        </div>
-
-        <div class="card">
-
-          <div class="card-title">
-            Xray
-          </div>
-
-          <div class="card-value status">
-
-            <span class="dot ${
-              xrayRunning ? "" : "off"
-            }"></span>
-
-            ${xrayRunning ? "Running" : "Stopped"}
-
-          </div>
-
-        </div>
-
-        <div class="card">
-
-          <div class="card-title">
-            Xray Port
-          </div>
-
-          <div class="card-value">
-            ${XRAY_PORT}
-          </div>
-
-        </div>
-
-        <div class="card">
-
-          <div class="card-title">
-            Version
-          </div>
-
-          <div class="card-value">
-            v${VERSION}
-          </div>
-
-        </div>
-
-      </div>
-
-    </div>
-
-    <div class="section">
-
-      <div class="xray-box">
-
-        <div class="card-title">
-          Railway TCP Proxy
-        </div>
-
-        ${
-          tcpDomain && tcpPort
-            ? `
-              <div class="card-value">
-                ${escapeHtml(tcpDomain)}:${tcpPort}
-              </div>
-
-              <p style="color:#8995b2;">
-                Automatic connection endpoint detected.
-              </p>
-            `
-            : `
-              <div class="card-value">
-                Not detected
-              </div>
-
-              <p style="color:#8995b2;">
-                Create a Railway TCP Proxy for port ${XRAY_PORT}.
-              </p>
-            `
-        }
-
-      </div>
-
-    </div>
-
-    <div class="section">
-
-      <div class="section-header">
-
-        <h2>Management</h2>
-
-        <a href="/users/new" class="btn">
-          + New User
-        </a>
-
-      </div>
-
-      <div class="grid">
-
-        <a href="/users" class="card">
-
-          <div class="card-title">
-            Users
-          </div>
-
-          <div class="card-value">
-            Manage →
-          </div>
-
-        </a>
-
-        <a href="/xray" class="card">
-
-          <div class="card-title">
-            Xray
-          </div>
-
-          <div class="card-value">
-            Configuration →
-          </div>
-
-        </a>
-
-        <div class="card">
-
-          <div class="card-title">
-            Settings
-          </div>
-
-          <div class="card-value">
-            Coming soon
-          </div>
-
-        </div>
-
-        <div class="card">
-
-          <div class="card-title">
-            API
-          </div>
-
-          <div class="card-value">
-            Coming soon
-          </div>
-
-        </div>
-
-      </div>
-
-    </div>
-    `,
-    username
-  );
-}
-
-function usersPage(username) {
-  const users = db
-    .prepare(`
-      SELECT
-        id,
-        username,
-        uuid,
-        protocol,
-        traffic_limit_bytes,
-        traffic_used_bytes,
-        expires_at,
-        status,
-        created_at
-      FROM users
-      ORDER BY id DESC
-    `)
-    .all();
-
-  const rows = users.length
-    ? users
-        .map((user) => {
-          const link = getVlessLink(user);
-
-          return `
-      <tr>
-
-        <td>
-          <strong>${escapeHtml(user.username)}</strong>
-        </td>
-
-        <td>
-          ${escapeHtml(user.protocol.toUpperCase())}
-        </td>
-
-        <td>
-          <div class="mono">
-            ${escapeHtml(user.uuid)}
-          </div>
-        </td>
-
-        <td>
-          ${formatBytes(user.traffic_limit_bytes)}
-        </td>
-
-        <td>
-          ${formatBytes(user.traffic_used_bytes)}
-        </td>
-
-        <td>
-          ${formatDate(user.expires_at)}
-        </td>
-
-        <td>
-          <span class="badge ${
-            user.status === "active"
-              ? "active"
-              : "disabled"
-          }">
-            ${escapeHtml(user.status)}
-          </span>
-        </td>
-
-        <td>
-          <div class="actions">
-
-            <a
-              href="/users/view?id=${user.id}"
-              class="btn"
-            >
-              Config
-            </a>
-
-            <form
-              method="POST"
-              action="/users/delete"
-            >
-
-              <input
-                type="hidden"
-                name="id"
-                value="${user.id}"
-              >
-
-              <button
-                class="btn danger"
-                type="submit"
-                onclick="return confirm('Delete this user?')"
-              >
-                Delete
-              </button>
-
-            </form>
-
-          </div>
-        </td>
-
-      </tr>
-    `;
-        })
-        .join("")
-    : `
-      <tr>
-        <td colspan="8">
-
-          <div class="empty">
-            No users yet.
-          </div>
-
-        </td>
-      </tr>
-    `;
-
-  return page(
-    "Users",
-    `
-    <div class="hero">
-
-      <h1>Users</h1>
-
-      <p>
-        Manage your VLESS users.
-      </p>
-
-    </div>
-
-    <div class="card">
-
-      <div class="section-header">
-
-        <h2>User Management</h2>
-
-        <div class="actions">
-
-          <a
-            href="/dashboard"
-            class="btn secondary"
-          >
-            Dashboard
-          </a>
-
-          <a
-            href="/users/new"
-            class="btn"
-          >
-            + New User
-          </a>
-
-        </div>
-
-      </div>
-
-      <div class="table-wrap">
-
-        <table>
-
-          <thead>
-
-            <tr>
-              <th>Username</th>
-              <th>Protocol</th>
-              <th>UUID</th>
-              <th>Limit</th>
-              <th>Used</th>
-              <th>Expires</th>
-              <th>Status</th>
-              <th>Action</th>
-            </tr>
-
-          </thead>
-
-          <tbody>
-            ${rows}
-          </tbody>
-
-        </table>
-
-      </div>
-
-    </div>
-    `,
-    username
-  );
-}
-
-function userViewPage(username, user, error = "") {
-  const link = getVlessLink(user);
-
-  return page(
-    `User ${user.username}`,
-    `
-    <div class="hero">
-
-      <h1>${escapeHtml(user.username)}</h1>
-
-      <p>
-        VLESS connection configuration
-      </p>
-
-    </div>
-
-    <div class="card">
-
-      ${
-        error
-          ? `<div class="error">${escapeHtml(error)}</div>`
-          : ""
-      }
-
-      <div class="section-header">
-        <h2>VLESS TCP</h2>
-
-        <span class="badge ${
-          user.status === "active"
-            ? "active"
-            : "disabled"
-        }">
-          ${escapeHtml(user.status)}
-        </span>
-      </div>
-
-      <label>
-        UUID
-      </label>
-
-      <div class="xray-box mono">
-        ${escapeHtml(user.uuid)}
-      </div>
-
-      <br>
-
-      <label>
-        Server
-      </label>
-
-      <div class="xray-box mono">
-        ${
-          getTcpDomain()
-            ? `${escapeHtml(getTcpDomain())}:${getTcpPort()}`
-            : "TCP Proxy not detected"
-        }
-      </div>
-
-      <br>
-
-      <label>
-        VLESS Link
-      </label>
-
-      ${
-        link
-          ? `
-          <div class="link-box">
-
-            <input
-              id="vlessLink"
-              type="text"
-              readonly
-              value="${escapeHtml(link)}"
-            >
-
-            <button
-              class="btn"
-              type="button"
-              onclick="copyLink()"
-            >
-              Copy
-            </button>
-
-          </div>
-
-          <p style="color:#7f8aa6;font-size:13px;">
-            Open the link with your VLESS client.
-          </p>
-          `
-          : `
-          <div class="error">
-            Railway TCP Proxy information was not detected.
-          </div>
-          `
-      }
-
-      <br>
-
-      <div class="actions">
-
-        <a
-          href="/users"
-          class="btn secondary"
-        >
-          Back
-        </a>
-
-      </div>
-
-    </div>
-
-    <script>
-      async function copyLink() {
-        const input =
-          document.getElementById("vlessLink");
-
-        if (!input) return;
-
-        try {
-          await navigator.clipboard.writeText(
-            input.value
-          );
-
-          alert("VLESS link copied.");
-        } catch {
-          input.select();
-          document.execCommand("copy");
-          alert("VLESS link copied.");
-        }
-      }
-    </script>
-    `,
-    username
-  );
-}
-
-function xrayPage(username) {
-  const xrayRunning = isXrayRunning();
-
-  const tcpDomain = getTcpDomain();
-  const tcpPort = getTcpPort();
-
-  const activeCount = getXrayUsers().length;
-
-  return page(
-    "Xray",
-    `
-    <div class="hero">
-
-      <h1>Xray Configuration</h1>
-
-      <p>
-        Automatic Xray management
-      </p>
-
-    </div>
-
-    <div class="grid">
-
-      <div class="card">
-
-        <div class="card-title">
-          Xray Status
-        </div>
-
-        <div class="card-value status">
-
-          <span class="dot ${
-            xrayRunning ? "" : "off"
-          }"></span>
-
-          ${xrayRunning ? "Running" : "Stopped"}
-
-        </div>
-
-      </div>
-
-      <div class="card">
-
-        <div class="card-title">
-          Transport
-        </div>
-
-        <div class="card-value">
-          TCP
-        </div>
-
-      </div>
-
-      <div class="card">
-
-        <div class="card-title">
-          Internal Port
-        </div>
-
-        <div class="card-value">
-          ${XRAY_PORT}
-        </div>
-
-      </div>
-
-      <div class="card">
-
-        <div class="card-title">
-          Active Xray Users
-        </div>
-
-        <div class="card-value">
-          ${activeCount}
-        </div>
-
-      </div>
-
-    </div>
-
-    <div class="section">
-
-      <div class="card">
-
-        <h2>Connection Endpoint</h2>
-
-        ${
-          tcpDomain && tcpPort
-            ? `
-              <p class="mono">
-                ${escapeHtml(tcpDomain)}:${tcpPort}
-              </p>
-            `
-            : `
-              <p style="color:#ff8b9a;">
-                Railway TCP Proxy is not detected.
-              </p>
-            `
-        }
-
-      </div>
-
-    </div>
-
-    <div class="section">
-
-      <div class="card">
-
-        <h2>Automatic Sync</h2>
-
-        <p style="color:#8f9ab7;line-height:1.7;">
-          VergilPanel generates the Xray configuration
-          automatically from the Users database.
-          Creating or deleting a user automatically
-          synchronizes Xray.
-        </p>
-
-      </div>
-
-    </div>
-
-    <div class="section">
-
-      <div class="card">
-
-        <h2>Supported Transport</h2>
-
-        <div class="grid">
-
-          <div class="card">
-            <div class="card-title">
-              VLESS + TCP
-            </div>
-
-            <div class="card-value">
-              Enabled
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-title">
-              WebSocket
-            </div>
-
-            <div class="card-value">
-              Next
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-title">
-              XHTTP
-            </div>
-
-            <div class="card-value">
-              Next
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-title">
-              Secure Transport
-            </div>
-
-            <div class="card-value">
-              Next
-            </div>
-          </div>
-
-        </div>
-
-      </div>
-
-    </div>
-
-    <div class="section">
-
-      <a href="/dashboard" class="btn secondary">
-        ← Dashboard
-      </a>
-
-    </div>
-    `,
-    username
-  );
-}
-
-/*
- * ---------------------------------------------------------
- * REQUEST HANDLER
- * ---------------------------------------------------------
- */
-
-async function handleRequest(req, res) {
-  const url = new URL(
-    req.url,
-    `http://${req.headers.host || "localhost"}`
-  );
-
-  const path = url.pathname;
-  const method = req.method;
-
-  /*
-   * HEALTH
-   */
-
-  if (
-    method === "GET" &&
-    path === "/health"
-  ) {
-    send(
-      res,
-      200,
-      JSON.stringify(
-        {
-          ok: true,
-          service: "VergilPanel",
-          version: VERSION,
-          database: "sqlite",
-          xray: isXrayRunning(),
-          xrayPort: XRAY_PORT,
-          tcpProxyDomain: getTcpDomain() || null,
-          tcpProxyPort: getTcpPort() || null,
-        },
-        null,
-        2
-      ),
-      "application/json; charset=utf-8"
-    );
-
-    return;
-  }
-
-  /*
-   * XRAY STATUS API
-   */
-
-  if (
-    method === "GET" &&
-    path === "/api/xray/status"
-  ) {
-    send(
-      res,
-      200,
-      JSON.stringify(
-        {
-          ok: true,
-          running: isXrayRunning(),
-          port: XRAY_PORT,
-          activeUsers: getXrayUsers().length,
-          tcpProxy: {
-            domain: getTcpDomain() || null,
-            port: getTcpPort() || null,
-          },
-        },
-        null,
-        2
-      ),
-      "application/json; charset=utf-8"
-    );
-
-    return;
-  }
-
-  /*
-   * SETUP STATUS
-   */
-
-  if (
-    method === "GET" &&
-    path === "/api/setup/status"
-  ) {
-    const admin = db
-      .prepare("SELECT id FROM admins LIMIT 1")
-      .get();
-
-    send(
-      res,
-      200,
-      JSON.stringify({
-        setupRequired: !admin,
-      }),
-      "application/json; charset=utf-8"
-    );
-
-    return;
-  }
-
-  /*
-   * ROOT
-   */
-
-  if (
-    method === "GET" &&
-    path === "/"
-  ) {
-    const admin = db
-      .prepare("SELECT id FROM admins LIMIT 1")
-      .get();
-
-    if (!admin) {
-      redirect(res, "/setup");
-      return;
-    }
-
     const session = getSession(req);
 
-    if (session) {
-      redirect(res, "/dashboard");
-      return;
+    if (!session) {
+        redirect(res, "/login");
+        return null;
     }
 
-    redirect(res, "/login");
-    return;
-  }
+    return session;
+}
 
-  /*
-   * SETUP GET
-   */
-
-  if (
-    method === "GET" &&
-    path === "/setup"
-  ) {
-    const admin = db
-      .prepare("SELECT id FROM admins LIMIT 1")
-      .get();
-
-    if (admin) {
-      redirect(res, "/login");
-      return;
-    }
-
-    send(res, 200, setupPage());
-    return;
-  }
-
-  /*
-   * SETUP POST
-   */
-
-  if (
-    method === "POST" &&
-    path === "/setup"
-  ) {
-    const admin = db
-      .prepare("SELECT id FROM admins LIMIT 1")
-      .get();
-
-    if (admin) {
-      redirect(res, "/login");
-      return;
-    }
-
-    try {
-      const body = await readBody(req);
-
-      const username = String(
-        body.username || ""
-      ).trim();
-
-      const password = String(
-        body.password || ""
-      );
-
-      if (!username || !password) {
-        send(
-          res,
-          400,
-          setupPage(
-            "Username and password are required."
-          )
-        );
-
-        return;
-      }
-
-      if (password.length < 6) {
-        send(
-          res,
-          400,
-          setupPage(
-            "Password must be at least 6 characters."
-          )
-        );
-
-        return;
-      }
-
-      db.prepare(`
-        INSERT INTO admins
-        (
-          username,
-          password_hash,
-          created_at
-        )
-        VALUES (?, ?, ?)
-      `).run(
-        username,
-        hashPassword(password),
-        new Date().toISOString()
-      );
-
-      redirect(res, "/login");
-      return;
-    } catch (error) {
-      console.error(error);
-
-      send(
-        res,
-        500,
-        setupPage(
-          "Unable to complete setup."
-        )
-      );
-
-      return;
-    }
-  }
-
-  /*
-   * LOGIN GET
-   */
-
-  if (
-    method === "GET" &&
-    path === "/login"
-  ) {
-    const admin = db
-      .prepare("SELECT id FROM admins LIMIT 1")
-      .get();
-
-    if (!admin) {
-      redirect(res, "/setup");
-      return;
-    }
-
-    const session = getSession(req);
-
-    if (session) {
-      redirect(res, "/dashboard");
-      return;
-    }
-
-    send(res, 200, loginPage());
-    return;
-  }
-
-  /*
-   * LOGIN POST
-   */
-
-  if (
-    method === "POST" &&
-    path === "/login"
-  ) {
-    try {
-      const body = await readBody(req);
-
-      const username = String(
-        body.username || ""
-      ).trim();
-
-      const password = String(
-        body.password || ""
-      );
-
-      const admin = db
-        .prepare(`
-          SELECT *
-          FROM admins
-          WHERE username = ?
-          LIMIT 1
-        `)
-        .get(username);
-
-      if (
-        !admin ||
-        admin.password_hash !==
-          hashPassword(password)
-      ) {
-        send(
-          res,
-          401,
-          loginPage(
-            "Invalid username or password."
-          )
-        );
-
-        return;
-      }
-
-      const token = createSession(username);
-
-      res.writeHead(302, {
-        Location: "/dashboard",
-
-        "Set-Cookie": [
-          `vergil_session=${encodeURIComponent(
-            token
-          )}; HttpOnly; Path=/; SameSite=Lax`,
-        ],
-
-        "Cache-Control": "no-store",
-      });
-
-      res.end();
-
-      return;
-    } catch (error) {
-      console.error(error);
-
-      send(
-        res,
-        500,
-        loginPage("Login failed.")
-      );
-
-      return;
-    }
-  }
-
-  /*
-   * LOGOUT
-   */
-
-  if (
-    method === "POST" &&
-    path === "/logout"
-  ) {
-    deleteSession(req);
-
+function redirect(res, location) {
     res.writeHead(302, {
-      Location: "/login",
-
-      "Set-Cookie":
-        "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax",
-
-      "Cache-Control": "no-store",
+        Location: location,
+        "Cache-Control": "no-store"
     });
 
     res.end();
+}
 
-    return;
-  }
+function sendHtml(res, html, status = 200) {
+    res.writeHead(status, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store"
+    });
 
-  /*
-   * DASHBOARD
-   */
+    res.end(html);
+}
 
-  if (
-    method === "GET" &&
-    path === "/dashboard"
-  ) {
-    const session = requireAuth(req, res);
+function sendJson(res, data, status = 200) {
+    res.writeHead(status, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store"
+    });
 
-    if (!session) {
-      return;
+    res.end(JSON.stringify(data));
+}
+
+async function readBody(req) {
+    return new Promise((resolve, reject) => {
+        let body = "";
+
+        req.on("data", chunk => {
+            body += chunk;
+
+            if (body.length > 1024 * 1024) {
+                req.destroy();
+                reject(new Error("Request body too large"));
+            }
+        });
+
+        req.on("end", () => resolve(body));
+
+        req.on("error", reject);
+    });
+}
+
+async function readForm(req) {
+    const body = await readBody(req);
+    return new URLSearchParams(body);
+}
+
+function getPublicOrigin(req) {
+    const forwardedHost =
+        req.headers["x-forwarded-host"] ||
+        req.headers.host ||
+        process.env.RAILWAY_PUBLIC_DOMAIN ||
+        "localhost:8080";
+
+    const host = String(forwardedHost).split(",")[0].trim();
+
+    if (
+        host.startsWith("localhost") ||
+        host.startsWith("127.0.0.1") ||
+        host.includes(":8080")
+    ) {
+        return `http://${host}`;
     }
 
-    send(
-      res,
-      200,
-      dashboardPage(session.username)
+    return `https://${host}`;
+}
+
+function getPublicDomain(req) {
+    const forwardedHost =
+        req.headers["x-forwarded-host"] ||
+        process.env.RAILWAY_PUBLIC_DOMAIN ||
+        req.headers.host ||
+        "localhost";
+
+    return String(forwardedHost).split(",")[0].trim();
+}
+
+function activeUsers() {
+    return db.prepare(`
+        SELECT *
+        FROM users
+        WHERE status = 'active'
+          AND (
+              expires_at IS NULL
+              OR expires_at = ''
+              OR expires_at > ?
+          )
+        ORDER BY id DESC
+    `).all(nowIso());
+}
+
+function allUsers() {
+    return db.prepare(`
+        SELECT *
+        FROM users
+        ORDER BY id DESC
+    `).all();
+}
+
+function generateXrayConfig() {
+    const users = activeUsers();
+
+    const clients = users.map(user => ({
+        id: user.uuid,
+        email: user.username
+    }));
+
+    return {
+        log: {
+            loglevel: "warning"
+        },
+
+        inbounds: [
+            {
+                listen: "127.0.0.1",
+                port: XRAY_XHTTP_PORT,
+                protocol: "vless",
+                settings: {
+                    clients,
+                    decryption: "none"
+                },
+                streamSettings: {
+                    network: "xhttp",
+                    security: "none",
+                    xhttpSettings: {
+                        path: XHTTP_PATH,
+                        mode: "auto"
+                    }
+                }
+            },
+
+            {
+                listen: "127.0.0.1",
+                port: XRAY_WS_PORT,
+                protocol: "vless",
+                settings: {
+                    clients,
+                    decryption: "none"
+                },
+                streamSettings: {
+                    network: "websocket",
+                    security: "none",
+                    wsSettings: {
+                        path: WS_PATH
+                    }
+                }
+            }
+        ],
+
+        outbounds: [
+            {
+                protocol: "freedom",
+                settings: {}
+            }
+        ]
+    };
+}
+
+async function writeXrayConfig() {
+    const config = generateXrayConfig();
+
+    await fs.writeFile(
+        XRAY_CONFIG,
+        JSON.stringify(config, null, 2),
+        "utf8"
     );
 
-    return;
-  }
+    console.log(
+        `⚙️ Xray config synced: ${activeUsers().length} active user(s)`
+    );
+}
 
-  /*
-   * XRAY PAGE
-   */
+function stopXray() {
+    return new Promise(resolve => {
+        if (!xrayProcess) {
+            resolve();
+            return;
+        }
 
-  if (
-    method === "GET" &&
-    path === "/xray"
-  ) {
-    const session = requireAuth(req, res);
+        const processToStop = xrayProcess;
+        xrayProcess = null;
 
-    if (!session) {
-      return;
-    }
+        const timer = setTimeout(() => {
+            try {
+                processToStop.kill("SIGKILL");
+            } catch {}
 
-    send(
-      res,
-      200,
-      xrayPage(session.username)
+            resolve();
+        }, 3000);
+
+        processToStop.once("exit", () => {
+            clearTimeout(timer);
+            resolve();
+        });
+
+        try {
+            processToStop.kill("SIGTERM");
+        } catch {
+            clearTimeout(timer);
+            resolve();
+        }
+    });
+}
+
+async function startXray() {
+    await writeXrayConfig();
+
+    console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
+    console.log(`⚔️ Starting Xray XHTTP on 127.0.0.1:${XRAY_XHTTP_PORT}`);
+    console.log(`⚔️ Starting Xray WebSocket on 127.0.0.1:${XRAY_WS_PORT}`);
+
+    xrayProcess = spawn(
+        XRAY_BIN,
+        [
+            "run",
+            "-config",
+            XRAY_CONFIG
+        ],
+        {
+            stdio: ["ignore", "pipe", "pipe"]
+        }
     );
 
-    return;
-  }
+    xrayProcess.stdout.on("data", data => {
+        process.stdout.write(`[XRAY] ${data}`);
+    });
 
-  /*
-   * USERS
-   */
+    xrayProcess.stderr.on("data", data => {
+        process.stderr.write(`[XRAY] ${data}`);
+    });
 
-  if (
-    method === "GET" &&
-    path === "/users"
-  ) {
-    const session = requireAuth(req, res);
+    xrayProcess.on("error", error => {
+        console.error("❌ Xray process error:", error);
+    });
 
-    if (!session) {
-      return;
+    xrayProcess.on("exit", (code, signal) => {
+        console.log(
+            `⚠️ Xray exited. code=${code} signal=${signal}`
+        );
+
+        if (!stoppingXray) {
+            setTimeout(() => {
+                startXray().catch(error => {
+                    console.error("❌ Xray restart failed:", error);
+                });
+            }, 1500);
+        }
+    });
+}
+
+async function restartXray() {
+    await stopXray();
+    await startXray();
+}
+
+function makeVlessLinks(user, origin) {
+    const domain = new URL(origin).hostname;
+
+    const xhttpParams = new URLSearchParams({
+        encryption: "none",
+        security: "tls",
+        type: "xhttp",
+        path: XHTTP_PATH,
+        host: domain,
+        mode: "auto"
+    });
+
+    const wsParams = new URLSearchParams({
+        encryption: "none",
+        security: "tls",
+        type: "ws",
+        path: WS_PATH,
+        host: domain
+    });
+
+    return {
+        xhttp:
+            `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(user.username)}-XHTTP`,
+
+        websocket:
+            `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(user.username)}-WS`
+    };
+}
+
+function makeSubscription(user, origin) {
+    const links = makeVlessLinks(user, origin);
+
+    return Buffer.from(
+        `${links.xhttp}\n${links.websocket}`,
+        "utf8"
+    ).toString("base64");
+}
+
+function layout(title, body, extraHead = "") {
+    return `
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} — VergilPanel</title>
+${extraHead}
+<style>
+:root{
+    color-scheme:dark;
+    --bg:#080a0f;
+    --card:#11151d;
+    --card2:#171c26;
+    --border:#252c38;
+    --text:#f5f7fb;
+    --muted:#8d98a8;
+    --accent:#7c5cff;
+    --green:#35d07f;
+    --red:#ff5d6c;
+}
+*{box-sizing:border-box}
+body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+a{color:inherit;text-decoration:none}
+.container{max-width:1200px;margin:auto;padding:24px}
+.nav{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    margin-bottom:28px;
+}
+.brand{
+    font-size:22px;
+    font-weight:800;
+}
+.brand span{color:var(--accent)}
+.nav-right{display:flex;gap:12px;align-items:center}
+.btn{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    padding:10px 15px;
+    border-radius:10px;
+    border:1px solid var(--border);
+    background:var(--card2);
+    color:var(--text);
+    cursor:pointer;
+    font-size:14px;
+}
+.btn.primary{
+    background:var(--accent);
+    border-color:var(--accent);
+}
+.btn.danger{
+    color:#fff;
+    background:#34151b;
+    border-color:#56202a;
+}
+.grid{
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:16px;
+}
+.card{
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:16px;
+    padding:20px;
+}
+.stat-label{color:var(--muted);font-size:13px}
+.stat-value{font-size:30px;font-weight:800;margin-top:8px}
+h1{font-size:28px;margin:0 0 8px}
+h2{font-size:20px}
+.muted{color:var(--muted)}
+.table-wrap{
+    overflow:auto;
+    margin-top:18px;
+}
+table{
+    width:100%;
+    border-collapse:collapse;
+}
+th,td{
+    padding:14px 12px;
+    text-align:left;
+    border-bottom:1px solid var(--border);
+    white-space:nowrap;
+}
+th{color:var(--muted);font-size:12px}
+.badge{
+    display:inline-flex;
+    padding:5px 9px;
+    border-radius:999px;
+    background:#202633;
+    font-size:12px;
+}
+.badge.green{background:#123522;color:#68e9a2}
+.badge.red{background:#39171c;color:#ff8b96}
+.actions{display:flex;gap:8px}
+.form{
+    max-width:520px;
+}
+label{
+    display:block;
+    margin:16px 0 7px;
+    color:var(--muted);
+    font-size:13px;
+}
+input,select{
+    width:100%;
+    padding:13px;
+    background:#0b0e14;
+    color:var(--text);
+    border:1px solid var(--border);
+    border-radius:10px;
+    outline:none;
+}
+input:focus,select:focus{
+    border-color:var(--accent);
+}
+.notice{
+    padding:14px;
+    border-radius:12px;
+    background:#151a23;
+    border:1px solid var(--border);
+    margin-bottom:18px;
+}
+pre.config{
+    white-space:pre-wrap;
+    word-break:break-all;
+    background:#090c11;
+    border:1px solid var(--border);
+    padding:14px;
+    border-radius:10px;
+}
+.login{
+    min-height:100vh;
+    display:grid;
+    place-items:center;
+    padding:20px;
+}
+.login .card{width:min(420px,100%)}
+.small{font-size:12px}
+footer{
+    text-align:center;
+    color:var(--muted);
+    padding:30px 0 10px;
+}
+@media(max-width:800px){
+    .grid{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:520px){
+    .container{padding:15px}
+    .grid{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+${body}
+</body>
+</html>
+`;
+}
+
+function loginPage(error = "") {
+    return layout(
+        "Login",
+        `
+<div class="login">
+<div class="card">
+    <div class="brand">⚔️ Vergil<span>Panel</span></div>
+    <p class="muted">Sign in to your panel</p>
+
+    ${error ? `<div class="notice">${escapeHtml(error)}</div>` : ""}
+
+    <form method="POST" action="/login">
+        <label>Username</label>
+        <input name="username" required autocomplete="username">
+
+        <label>Password</label>
+        <input type="password" name="password" required autocomplete="current-password">
+
+        <br><br>
+        <button class="btn primary" type="submit" style="width:100%">
+            Login
+        </button>
+    </form>
+</div>
+</div>
+`
+    );
+}
+
+function dashboardPage(req) {
+    const users = allUsers();
+    const active = activeUsers();
+
+    return layout(
+        "Dashboard",
+        `
+<div class="container">
+
+<div class="nav">
+    <div class="brand">⚔️ Vergil<span>Panel</span></div>
+    <div class="nav-right">
+        <span class="muted">${escapeHtml(getSession(req)?.username || "admin")}</span>
+        <a class="btn" href="/logout">Logout</a>
+    </div>
+</div>
+
+<div class="grid">
+    <div class="card">
+        <div class="stat-label">Users</div>
+        <div class="stat-value">${users.length}</div>
+    </div>
+
+    <div class="card">
+        <div class="stat-label">Active Users</div>
+        <div class="stat-value">${active.length}</div>
+    </div>
+
+    <div class="card">
+        <div class="stat-label">Transport</div>
+        <div class="stat-value" style="font-size:20px">XHTTP + WS</div>
+    </div>
+
+    <div class="card">
+        <div class="stat-label">Version</div>
+        <div class="stat-value" style="font-size:20px">v${VERSION}</div>
+    </div>
+</div>
+
+<br>
+
+<div class="card">
+    <div style="display:flex;justify-content:space-between;gap:15px;align-items:center">
+        <div>
+            <h2>Users</h2>
+            <div class="muted">Automatic Xray configuration</div>
+        </div>
+
+        <a class="btn primary" href="/users/new">＋ New User</a>
+    </div>
+
+    <div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th>Username</th>
+                <th>Protocol</th>
+                <th>UUID</th>
+                <th>Status</th>
+                <th>Configs</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+
+        <tbody>
+        ${
+            users.length
+                ? users.map(user => `
+            <tr>
+                <td><strong>${escapeHtml(user.username)}</strong></td>
+                <td><span class="badge">VLESS</span></td>
+                <td class="small">${escapeHtml(user.uuid)}</td>
+                <td>
+                    ${
+                        user.status === "active"
+                            ? `<span class="badge green">Active</span>`
+                            : `<span class="badge red">Disabled</span>`
+                    }
+                </td>
+                <td>
+                    <a class="btn" href="/users/config?id=${user.id}">
+                        Config
+                    </a>
+                </td>
+                <td>
+                    <div class="actions">
+                        ${
+                            user.status === "active"
+                                ? `
+                                <form method="POST" action="/users/toggle">
+                                    <input type="hidden" name="id" value="${user.id}">
+                                    <button class="btn" type="submit">Disable</button>
+                                </form>
+                                `
+                                : `
+                                <form method="POST" action="/users/toggle">
+                                    <input type="hidden" name="id" value="${user.id}">
+                                    <button class="btn" type="submit">Enable</button>
+                                </form>
+                                `
+                        }
+
+                        <form method="POST" action="/users/delete"
+                              onsubmit="return confirm('Delete this user?')">
+                            <input type="hidden" name="id" value="${user.id}">
+                            <button class="btn danger" type="submit">Delete</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            `).join("")
+                : `
+            <tr>
+                <td colspan="6" class="muted">
+                    No users yet.
+                </td>
+            </tr>
+            `
+        }
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<footer>
+    VergilPanel v${VERSION} · Xray automatic management
+</footer>
+
+</div>
+`
+    );
+}
+
+function newUserPage(error = "") {
+    return layout(
+        "New User",
+        `
+<div class="container">
+
+<div class="nav">
+    <div class="brand">⚔️ Vergil<span>Panel</span></div>
+    <a class="btn" href="/dashboard">← Dashboard</a>
+</div>
+
+<div class="card form">
+    <h1>New User</h1>
+    <p class="muted">
+        The UUID and subscription token will be generated automatically.
+    </p>
+
+    ${
+        error
+            ? `<div class="notice">${escapeHtml(error)}</div>`
+            : ""
     }
 
-    send(
-      res,
-      200,
-      usersPage(session.username)
+    <form method="POST" action="/users/new">
+
+        <label>Username</label>
+        <input
+            name="username"
+            required
+            maxlength="64"
+            placeholder="Vexa"
+        >
+
+        <label>Traffic Limit</label>
+        <select name="traffic_limit">
+            <option value="0">Unlimited</option>
+            <option value="10737418240">10 GB</option>
+            <option value="53687091200">50 GB</option>
+            <option value="107374182400">100 GB</option>
+            <option value="536870912000">500 GB</option>
+        </select>
+
+        <label>Expiry</label>
+        <input
+            type="datetime-local"
+            name="expires_at"
+        >
+
+        <br><br>
+
+        <button class="btn primary" type="submit">
+            Create User
+        </button>
+
+    </form>
+</div>
+
+</div>
+`
+    );
+}
+
+function configPage(req, user) {
+    const origin = getPublicOrigin(req);
+    const links = makeVlessLinks(user, origin);
+
+    const subscriptionUrl =
+        `${origin}/sub/${user.subscription_token}`;
+
+    return layout(
+        `${user.username} Config`,
+        `
+<div class="container">
+
+<div class="nav">
+    <div class="brand">⚔️ Vergil<span>Panel</span></div>
+    <a class="btn" href="/dashboard">← Dashboard</a>
+</div>
+
+<div class="card">
+
+<h1>${escapeHtml(user.username)}</h1>
+
+<p class="muted">
+VLESS · automatic configuration
+</p>
+
+<div class="notice">
+    <strong>Subscription URL</strong>
+    <pre class="config">${escapeHtml(subscriptionUrl)}</pre>
+    <button class="btn primary"
+        onclick="navigator.clipboard.writeText(${JSON.stringify(subscriptionUrl)})">
+        Copy Subscription
+    </button>
+</div>
+
+<h2>🚀 XHTTP</h2>
+<pre class="config">${escapeHtml(links.xhttp)}</pre>
+<button class="btn"
+    onclick="navigator.clipboard.writeText(${JSON.stringify(links.xhttp)})">
+    Copy XHTTP
+</button>
+
+<h2>🌐 WebSocket</h2>
+<pre class="config">${escapeHtml(links.websocket)}</pre>
+<button class="btn"
+    onclick="navigator.clipboard.writeText(${JSON.stringify(links.websocket)})">
+    Copy WebSocket
+</button>
+
+<h2>UUID</h2>
+<pre class="config">${escapeHtml(user.uuid)}</pre>
+
+<p class="muted small">
+Xray transport security is disabled at the Xray layer. Railway provides HTTPS/TLS at the public edge.
+</p>
+
+</div>
+</div>
+`
+    );
+}
+
+function setupPage(error = "") {
+    return layout(
+        "Setup",
+        `
+<div class="login">
+<div class="card">
+
+<div class="brand">⚔️ Vergil<span>Panel</span></div>
+
+<h2>Initial Setup</h2>
+
+<p class="muted">
+Create the first administrator account.
+</p>
+
+${error ? `<div class="notice">${escapeHtml(error)}</div>` : ""}
+
+<form method="POST" action="/setup">
+
+<label>Admin Username</label>
+<input name="username" required value="admin">
+
+<label>Password</label>
+<input type="password" name="password" required minlength="6">
+
+<label>Confirm Password</label>
+<input type="password" name="confirm" required minlength="6">
+
+<br><br>
+
+<button class="btn primary" type="submit" style="width:100%">
+Create Panel
+</button>
+
+</form>
+
+</div>
+</div>
+`
+    );
+}
+
+function setupComplete() {
+    return db.prepare("SELECT COUNT(*) AS count FROM admins").get().count > 0;
+}
+
+function ensureDefaultAdmin() {
+    if (setupComplete()) return;
+
+    const username = process.env.ADMIN_USERNAME;
+    const password = process.env.ADMIN_PASSWORD;
+
+    if (!username || !password) return;
+
+    db.prepare(`
+        INSERT INTO admins(username, password_hash, created_at)
+        VALUES (?, ?, ?)
+    `).run(
+        username,
+        hashPassword(password),
+        nowIso()
     );
 
-    return;
-  }
+    console.log(`👤 Default admin created: ${username}`);
+}
 
-  /*
-   * USER VIEW
-   */
+function authenticate(username, password) {
+    const admin = db.prepare(`
+        SELECT *
+        FROM admins
+        WHERE username = ?
+    `).get(username);
 
-  if (
-    method === "GET" &&
-    path === "/users/view"
-  ) {
-    const session = requireAuth(req, res);
+    if (!admin) return false;
 
-    if (!session) {
-      return;
+    return admin.password_hash === hashPassword(password);
+}
+
+async function createUser(form) {
+    const username = String(form.get("username") || "").trim();
+
+    if (!username) {
+        throw new Error("Username is required.");
     }
 
-    const id = Number(url.searchParams.get("id"));
+    const exists = db.prepare(`
+        SELECT id
+        FROM users
+        WHERE username = ?
+    `).get(username);
 
-    if (!Number.isInteger(id)) {
-      redirect(res, "/users");
-      return;
+    if (exists) {
+        throw new Error("Username already exists.");
     }
 
-    const user = db
-      .prepare(`
+    const uuid = crypto.randomUUID();
+    const subscriptionToken = randomToken(32);
+
+    const trafficLimit =
+        Number(form.get("traffic_limit") || 0);
+
+    let expiresAt = null;
+
+    const expiry = String(form.get("expires_at") || "").trim();
+
+    if (expiry) {
+        const date = new Date(expiry);
+
+        if (Number.isNaN(date.getTime())) {
+            throw new Error("Invalid expiry date.");
+        }
+
+        expiresAt = date.toISOString();
+    }
+
+    const result = db.prepare(`
+        INSERT INTO users(
+            username,
+            uuid,
+            protocol,
+            traffic_limit_bytes,
+            traffic_used_bytes,
+            expires_at,
+            status,
+            subscription_token,
+            created_at
+        )
+        VALUES (?, ?, 'vless', ?, 0, ?, 'active', ?, ?)
+    `).run(
+        username,
+        uuid,
+        Number.isFinite(trafficLimit) ? trafficLimit : 0,
+        expiresAt,
+        subscriptionToken,
+        nowIso()
+    );
+
+    await restartXray();
+
+    return db.prepare(`
         SELECT *
         FROM users
         WHERE id = ?
-        LIMIT 1
-      `)
-      .get(id);
+    `).get(result.lastInsertRowid);
+}
+
+async function deleteUser(id) {
+    db.prepare(`
+        DELETE FROM users
+        WHERE id = ?
+    `).run(Number(id));
+
+    await restartXray();
+}
+
+async function toggleUser(id) {
+    const user = db.prepare(`
+        SELECT *
+        FROM users
+        WHERE id = ?
+    `).get(Number(id));
 
     if (!user) {
-      redirect(res, "/users");
-      return;
+        throw new Error("User not found.");
     }
 
-    send(
-      res,
-      200,
-      userViewPage(
-        session.username,
-        user
-      )
-    );
+    const newStatus =
+        user.status === "active"
+            ? "disabled"
+            : "active";
 
-    return;
-  }
+    db.prepare(`
+        UPDATE users
+        SET status = ?
+        WHERE id = ?
+    `).run(newStatus, Number(id));
 
-  /*
-   * NEW USER GET
-   */
-
-  if (
-    method === "GET" &&
-    path === "/users/new"
-  ) {
-    const session = requireAuth(req, res);
-
-    if (!session) {
-      return;
-    }
-
-    send(
-      res,
-      200,
-      newUserPage(session.username)
-    );
-
-    return;
-  }
-
-  /*
-   * NEW USER POST
-   */
-
-  if (
-    method === "POST" &&
-    path === "/users/new"
-  ) {
-    const session = requireAuth(req, res);
-
-    if (!session) {
-      return;
-    }
-
-    try {
-      const body = await readBody(req);
-
-      const username = String(
-        body.username || ""
-      ).trim();
-
-      const protocol = String(
-        body.protocol || "vless"
-      ).toLowerCase();
-
-      const trafficLimitGb = Number(
-        body.traffic_limit_gb || 0
-      );
-
-      const expiresAtRaw = String(
-        body.expires_at || ""
-      ).trim();
-
-      if (!username) {
-        send(
-          res,
-          400,
-          newUserPage(
-            session.username,
-            "Username is required."
-          )
-        );
-
-        return;
-      }
-
-      if (protocol !== "vless") {
-        send(
-          res,
-          400,
-          newUserPage(
-            session.username,
-            "Only VLESS is currently supported."
-          )
-        );
-
-        return;
-      }
-
-      if (
-        !Number.isFinite(trafficLimitGb) ||
-        trafficLimitGb < 0
-      ) {
-        send(
-          res,
-          400,
-          newUserPage(
-            session.username,
-            "Traffic limit is invalid."
-          )
-        );
-
-        return;
-      }
-
-      const existing = db
-        .prepare(`
-          SELECT id
-          FROM users
-          WHERE username = ?
-          LIMIT 1
-        `)
-        .get(username);
-
-      if (existing) {
-        send(
-          res,
-          400,
-          newUserPage(
-            session.username,
-            "This username already exists."
-          )
-        );
-
-        return;
-      }
-
-      const uuid = crypto.randomUUID();
-
-      const trafficLimitBytes = Math.floor(
-        trafficLimitGb * 1024 ** 3
-      );
-
-      const expiresAt = expiresAtRaw
-        ? new Date(
-            `${expiresAtRaw}T23:59:59.000Z`
-          ).toISOString()
-        : null;
-
-      db.prepare(`
-        INSERT INTO users
-        (
-          username,
-          uuid,
-          protocol,
-          traffic_limit_bytes,
-          traffic_used_bytes,
-          expires_at,
-          status,
-          created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        username,
-        uuid,
-        protocol,
-        trafficLimitBytes,
-        0,
-        expiresAt,
-        "active",
-        new Date().toISOString()
-      );
-
-      const syncOk = await syncXray();
-
-      if (!syncOk) {
-        console.error(
-          `User ${username} created but Xray sync failed.`
-        );
-      }
-
-      redirect(res, `/users/view?id=${
-        db
-          .prepare(`
-            SELECT id
-            FROM users
-            WHERE uuid = ?
-            LIMIT 1
-          `)
-          .get(uuid).id
-      }`);
-
-      return;
-    } catch (error) {
-      console.error(error);
-
-      send(
-        res,
-        500,
-        newUserPage(
-          session.username,
-          "Unable to create user."
-        )
-      );
-
-      return;
-    }
-  }
-
-  /*
-   * DELETE USER
-   */
-
-  if (
-    method === "POST" &&
-    path === "/users/delete"
-  ) {
-    const session = requireAuth(req, res);
-
-    if (!session) {
-      return;
-    }
-
-    try {
-      const body = await readBody(req);
-
-      const id = Number(body.id);
-
-      if (!Number.isInteger(id)) {
-        redirect(res, "/users");
-        return;
-      }
-
-      db.prepare(
-        "DELETE FROM users WHERE id = ?"
-      ).run(id);
-
-      const syncOk = await syncXray();
-
-      if (!syncOk) {
-        console.error(
-          "User deleted but Xray sync failed."
-        );
-      }
-
-      redirect(res, "/users");
-      return;
-    } catch (error) {
-      console.error(error);
-
-      send(
-        res,
-        500,
-        "Unable to delete user."
-      );
-
-      return;
-    }
-  }
-
-  /*
-   * 404
-   */
-
-  send(
-    res,
-    404,
-    page(
-      "404",
-      `
-      <div class="hero">
-
-        <h1>404</h1>
-
-        <p>
-          The page you are looking for does not exist.
-        </p>
-
-      </div>
-
-      <a href="/" class="btn">
-        Go Home
-      </a>
-      `
-    )
-  );
+    await restartXray();
 }
 
-/*
- * ---------------------------------------------------------
- * SERVER
- * ---------------------------------------------------------
- */
+function proxyHttpToXray(req, res, targetPort) {
+    const options = {
+        hostname: "127.0.0.1",
+        port: targetPort,
+        path: req.url,
+        method: req.method,
+        headers: {
+            ...req.headers,
+            host: `127.0.0.1:${targetPort}`
+        }
+    };
+
+    const proxy = http.request(options, upstream => {
+        res.writeHead(
+            upstream.statusCode || 502,
+            upstream.headers
+        );
+
+        upstream.pipe(res);
+    });
+
+    proxy.on("error", error => {
+        console.error("HTTP proxy error:", error);
+
+        if (!res.headersSent) {
+            res.writeHead(502, {
+                "Content-Type": "text/plain"
+            });
+        }
+
+        res.end("Bad Gateway");
+    });
+
+    req.pipe(proxy);
+}
+
+function proxyWebSocket(req, clientSocket, head) {
+    const upstream = net.connect({
+        host: "127.0.0.1",
+        port: XRAY_WS_PORT
+    });
+
+    upstream.on("connect", () => {
+        const headers = [];
+
+        headers.push(
+            `${req.method} ${req.url} HTTP/${req.httpVersion}`
+        );
+
+        for (const [key, value] of Object.entries(req.headers)) {
+            if (Array.isArray(value)) {
+                for (const item of value) {
+                    headers.push(`${key}: ${item}`);
+                }
+            } else {
+                headers.push(`${key}: ${value}`);
+            }
+        }
+
+        headers.push("");
+        headers.push("");
+
+        upstream.write(headers.join("\r\n"));
+
+        if (head?.length) {
+            upstream.write(head);
+        }
+
+        clientSocket.pipe(upstream);
+        upstream.pipe(clientSocket);
+    });
+
+    upstream.on("error", error => {
+        console.error("WebSocket proxy error:", error);
+
+        try {
+            clientSocket.destroy();
+        } catch {}
+    });
+
+    clientSocket.on("error", () => {
+        try {
+            upstream.destroy();
+        } catch {}
+    });
+}
+
+async function subscriptionResponse(req, res, token) {
+    const user = db.prepare(`
+        SELECT *
+        FROM users
+        WHERE subscription_token = ?
+    `).get(token);
+
+    if (!user) {
+        sendJson(res, {
+            ok: false,
+            error: "Subscription not found."
+        }, 404);
+
+        return;
+    }
+
+    if (user.status !== "active") {
+        sendJson(res, {
+            ok: false,
+            error: "Subscription disabled."
+        }, 403);
+
+        return;
+    }
+
+    const origin = getPublicOrigin(req);
+
+    const content = makeSubscription(user, origin);
+
+    res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store"
+    });
+
+    res.end(content);
+}
+
+async function handleRequest(req, res) {
+    try {
+        const url = new URL(
+            req.url,
+            `http://${req.headers.host || "localhost"}`
+        );
+
+        const pathname = url.pathname;
+
+        /*
+         * XHTTP must reach Xray directly through the internal
+         * HTTP reverse proxy.
+         */
+        if (
+            pathname === XHTTP_PATH ||
+            pathname.startsWith(`${XHTTP_PATH}/`)
+        ) {
+            proxyHttpToXray(
+                req,
+                res,
+                XRAY_XHTTP_PORT
+            );
+
+            return;
+        }
+
+        /*
+         * Subscription endpoint.
+         */
+        if (pathname.startsWith("/sub/")) {
+            const token = pathname.slice("/sub/".length);
+
+            await subscriptionResponse(
+                req,
+                res,
+                token
+            );
+
+            return;
+        }
+
+        /*
+         * Health check.
+         */
+        if (pathname === "/health") {
+            sendJson(res, {
+                ok: true,
+                panel: `v${VERSION}`,
+                xray: Boolean(xrayProcess && !xrayProcess.killed)
+            });
+
+            return;
+        }
+
+        /*
+         * Login.
+         */
+        if (pathname === "/login" && req.method === "GET") {
+            if (getSession(req)) {
+                redirect(res, "/dashboard");
+                return;
+            }
+
+            sendHtml(res, loginPage());
+            return;
+        }
+
+        if (pathname === "/login" && req.method === "POST") {
+            const form = await readForm(req);
+
+            const username = String(
+                form.get("username") || ""
+            ).trim();
+
+            const password = String(
+                form.get("password") || ""
+            );
+
+            if (!authenticate(username, password)) {
+                sendHtml(
+                    res,
+                    loginPage("Invalid username or password."),
+                    401
+                );
+
+                return;
+            }
+
+            const token = randomToken(32);
+
+            sessions.set(token, {
+                username,
+                createdAt: Date.now()
+            });
+
+            res.writeHead(302, {
+                Location: "/dashboard",
+                "Set-Cookie":
+                    `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Secure`
+            });
+
+            res.end();
+
+            return;
+        }
+
+        /*
+         * Setup.
+         */
+        if (pathname === "/setup" && req.method === "GET") {
+            if (setupComplete()) {
+                redirect(res, "/login");
+                return;
+            }
+
+            sendHtml(res, setupPage());
+            return;
+        }
+
+        if (pathname === "/setup" && req.method === "POST") {
+            if (setupComplete()) {
+                redirect(res, "/login");
+                return;
+            }
+
+            const form = await readForm(req);
+
+            const username = String(
+                form.get("username") || ""
+            ).trim();
+
+            const password = String(
+                form.get("password") || ""
+            );
+
+            const confirm = String(
+                form.get("confirm") || ""
+            );
+
+            if (!username || !password) {
+                sendHtml(
+                    res,
+                    setupPage("Username and password are required."),
+                    400
+                );
+
+                return;
+            }
+
+            if (password.length < 6) {
+                sendHtml(
+                    res,
+                    setupPage("Password must contain at least 6 characters."),
+                    400
+                );
+
+                return;
+            }
+
+            if (password !== confirm) {
+                sendHtml(
+                    res,
+                    setupPage("Passwords do not match."),
+                    400
+                );
+
+                return;
+            }
+
+            db.prepare(`
+                INSERT INTO admins(
+                    username,
+                    password_hash,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+            `).run(
+                username,
+                hashPassword(password),
+                nowIso()
+            );
+
+            redirect(res, "/login");
+
+            return;
+        }
+
+        /*
+         * Logout.
+         */
+        if (pathname === "/logout") {
+            const cookies = parseCookies(req);
+
+            if (cookies.vergil_session) {
+                sessions.delete(cookies.vergil_session);
+            }
+
+            res.writeHead(302, {
+                Location: "/login",
+                "Set-Cookie":
+                    "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
+            });
+
+            res.end();
+
+            return;
+        }
+
+        /*
+         * Everything below this point requires login.
+         */
+        const session = requireAuth(req, res);
+
+        if (!session) return;
+
+        if (pathname === "/" || pathname === "/dashboard") {
+            sendHtml(res, dashboardPage(req));
+            return;
+        }
+
+        if (pathname === "/users/new" && req.method === "GET") {
+            sendHtml(res, newUserPage());
+            return;
+        }
+
+        if (pathname === "/users/new" && req.method === "POST") {
+            try {
+                const form = await readForm(req);
+
+                const user = await createUser(form);
+
+                console.log(
+                    `👤 User created: ${user.username} (${user.uuid})`
+                );
+
+                redirect(
+                    res,
+                    `/users/config?id=${user.id}`
+                );
+            } catch (error) {
+                console.error(
+                    "User creation failed:",
+                    error
+                );
+
+                sendHtml(
+                    res,
+                    newUserPage(
+                        error?.message ||
+                        "Failed to create user."
+                    ),
+                    500
+                );
+            }
+
+            return;
+        }
+
+        if (pathname === "/users/config" && req.method === "GET") {
+            const id = Number(url.searchParams.get("id"));
+
+            const user = db.prepare(`
+                SELECT *
+                FROM users
+                WHERE id = ?
+            `).get(id);
+
+            if (!user) {
+                sendHtml(
+                    res,
+                    "<h1>User not found</h1>",
+                    404
+                );
+
+                return;
+            }
+
+            sendHtml(
+                res,
+                configPage(req, user)
+            );
+
+            return;
+        }
+
+        if (
+            pathname === "/users/toggle" &&
+            req.method === "POST"
+        ) {
+            const form = await readForm(req);
+
+            try {
+                await toggleUser(form.get("id"));
+            } catch (error) {
+                console.error(
+                    "Toggle user failed:",
+                    error
+                );
+            }
+
+            redirect(res, "/dashboard");
+            return;
+        }
+
+        if (
+            pathname === "/users/delete" &&
+            req.method === "POST"
+        ) {
+            const form = await readForm(req);
+
+            try {
+                await deleteUser(form.get("id"));
+            } catch (error) {
+                console.error(
+                    "Delete user failed:",
+                    error
+                );
+            }
+
+            redirect(res, "/dashboard");
+            return;
+        }
+
+        sendHtml(
+            res,
+            "<h1>404</h1><p>Not Found</p>",
+            404
+        );
+    } catch (error) {
+        console.error(
+            "Unhandled server error:",
+            error
+        );
+
+        if (!res.headersSent) {
+            sendJson(res, {
+                ok: false,
+                error: "Internal Server Error"
+            }, 500);
+        }
+    }
+}
 
 const server = http.createServer(
-  async (req, res) => {
-    try {
-      await handleRequest(req, res);
-    } catch (error) {
-      console.error(
-        "Unhandled server error:",
-        error
-      );
-
-      if (!res.headersSent) {
-        send(
-          res,
-          500,
-          "Internal Server Error"
-        );
-      } else {
-        res.end();
-      }
-    }
-  }
-);
-
-server.listen(
-  PORT,
-  HOST,
-  async () => {
-    console.log(
-      `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
-    );
-
-    console.log(
-      `📦 Database: ${DB_PATH}`
-    );
-
-    console.log(
-      `⚙️ Xray binary: ${XRAY_PATH}`
-    );
-
-    console.log(
-      `⚙️ Xray internal port: ${XRAY_PORT}`
-    );
-
-    console.log(
-      `🌐 Railway TCP Proxy: ${
-        getTcpDomain() || "not detected"
-      }:${getTcpPort() || "?"}`
-    );
-
-    await syncXray();
-  }
+    handleRequest
 );
 
 /*
- * ---------------------------------------------------------
- * SHUTDOWN
- * ---------------------------------------------------------
+ * WebSocket upgrade.
  */
+server.on("upgrade", (req, socket, head) => {
+    try {
+        const url = new URL(
+            req.url,
+            `http://${req.headers.host || "localhost"}`
+        );
+
+        if (
+            url.pathname === WS_PATH ||
+            url.pathname.startsWith(`${WS_PATH}/`)
+        ) {
+            proxyWebSocket(
+                req,
+                socket,
+                head
+            );
+
+            return;
+        }
+
+        socket.destroy();
+    } catch {
+        socket.destroy();
+    }
+});
+
+ensureDefaultAdmin();
+
+await startXray();
+
+server.listen(
+    PORT,
+    HOST,
+    () => {
+        console.log(
+            `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
+        );
+
+        console.log(
+            `📦 Database: ${DB_PATH}`
+        );
+
+        console.log(
+            `🌐 Public domain: ${process.env.RAILWAY_PUBLIC_DOMAIN || "detected from request"}`
+        );
+
+        console.log(
+            `🚀 XHTTP path: ${XHTTP_PATH}`
+        );
+
+        console.log(
+            `🌐 WebSocket path: ${WS_PATH}`
+        );
+
+        console.log(
+            `⚔️ Railway TCP Proxy is NOT required`
+        );
+    }
+);
 
 async function shutdown(signal) {
-  console.log(
-    `Received ${signal}. Shutting down...`
-  );
+    console.log(`\nReceived ${signal}`);
 
-  await stopXray();
+    stoppingXray = true;
 
-  db.close();
+    try {
+        await stopXray();
+    } catch {}
 
-  server.close(() => {
+    try {
+        db.close();
+    } catch {}
+
     process.exit(0);
-  });
 }
 
-process.on(
-  "SIGTERM",
-  () => {
+process.on("SIGTERM", () => {
     shutdown("SIGTERM");
-  }
-);
+});
 
-process.on(
-  "SIGINT",
-  () => {
+process.on("SIGINT", () => {
     shutdown("SIGINT");
-  }
-);
+});
