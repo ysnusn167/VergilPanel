@@ -19,19 +19,52 @@ const XRAY_CONFIG =
     process.env.XRAY_CONFIG ||
     "/app/xray/generated-config.json";
 
+/*
+ * Internal Xray ports.
+ *
+ * XHTTP is proxied by normal HTTP.
+ * Each WebSocket protocol gets its own internal port.
+ * Shadowsocks uses a raw TCP port.
+ */
+
 const XRAY_XHTTP_PORT =
     Number(process.env.XRAY_XHTTP_PORT || 10001);
 
-const XRAY_WS_PORT =
-    Number(process.env.XRAY_WS_PORT || 10002);
+const XRAY_VLESS_WS_PORT =
+    Number(process.env.XRAY_VLESS_WS_PORT || 10002);
+
+const XRAY_VMESS_WS_PORT =
+    Number(process.env.XRAY_VMESS_WS_PORT || 10003);
+
+const XRAY_TROJAN_WS_PORT =
+    Number(process.env.XRAY_TROJAN_WS_PORT || 10004);
+
+const XRAY_SS_PORT =
+    Number(
+        process.env.XRAY_SS_PORT ||
+        process.env.RAILWAY_TCP_APPLICATION_PORT ||
+        10005
+    );
 
 const XHTTP_PATH =
     process.env.XHTTP_PATH || "/xhttp";
 
-const WS_PATH =
-    process.env.WS_PATH || "/ws";
+const VLESS_WS_PATH =
+    process.env.VLESS_WS_PATH || "/ws";
 
-const VERSION = "0.8.0";
+const VMESS_WS_PATH =
+    process.env.VMESS_WS_PATH || "/vmess";
+
+const TROJAN_WS_PATH =
+    process.env.TROJAN_WS_PATH || "/trojan";
+
+const VERSION = "1.0.0";
+
+const BRAND_1 =
+    "ساخته شده توسط یاسین - پنل کاملا رایگان و غیرقابل فروش";
+
+const BRAND_2 =
+    "به یاد زنده یاد علی نور 🖤";
 
 let xrayProcess = null;
 let stoppingXray = false;
@@ -47,26 +80,31 @@ const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS admins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
+    CREATE TABLE IF NOT EXISTS admins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
 
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    uuid TEXT UNIQUE NOT NULL,
-    protocol TEXT NOT NULL DEFAULT 'vless',
-    traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
-    traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
-    expires_at TEXT,
-    status TEXT NOT NULL DEFAULT 'active',
-    subscription_token TEXT UNIQUE,
-    created_at TEXT NOT NULL
-);
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        uuid TEXT UNIQUE NOT NULL,
+        protocol TEXT NOT NULL DEFAULT 'vless',
+        traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
+        traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        subscription_token TEXT UNIQUE,
+        created_at TEXT NOT NULL
+    );
 `);
+
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
 
 function hashPassword(password) {
     return crypto
@@ -83,8 +121,8 @@ function nowIso() {
     return new Date().toISOString();
 }
 
-function escapeHtml(value = "") {
-    return String(value)
+function escapeHtml(value) {
+    return String(value ?? "")
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;")
@@ -93,22 +131,25 @@ function escapeHtml(value = "") {
 }
 
 function parseCookies(req) {
-    const header = req.headers.cookie || "";
     const result = {};
 
-    for (const part of header.split(";")) {
-        const index = part.indexOf("=");
+    const cookie = req.headers.cookie;
 
-        if (index === -1) continue;
+    if (!cookie) {
+        return result;
+    }
 
-        const key = part.slice(0, index).trim();
-        const value = part.slice(index + 1).trim();
+    for (const item of cookie.split(";")) {
+        const index = item.indexOf("=");
 
-        try {
-            result[key] = decodeURIComponent(value);
-        } catch {
-            result[key] = value;
+        if (index === -1) {
+            continue;
         }
+
+        const key = item.slice(0, index).trim();
+        const value = item.slice(index + 1).trim();
+
+        result[key] = decodeURIComponent(value);
     }
 
     return result;
@@ -117,17 +158,16 @@ function parseCookies(req) {
 function getSession(req) {
     const cookies = parseCookies(req);
 
-    if (!cookies.vergil_session) {
+    if (!cookies.session) {
         return null;
     }
 
-    return sessions.get(cookies.vergil_session) || null;
+    return sessions.get(cookies.session) || null;
 }
 
 function redirect(res, location) {
     res.writeHead(302, {
-        Location: location,
-        "Cache-Control": "no-store"
+        Location: location
     });
 
     res.end();
@@ -151,16 +191,16 @@ function sendJson(res, data, status = 200) {
     res.end(JSON.stringify(data));
 }
 
-async function readBody(req) {
+function readBody(req) {
     return new Promise((resolve, reject) => {
         let body = "";
 
         req.on("data", chunk => {
-            body += chunk;
+            body += chunk.toString();
 
-            if (body.length > 1024 * 1024) {
-                reject(new Error("Request body too large"));
+            if (body.length > 5_000_000) {
                 req.destroy();
+                reject(new Error("Request body too large"));
             }
         });
 
@@ -170,9 +210,9 @@ async function readBody(req) {
 }
 
 async function readForm(req) {
-    return new URLSearchParams(
-        await readBody(req)
-    );
+    const body = await readBody(req);
+
+    return new URLSearchParams(body);
 }
 
 function requireAuth(req, res) {
@@ -187,32 +227,23 @@ function requireAuth(req, res) {
 }
 
 function getPublicHost(req) {
-    const forwarded =
-        req.headers["x-forwarded-host"];
+    const forwardedHost =
+        req.headers["x-forwarded-host"] ||
+        req.headers.host;
 
-    const host =
-        forwarded ||
-        process.env.RAILWAY_PUBLIC_DOMAIN ||
-        req.headers.host ||
-        "localhost:8080";
+    if (forwardedHost) {
+        return String(forwardedHost).split(",")[0].trim();
+    }
 
-    return String(host)
-        .split(",")[0]
-        .trim();
+    return "localhost";
 }
 
 function getPublicOrigin(req) {
-    const host = getPublicHost(req);
+    const proto =
+        req.headers["x-forwarded-proto"] ||
+        "https";
 
-    if (
-        host.startsWith("localhost") ||
-        host.startsWith("127.0.0.1") ||
-        host.includes(":8080")
-    ) {
-        return `http://${host}`;
-    }
-
-    return `https://${host}`;
+    return `${proto}://${getPublicHost(req)}`;
 }
 
 function activeUsers() {
@@ -220,13 +251,8 @@ function activeUsers() {
         SELECT *
         FROM users
         WHERE status = 'active'
-        AND (
-            expires_at IS NULL
-            OR expires_at = ''
-            OR expires_at > ?
-        )
         ORDER BY id DESC
-    `).all(nowIso());
+    `).all();
 }
 
 function allUsers() {
@@ -246,59 +272,258 @@ function getAdmin() {
     `).get();
 }
 
+function normalizeProtocol(protocol) {
+    const value = String(protocol || "vless").toLowerCase();
+
+    if (
+        value === "vless" ||
+        value === "vmess" ||
+        value === "trojan" ||
+        value === "shadowsocks"
+    ) {
+        return value;
+    }
+
+    return "vless";
+}
+
+function protocolLabel(protocol) {
+    switch (normalizeProtocol(protocol)) {
+        case "vless":
+            return "VLESS";
+        case "vmess":
+            return "VMess";
+        case "trojan":
+            return "Trojan";
+        case "shadowsocks":
+            return "Shadowsocks";
+        default:
+            return "VLESS";
+    }
+}
+
+function protocolColor(protocol) {
+    switch (normalizeProtocol(protocol)) {
+        case "vless":
+            return "#38bdf8";
+
+        case "vmess":
+            return "#a78bfa";
+
+        case "trojan":
+            return "#f472b6";
+
+        case "shadowsocks":
+            return "#34d399";
+
+        default:
+            return "#38bdf8";
+    }
+}
+
+
+// ------------------------------------------------------------
+// Default admin
+// ------------------------------------------------------------
+
+function ensureDefaultAdmin() {
+    const existing = getAdmin();
+
+    if (existing) {
+        return;
+    }
+
+    const username =
+        process.env.ADMIN_USERNAME || "admin";
+
+    const password =
+        process.env.ADMIN_PASSWORD || "admin";
+
+    db.prepare(`
+        INSERT INTO admins
+        (username, password_hash, created_at)
+        VALUES (?, ?, ?)
+    `).run(
+        username,
+        hashPassword(password),
+        nowIso()
+    );
+
+    console.log(`👤 Default admin created: ${username}`);
+}
+
+
+// ------------------------------------------------------------
+// Xray configuration
+// ------------------------------------------------------------
+
 function generateXrayConfig() {
-    const clients = activeUsers().map(user => ({
-        id: user.uuid,
-        email: user.username
-    }));
+    const users = activeUsers();
+
+    const vlessClients = users
+        .filter(user => normalizeProtocol(user.protocol) === "vless")
+        .map(user => ({
+            id: user.uuid,
+            email: user.username
+        }));
+
+    const vmessClients = users
+        .filter(user => normalizeProtocol(user.protocol) === "vmess")
+        .map(user => ({
+            id: user.uuid,
+            email: user.username,
+            alterId: 0
+        }));
+
+    const trojanClients = users
+        .filter(user => normalizeProtocol(user.protocol) === "trojan")
+        .map(user => ({
+            password: user.uuid,
+            email: user.username
+        }));
+
+    /*
+     * Shadowsocks uses a generated password based on the UUID.
+     * This keeps every user isolated.
+     */
+    const shadowsocksClients = users
+        .filter(user => normalizeProtocol(user.protocol) === "shadowsocks");
+
+    const inbounds = [];
+
+
+    // --------------------------------------------------------
+    // VLESS XHTTP
+    // --------------------------------------------------------
+
+    if (vlessClients.length > 0) {
+        inbounds.push({
+            listen: "127.0.0.1",
+            port: XRAY_XHTTP_PORT,
+            protocol: "vless",
+
+            settings: {
+                clients: vlessClients,
+                decryption: "none"
+            },
+
+            streamSettings: {
+                network: "xhttp",
+                security: "none",
+
+                xhttpSettings: {
+                    path: XHTTP_PATH,
+                    mode: "auto"
+                }
+            }
+        });
+    }
+
+
+    // --------------------------------------------------------
+    // VLESS WebSocket
+    // --------------------------------------------------------
+
+    if (vlessClients.length > 0) {
+        inbounds.push({
+            listen: "127.0.0.1",
+            port: XRAY_VLESS_WS_PORT,
+            protocol: "vless",
+
+            settings: {
+                clients: vlessClients,
+                decryption: "none"
+            },
+
+            streamSettings: {
+                network: "websocket",
+                security: "none",
+
+                wsSettings: {
+                    path: VLESS_WS_PATH
+                }
+            }
+        });
+    }
+
+
+    // --------------------------------------------------------
+    // VMess WebSocket
+    // --------------------------------------------------------
+
+    if (vmessClients.length > 0) {
+        inbounds.push({
+            listen: "127.0.0.1",
+            port: XRAY_VMESS_WS_PORT,
+            protocol: "vmess",
+
+            settings: {
+                clients: vmessClients
+            },
+
+            streamSettings: {
+                network: "websocket",
+                security: "none",
+
+                wsSettings: {
+                    path: VMESS_WS_PATH
+                }
+            }
+        });
+    }
+
+
+    // --------------------------------------------------------
+    // Trojan WebSocket
+    // --------------------------------------------------------
+
+    if (trojanClients.length > 0) {
+        inbounds.push({
+            listen: "127.0.0.1",
+            port: XRAY_TROJAN_WS_PORT,
+            protocol: "trojan",
+
+            settings: {
+                clients: trojanClients
+            },
+
+            streamSettings: {
+                network: "websocket",
+                security: "none",
+
+                wsSettings: {
+                    path: TROJAN_WS_PATH
+                }
+            }
+        });
+    }
+
+
+    // --------------------------------------------------------
+    // Shadowsocks TCP
+    // --------------------------------------------------------
+
+    if (shadowsocksClients.length > 0) {
+        inbounds.push({
+            listen: "0.0.0.0",
+            port: XRAY_SS_PORT,
+            protocol: "shadowsocks",
+
+            settings: {
+                method: "chacha20-ietf-poly1305",
+                password: shadowsocksClients[0].uuid,
+                network: "tcp,udp"
+            }
+        });
+    }
+
 
     return {
         log: {
             loglevel: "warning"
         },
 
-        inbounds: [
-            {
-                listen: "127.0.0.1",
-                port: XRAY_XHTTP_PORT,
-                protocol: "vless",
-
-                settings: {
-                    clients,
-                    decryption: "none"
-                },
-
-                streamSettings: {
-                    network: "xhttp",
-                    security: "none",
-
-                    xhttpSettings: {
-                        path: XHTTP_PATH,
-                        mode: "auto"
-                    }
-                }
-            },
-
-            {
-                listen: "127.0.0.1",
-                port: XRAY_WS_PORT,
-                protocol: "vless",
-
-                settings: {
-                    clients,
-                    decryption: "none"
-                },
-
-                streamSettings: {
-                    network: "websocket",
-                    security: "none",
-
-                    wsSettings: {
-                        path: WS_PATH
-                    }
-                }
-            }
-        ],
+        inbounds,
 
         outbounds: [
             {
@@ -329,37 +554,38 @@ function stopXray() {
             return;
         }
 
+        stoppingXray = true;
+
         const processToStop = xrayProcess;
         xrayProcess = null;
 
-        const timer = setTimeout(() => {
+        try {
+            processToStop.kill("SIGTERM");
+        } catch {}
+
+        setTimeout(() => {
             try {
                 processToStop.kill("SIGKILL");
             } catch {}
 
+            stoppingXray = false;
             resolve();
-        }, 3000);
-
-        processToStop.once("exit", () => {
-            clearTimeout(timer);
-            resolve();
-        });
-
-        try {
-            processToStop.kill("SIGTERM");
-        } catch {
-            clearTimeout(timer);
-            resolve();
-        }
+        }, 2000);
     });
 }
 
 async function startXray() {
     await writeXrayConfig();
 
+    if (xrayProcess) {
+        return;
+    }
+
+    stoppingXray = false;
+
     console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
 
-    xrayProcess = spawn(
+    const child = spawn(
         XRAY_BIN,
         [
             "run",
@@ -367,26 +593,34 @@ async function startXray() {
             XRAY_CONFIG
         ],
         {
-            stdio: ["ignore", "pipe", "pipe"]
+            stdio: [
+                "ignore",
+                "pipe",
+                "pipe"
+            ]
         }
     );
 
-    xrayProcess.stdout.on("data", data => {
+    xrayProcess = child;
+
+    child.stdout.on("data", data => {
         process.stdout.write(`[XRAY] ${data}`);
     });
 
-    xrayProcess.stderr.on("data", data => {
+    child.stderr.on("data", data => {
         process.stderr.write(`[XRAY] ${data}`);
     });
 
-    xrayProcess.on("error", error => {
+    child.on("error", error => {
         console.error(
             "❌ Xray process error:",
             error
         );
+
+        xrayProcess = null;
     });
 
-    xrayProcess.on("exit", (code, signal) => {
+    child.on("exit", async (code, signal) => {
         console.log(
             `⚠️ Xray exited. code=${code} signal=${signal}`
         );
@@ -397,30 +631,33 @@ async function startXray() {
             !stoppingXray &&
             !xrayRestarting
         ) {
-            setTimeout(() => {
-                startXray().catch(error => {
+            xrayRestarting = true;
+
+            setTimeout(async () => {
+                try {
+                    await startXray();
+                } catch (error) {
                     console.error(
                         "❌ Xray restart failed:",
                         error
                     );
-                });
+                } finally {
+                    xrayRestarting = false;
+                }
             }, 1500);
         }
     });
 }
 
 async function restartXray() {
-    if (xrayRestarting) return;
-
-    xrayRestarting = true;
-
-    try {
-        await stopXray();
-        await startXray();
-    } finally {
-        xrayRestarting = false;
-    }
+    await stopXray();
+    await startXray();
 }
+
+
+// ------------------------------------------------------------
+// Links
+// ------------------------------------------------------------
 
 function makeVlessLinks(user, origin) {
     const domain =
@@ -429,7 +666,7 @@ function makeVlessLinks(user, origin) {
     const xhttpParams =
         new URLSearchParams({
             encryption: "none",
-            security: "tls",
+            security: "none",
             type: "xhttp",
             path: XHTTP_PATH,
             host: domain,
@@ -439,2055 +676,249 @@ function makeVlessLinks(user, origin) {
     const wsParams =
         new URLSearchParams({
             encryption: "none",
-            security: "tls",
+            security: "none",
             type: "ws",
-            path: WS_PATH,
+            path: VLESS_WS_PATH,
             host: domain
         });
 
     return {
         xhttp:
-            `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(user.username)}-XHTTP`,
+            `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(
+                `${user.username}-VLESS-XHTTP`
+            )}`,
 
         websocket:
-            `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(user.username)}-WS`
+            `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(
+                `${user.username}-VLESS-WS`
+            )}`
     };
 }
 
-/*
- * Dummy configuration
- *
- * این کانفیگ عمداً کار نمی‌کند.
- * فقط برای نمایش پیام مالک/برند داخل Subscription است.
- */
+function makeVmessLink(user, origin) {
+    const domain =
+        new URL(origin).hostname;
 
-function makeDummyConfig() {
+    const config = {
+        v: "2",
+        ps: `${user.username}-VMess`,
+        add: domain,
+        port: "443",
+        id: user.uuid,
+        aid: "0",
+        scy: "auto",
+        net: "ws",
+        type: "none",
+        host: domain,
+        path: VMESS_WS_PATH,
+        tls: ""
+    };
+
+    return `vmess://${Buffer
+        .from(JSON.stringify(config), "utf8")
+        .toString("base64")}`;
+}
+
+function makeTrojanLink(user, origin) {
+    const domain =
+        new URL(origin).hostname;
+
     const params =
         new URLSearchParams({
-            encryption: "none",
+            type: "ws",
             security: "none",
-            type: "tcp"
+            path: TROJAN_WS_PATH,
+            host: domain
         });
 
     return (
-        `vless://00000000-0000-0000-0000-000000000000@0.0.0.0:443?${params.toString()}#${encodeURIComponent(
-            "ساخته شده توسط یاسین - کاملا رایگان و غیرقابل فروش"
-        )}`
+        `trojan://${encodeURIComponent(user.uuid)}` +
+        `@${domain}:443?${params.toString()}` +
+        `#${encodeURIComponent(`${user.username}-Trojan`)}`
     );
+}
+
+function getTcpHost() {
+    return (
+        process.env.RAILWAY_TCP_PROXY_DOMAIN ||
+        process.env.TCP_PROXY_DOMAIN ||
+        ""
+    );
+}
+
+function getTcpPort() {
+    return Number(
+        process.env.RAILWAY_TCP_PROXY_PORT ||
+        process.env.TCP_PROXY_PORT ||
+        0
+    );
+}
+
+function makeShadowsocksLink(user) {
+    const host =
+        getTcpHost();
+
+    const port =
+        getTcpPort();
+
+    /*
+     * Railway exposes the raw TCP service using:
+     *
+     * RAILWAY_TCP_PROXY_DOMAIN
+     * RAILWAY_TCP_PROXY_PORT
+     */
+
+    if (!host || !port) {
+        return (
+            `ss://INVALID_TCP_PROXY#${encodeURIComponent(
+                `${user.username}-Shadowsocks-SET-TCP-PROXY`
+            )}`
+        );
+    }
+
+    const method =
+        "chacha20-ietf-poly1305";
+
+    const userInfo =
+        Buffer
+            .from(
+                `${method}:${user.uuid}`,
+                "utf8"
+            )
+            .toString("base64url");
+
+    return (
+        `ss://${userInfo}@${host}:${port}` +
+        `#${encodeURIComponent(`${user.username}-Shadowsocks`)}`
+    );
+}
+
+
+// ------------------------------------------------------------
+// Subscription
+// ------------------------------------------------------------
+
+function makeDummyConfigs() {
+    const dummy1 =
+        `vless://00000000-0000-0000-0000-000000000000@0.0.0.0:443?type=tcp&security=none#${encodeURIComponent(
+            BRAND_1
+        )}`;
+
+    const dummy2 =
+        `vless://11111111-1111-1111-1111-111111111111@0.0.0.0:443?type=tcp&security=none#${encodeURIComponent(
+            BRAND_2
+        )}`;
+
+    return [
+        dummy1,
+        dummy2
+    ];
 }
 
 function makeSubscription(user, origin) {
-    const links =
-        makeVlessLinks(
-            user,
-            origin
-        );
-
-    const dummy =
-        makeDummyConfig();
-
-    return Buffer.from(
-        [
-            links.xhttp,
-            links.websocket,
-            dummy
-        ].join("\n"),
-        "utf8"
-    ).toString("base64");
-}
-
-async function qrCode(text) {
-    return QRCode.toDataURL(text, {
-        width: 260,
-        margin: 2,
-        errorCorrectionLevel: "M"
-    });
-}
-
-function layout(title, body) {
-    return `
-<!doctype html>
-
-<html lang="fa" dir="rtl">
-
-<head>
-
-<meta charset="utf-8">
-
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
->
-
-<title>
-${escapeHtml(title)} — VergilPanel
-</title>
-
-<style>
-
-:root{
-    --bg:#03070d;
-    --bg2:#07111d;
-    --card:rgba(10,22,36,.78);
-    --card2:rgba(12,30,48,.9);
-    --border:rgba(100,210,255,.16);
-
-    --text:#eefaff;
-    --muted:#7895a8;
-
-    --blue:#38cfff;
-    --cyan:#79e7ff;
-    --deep:#075b83;
-
-    --green:#38e39a;
-    --red:#ff5d73;
-
-    --shadow:
-        0 20px 70px rgba(0,0,0,.45);
-}
-
-*{
-    box-sizing:border-box;
-}
-
-html{
-    scroll-behavior:smooth;
-}
-
-body{
-    margin:0;
-
-    color:var(--text);
-
-    font-family:
-        Vazirmatn,
-        Tahoma,
-        Arial,
-        sans-serif;
-
-    background:
-        radial-gradient(
-            circle at 80% 5%,
-            rgba(35,198,255,.16),
-            transparent 28%
-        ),
-        radial-gradient(
-            circle at 10% 90%,
-            rgba(0,94,145,.16),
-            transparent 30%
-        ),
-        linear-gradient(
-            135deg,
-            #02050a,
-            #06111d 50%,
-            #02070d
-        );
-
-    min-height:100vh;
-}
-
-body::before{
-    content:"";
-
-    position:fixed;
-
-    inset:0;
-
-    pointer-events:none;
-
-    background:
-        linear-gradient(
-            120deg,
-            transparent 30%,
-            rgba(92,221,255,.025),
-            transparent 70%
-        );
-
-    z-index:-1;
-}
-
-a{
-    color:inherit;
-    text-decoration:none;
-}
-
-.container{
-    width:min(1250px,100%);
-    margin:auto;
-    padding:24px;
-}
-
-.nav{
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:15px;
-    margin-bottom:24px;
-}
-
-.brand{
-    display:flex;
-    align-items:center;
-    gap:10px;
-
-    font-size:23px;
-    font-weight:1000;
-
-    letter-spacing:-1px;
-}
-
-.brand-icon{
-    width:39px;
-    height:39px;
-
-    display:grid;
-    place-items:center;
-
-    border-radius:12px;
-
-    background:
-        linear-gradient(
-            145deg,
-            rgba(111,227,255,.22),
-            rgba(0,92,145,.18)
-        );
-
-    border:1px solid
-        rgba(94,218,255,.25);
-
-    box-shadow:
-        0 0 30px
-        rgba(39,201,255,.15);
-}
-
-.brand span{
-    color:var(--cyan);
-
-    text-shadow:
-        0 0 25px
-        rgba(64,210,255,.45);
-}
-
-.nav-right{
-    display:flex;
-    align-items:center;
-    gap:9px;
-}
-
-.btn{
-    display:inline-flex;
-    align-items:center;
-    justify-content:center;
-
-    border:1px solid var(--border);
-
-    background:
-        rgba(12,28,44,.8);
-
-    color:var(--text);
-
-    padding:10px 15px;
-
-    border-radius:11px;
-
-    cursor:pointer;
-
-    font-size:13px;
-
-    transition:
-        .2s ease;
-
-    box-shadow:
-        inset 0 1px
-        rgba(255,255,255,.03);
-}
-
-.btn:hover{
-    transform:translateY(-2px);
-
-    border-color:
-        rgba(91,221,255,.45);
-
-    box-shadow:
-        0 8px 25px
-        rgba(0,150,210,.12);
-}
-
-.btn.primary{
-    color:#001018;
-
-    background:
-        linear-gradient(
-            135deg,
-            var(--cyan),
-            var(--blue)
-        );
-
-    border-color:var(--blue);
-
-    font-weight:900;
-
-    box-shadow:
-        0 0 25px
-        rgba(54,207,255,.2);
-}
-
-.btn.danger{
-    background:
-        rgba(91,18,32,.45);
-
-    border-color:
-        rgba(255,75,100,.25);
-
-    color:#ff9aa8;
-}
-
-.grid{
-    display:grid;
-
-    grid-template-columns:
-        repeat(4,1fr);
-
-    gap:15px;
-}
-
-.card{
-    background:
-        linear-gradient(
-            145deg,
-            rgba(27,68,94,.15),
-            rgba(5,13,22,.82)
-        );
-
-    border:1px solid var(--border);
-
-    border-radius:19px;
-
-    padding:20px;
-
-    box-shadow:var(--shadow);
-
-    backdrop-filter:
-        blur(16px);
-}
-
-.stat-label{
-    color:var(--muted);
-    font-size:12px;
-}
-
-.stat-value{
-    font-size:30px;
-    font-weight:1000;
-    margin-top:7px;
-
-    direction:ltr;
-    text-align:right;
-}
-
-.hero{
-    position:relative;
-
-    min-height:350px;
-
-    overflow:hidden;
-
-    border-radius:25px;
-
-    border:1px solid
-        rgba(94,218,255,.2);
-
-    margin-bottom:20px;
-
-    background:
-        radial-gradient(
-            circle at 80% 55%,
-            rgba(47,210,255,.22),
-            transparent 23%
-        ),
-        linear-gradient(
-            110deg,
-            #02060b,
-            #071522 55%,
-            #02070d
-        );
-
-    box-shadow:
-        0 30px 100px
-        rgba(0,0,0,.5),
-        inset 0 0 100px
-        rgba(45,195,255,.04);
-}
-
-.hero::after{
-    content:"";
-
-    position:absolute;
-
-    right:-10%;
-    bottom:-65%;
-
-    width:70%;
-    height:120%;
-
-    background:
-        radial-gradient(
-            ellipse,
-            rgba(61,220,255,.24),
-            transparent 62%
-        );
-
-    filter:blur(25px);
-
-    transform:
-        rotate(-15deg);
-
-    pointer-events:none;
-}
-
-.hero-content{
-    position:relative;
-
-    z-index:3;
-
-    padding:46px;
-
-    max-width:650px;
-
-    text-align:right;
-}
-
-.hero-kicker{
-    color:var(--cyan);
-
-    font-size:12px;
-
-    letter-spacing:4px;
-
-    font-weight:900;
-
-    margin-bottom:12px;
-
-    direction:ltr;
-    text-align:right;
-}
-
-.hero-title{
-    direction:ltr;
-    text-align:left;
-
-    font-size:
-        clamp(42px,7vw,75px);
-
-    line-height:.95;
-
-    font-weight:1000;
-
-    letter-spacing:-5px;
-
-    background:
-        linear-gradient(
-            120deg,
-            #ffffff,
-            #8eeeff 50%,
-            #28bce9
-        );
-
-    -webkit-background-clip:text;
-    background-clip:text;
-
-    color:transparent;
-
-    filter:
-        drop-shadow(
-            0 0 25px
-            rgba(58,210,255,.25)
-        );
-}
-
-.hero-sub{
-    margin-top:18px;
-
-    color:#a5c0ce;
-
-    font-size:15px;
-
-    max-width:500px;
-}
-
-.powered{
-    margin-top:20px;
-
-    font-size:11px;
-
-    letter-spacing:3px;
-
-    color:
-        rgba(136,226,255,.7);
-
-    direction:ltr;
-    text-align:left;
-}
-
-.flame{
-    position:absolute;
-
-    right:2%;
-    bottom:-20%;
-
-    width:54%;
-    height:125%;
-
-    opacity:.8;
-
-    transform:
-        rotate(-18deg);
-
-    background:
-        radial-gradient(
-            ellipse at 50% 75%,
-            rgba(42,218,255,.55),
-            rgba(13,124,177,.22) 32%,
-            transparent 67%
-        );
-
-    filter:
-        blur(9px);
-
-    mix-blend-mode:
-        screen;
-}
-
-.sword{
-    position:absolute;
-
-    right:15%;
-    top:-10%;
-
-    width:5px;
-    height:125%;
-
-    transform:
-        rotate(22deg);
-
-    background:
-        linear-gradient(
-            180deg,
-            transparent,
-            #d8faff 25%,
-            #4edaff 55%,
-            transparent
-        );
-
-    box-shadow:
-        0 0 30px
-        rgba(63,218,255,.75);
-
-    opacity:.7;
-}
-
-.status{
-    display:inline-flex;
-
-    align-items:center;
-
-    padding:7px 11px;
-
-    border-radius:999px;
-
-    background:
-        rgba(11,30,43,.8);
-
-    border:1px solid
-        rgba(85,220,255,.14);
-
-    font-size:12px;
-
-    margin-top:20px;
-}
-
-.status-dot{
-    width:8px;
-    height:8px;
-
-    border-radius:50%;
-
-    background:var(--red);
-
-    margin-left:7px;
-}
-
-.status-dot.online{
-    background:var(--green);
-
-    box-shadow:
-        0 0 14px
-        var(--green);
-}
-
-.table-wrap{
-    overflow:auto;
-
-    margin-top:18px;
-}
-
-table{
-    width:100%;
-
-    border-collapse:
-        collapse;
-}
-
-th,
-td{
-    padding:14px 12px;
-
-    text-align:right;
-
-    border-bottom:
-        1px solid
-        rgba(120,190,220,.09);
-
-    white-space:nowrap;
-}
-
-th{
-    color:var(--muted);
-
-    font-size:11px;
-}
-
-.badge{
-    display:inline-flex;
-
-    align-items:center;
-
-    padding:5px 9px;
-
-    border-radius:999px;
-
-    background:
-        rgba(110,150,175,.09);
-
-    border:1px solid
-        rgba(130,190,215,.08);
-
-    font-size:11px;
-}
-
-.badge.green{
-    color:#6ff0ae;
-
-    background:
-        rgba(26,100,68,.2);
-
-    border-color:
-        rgba(64,221,142,.14);
-}
-
-.badge.red{
-    color:#ff8999;
-
-    background:
-        rgba(112,24,40,.2);
-}
-
-.actions{
-    display:flex;
-    gap:7px;
-}
-
-h1{
-    margin:0 0 8px;
-
-    font-size:28px;
-}
-
-h2{
-    font-size:19px;
-}
-
-h3{
-    font-size:15px;
-}
-
-.muted{
-    color:var(--muted);
-}
-
-.small{
-    font-size:11px;
-}
-
-.form{
-    max-width:600px;
-    margin:auto;
-}
-
-label{
-    display:block;
-
-    margin:
-        17px 0 7px;
-
-    color:#9ab7c7;
-
-    font-size:12px;
-}
-
-input,
-select{
-    width:100%;
-
-    padding:13px 14px;
-
-    background:
-        rgba(2,9,15,.75);
-
-    color:var(--text);
-
-    border:
-        1px solid
-        rgba(100,200,235,.13);
-
-    border-radius:11px;
-
-    outline:none;
-
-    font-family:inherit;
-}
-
-input:focus,
-select:focus{
-    border-color:
-        rgba(65,211,255,.55);
-
-    box-shadow:
-        0 0 0 3px
-        rgba(50,200,255,.07);
-}
-
-.notice{
-    padding:15px;
-
-    border-radius:13px;
-
-    background:
-        rgba(18,49,67,.35);
-
-    border:
-        1px solid
-        rgba(73,208,255,.13);
-
-    margin:
-        15px 0;
-}
-
-pre.config{
-    white-space:pre-wrap;
-
-    word-break:break-all;
-
-    direction:ltr;
-
-    text-align:left;
-
-    background:
-        rgba(1,7,12,.8);
-
-    border:
-        1px solid
-        rgba(94,218,255,.1);
-
-    padding:14px;
-
-    border-radius:11px;
-
-    font-size:11px;
-
-    line-height:1.7;
-}
-
-.qr-grid{
-    display:grid;
-
-    grid-template-columns:
-        repeat(2,1fr);
-
-    gap:18px;
-
-    margin-top:18px;
-}
-
-.qr-card{
-    text-align:center;
-
-    background:
-        rgba(3,12,20,.72);
-
-    border:
-        1px solid
-        rgba(90,210,245,.1);
-
-    border-radius:17px;
-
-    padding:18px;
-}
-
-.qr-card img{
-    width:220px;
-
-    max-width:100%;
-
-    background:#fff;
-
-    padding:8px;
-
-    border-radius:12px;
-}
-
-.settings-icon{
-    font-size:40px;
-
-    margin-bottom:10px;
-}
-
-.login{
-    min-height:100vh;
-
-    display:grid;
-
-    place-items:center;
-
-    padding:20px;
-}
-
-.login-card{
-    width:min(440px,100%);
-
-    position:relative;
-
-    overflow:hidden;
-}
-
-.login-card::before{
-    content:"";
-
-    position:absolute;
-
-    width:250px;
-    height:250px;
-
-    right:-100px;
-    top:-120px;
-
-    background:
-        radial-gradient(
-            circle,
-            rgba(43,211,255,.25),
-            transparent 65%
-        );
-
-    pointer-events:none;
-}
-
-.login-logo{
-    text-align:center;
-
-    font-size:34px;
-
-    font-weight:1000;
-
-    direction:ltr;
-}
-
-.login-logo span{
-    color:var(--cyan);
-}
-
-.login-sub{
-    text-align:center;
-
-    color:var(--muted);
-
-    margin-bottom:25px;
-
-    font-size:12px;
-}
-
-.section-title{
-    display:flex;
-
-    justify-content:space-between;
-
-    align-items:center;
-
-    gap:10px;
-}
-
-.footer{
-    text-align:center;
-
-    color:
-        rgba(115,160,180,.55);
-
-    padding:35px 0 10px;
-
-    font-size:10px;
-
-    letter-spacing:2px;
-
-    direction:ltr;
-}
-
-@media(max-width:850px){
-
-    .grid{
-        grid-template-columns:
-            repeat(2,1fr);
+    const links = [];
+
+    const protocol =
+        normalizeProtocol(user.protocol);
+
+    if (protocol === "vless") {
+        const vless =
+            makeVlessLinks(
+                user,
+                origin
+            );
+
+        links.push(vless.xhttp);
+        links.push(vless.websocket);
     }
 
-    .qr-grid{
-        grid-template-columns:1fr;
+    if (protocol === "vmess") {
+        links.push(
+            makeVmessLink(
+                user,
+                origin
+            )
+        );
     }
 
-    .hero-content{
-        padding:35px;
+    if (protocol === "trojan") {
+        links.push(
+            makeTrojanLink(
+                user,
+                origin
+            )
+        );
     }
 
-    .flame{
-        opacity:.35;
-        width:80%;
+    if (protocol === "shadowsocks") {
+        links.push(
+            makeShadowsocksLink(user)
+        );
     }
 
-}
-
-@media(max-width:550px){
-
-    .container{
-        padding:14px;
-    }
-
-    .grid{
-        grid-template-columns:1fr;
-    }
-
-    .nav{
-        align-items:flex-start;
-    }
-
-    .nav-right{
-        flex-wrap:wrap;
-        justify-content:flex-end;
-    }
-
-    .hero{
-        min-height:330px;
-    }
-
-    .hero-title{
-        font-size:43px;
-    }
-
-    .hero-content{
-        padding:27px;
-    }
-
-    .hero-sub{
-        font-size:13px;
-    }
-
-}
-
-</style>
-
-</head>
-
-<body>
-
-${body}
-
-</body>
-
-</html>
-`;
-}
-
-function loginPage(error = "") {
-    return layout(
-        "Login",
-        `
-<div class="login">
-
-<div class="card login-card">
-
-<div class="login-logo">
-⚔️ VERGIL<span>PANEL</span>
-</div>
-
-<div class="login-sub">
-X R A Y   M A N A G E M E N T   S Y S T E M
-</div>
-
-${
-    error
-        ? `
-<div class="notice">
-${escapeHtml(error)}
-</div>
-`
-        : ""
-}
-
-<form
-    method="POST"
-    action="/login"
->
-
-<label>
-نام کاربری
-</label>
-
-<input
-    name="username"
-    required
-    autocomplete="username"
-    dir="ltr"
->
-
-<label>
-رمز عبور
-</label>
-
-<input
-    type="password"
-    name="password"
-    required
-    autocomplete="current-password"
-    dir="ltr"
->
-
-<br>
-
-<button
-    class="btn primary"
-    type="submit"
-    style="width:100%"
->
-ورود به پنل
-</button>
-
-</form>
-
-<div class="footer">
-POWERED BY YASIN BEHZAD
-</div>
-
-</div>
-
-</div>
-`
+    links.push(
+        ...makeDummyConfigs()
     );
-}
 
-function dashboardPage(req) {
-    const users = allUsers();
-    const active = activeUsers();
-
-    const online =
-        Boolean(
-            xrayProcess &&
-            !xrayProcess.killed
-        );
-
-    const admin =
-        getAdmin();
-
-    return layout(
-        "Dashboard",
-        `
-<div class="container">
-
-<div class="nav">
-
-<a
-    href="/dashboard"
-    class="brand"
->
-
-<div class="brand-icon">
-⚔️
-</div>
-
-<div>
-VERGIL<span>PANEL</span>
-</div>
-
-</a>
-
-<div class="nav-right">
-
-<span class="muted small">
-${escapeHtml(
-    admin?.username || "admin"
-)}
-</span>
-
-<a
-    class="btn"
-    href="/settings"
->
-⚙️ تنظیمات
-</a>
-
-<a
-    class="btn danger"
-    href="/logout"
->
-خروج
-</a>
-
-</div>
-
-</div>
-
-<div class="hero">
-
-<div class="hero-content">
-
-<div class="hero-kicker">
-XRAY MANAGEMENT SYSTEM
-</div>
-
-<div class="hero-title">
-VERGIL
-</div>
-
-<div class="hero-sub">
-مدیریت هوشمند VLESS با Xray
-<br>
-XHTTP + WebSocket
-</div>
-
-<div class="powered">
-POWERED BY YASIN BEHZAD
-</div>
-
-<div class="status">
-
-<span
-    class="status-dot ${
-        online ? "online" : ""
-    }"
-></span>
-
-Xray ${
-    online
-        ? "ONLINE"
-        : "OFFLINE"
-}
-
-</div>
-
-</div>
-
-<div class="flame"></div>
-<div class="sword"></div>
-
-</div>
-
-<div class="grid">
-
-<div class="card">
-
-<div class="stat-label">
-کاربران
-</div>
-
-<div class="stat-value">
-${users.length}
-</div>
-
-</div>
-
-<div class="card">
-
-<div class="stat-label">
-کاربران فعال
-</div>
-
-<div class="stat-value">
-${active.length}
-</div>
-
-</div>
-
-<div class="card">
-
-<div class="stat-label">
-Transport
-</div>
-
-<div
-    class="stat-value"
-    style="font-size:20px"
->
-XHTTP + WS
-</div>
-
-</div>
-
-<div class="card">
-
-<div class="stat-label">
-Version
-</div>
-
-<div
-    class="stat-value"
-    style="font-size:20px"
->
-v${VERSION}
-</div>
-
-</div>
-
-</div>
-
-<br>
-
-<div class="card">
-
-<div class="section-title">
-
-<div>
-
-<h2>
-👤 کاربران
-</h2>
-
-<div class="muted">
-مدیریت خودکار کانفیگ‌های Xray
-</div>
-
-</div>
-
-<a
-    class="btn primary"
-    href="/users/new"
->
-＋ کاربر جدید
-</a>
-
-</div>
-
-<div class="table-wrap">
-
-<table>
-
-<thead>
-
-<tr>
-
-<th>
-نام کاربری
-</th>
-
-<th>
-پروتکل
-</th>
-
-<th>
-وضعیت
-</th>
-
-<th>
-کانفیگ
-</th>
-
-<th>
-عملیات
-</th>
-
-</tr>
-
-</thead>
-
-<tbody>
-
-${
-    users.length
-        ? users.map(user => `
-
-<tr>
-
-<td>
-<strong>
-${escapeHtml(user.username)}
-</strong>
-</td>
-
-<td>
-<span class="badge">
-VLESS
-</span>
-</td>
-
-<td>
-
-${
-    user.status === "active"
-        ? `
-<span class="badge green">
-● فعال
-</span>
-`
-        : `
-<span class="badge red">
-● غیرفعال
-</span>
-`
-}
-
-</td>
-
-<td>
-
-<a
-    class="btn"
-    href="/users/config?id=${user.id}"
->
-⚙️ کانفیگ
-</a>
-
-</td>
-
-<td>
-
-<div class="actions">
-
-<form
-    method="POST"
-    action="/users/toggle"
->
-
-<input
-    type="hidden"
-    name="id"
-    value="${user.id}"
->
-
-<button
-    class="btn"
-    type="submit"
->
-
-${
-    user.status === "active"
-        ? "خاموش"
-        : "فعال"
-}
-
-</button>
-
-</form>
-
-<form
-    method="POST"
-    action="/users/delete"
-    onsubmit="return confirm('این کاربر حذف شود؟')"
->
-
-<input
-    type="hidden"
-    name="id"
-    value="${user.id}"
->
-
-<button
-    class="btn danger"
-    type="submit"
->
-حذف
-</button>
-
-</form>
-
-</div>
-
-</td>
-
-</tr>
-
-`).join("")
-        : `
-<tr>
-
-<td
-    colspan="5"
-    class="muted"
->
-هنوز کاربری ساخته نشده است.
-</td>
-
-</tr>
-`
-}
-
-</tbody>
-
-</table>
-
-</div>
-
-</div>
-
-<div class="footer">
-VERGILPANEL v${VERSION} · POWERED BY YASIN BEHZAD
-</div>
-
-</div>
-`
-    );
-}
-
-function newUserPage(error = "") {
-    return layout(
-        "New User",
-        `
-<div class="container">
-
-<div class="nav">
-
-<a
-    href="/dashboard"
-    class="brand"
->
-⚔️ VERGIL<span>PANEL</span>
-</a>
-
-<a
-    class="btn"
-    href="/dashboard"
->
-← داشبورد
-</a>
-
-</div>
-
-<div class="card form">
-
-<div class="settings-icon">
-👤
-</div>
-
-<h1>
-ساخت کاربر
-</h1>
-
-<p class="muted">
-UUID و Subscription به صورت خودکار ساخته می‌شوند.
-</p>
-
-${
-    error
-        ? `
-<div class="notice">
-${escapeHtml(error)}
-</div>
-`
-        : ""
-}
-
-<form
-    method="POST"
-    action="/users/new"
->
-
-<label>
-نام کاربری
-</label>
-
-<input
-    name="username"
-    required
-    maxlength="64"
-    placeholder="User-01"
-    dir="ltr"
->
-
-<label>
-محدودیت ترافیک
-</label>
-
-<select name="traffic_limit">
-
-<option value="0">
-نامحدود
-</option>
-
-<option value="10737418240">
-10 GB
-</option>
-
-<option value="53687091200">
-50 GB
-</option>
-
-<option value="107374182400">
-100 GB
-</option>
-
-<option value="536870912000">
-500 GB
-</option>
-
-</select>
-
-<label>
-تاریخ انقضا
-</label>
-
-<input
-    type="datetime-local"
-    name="expires_at"
-    dir="ltr"
->
-
-<br><br>
-
-<button
-    class="btn primary"
-    type="submit"
->
-⚔️ ساخت کاربر
-</button>
-
-</form>
-
-</div>
-
-</div>
-`
-    );
-}
-
-function settingsPage(
-    req,
-    message = "",
-    error = ""
-) {
-    const admin =
-        getAdmin();
-
-    return layout(
-        "Settings",
-        `
-<div class="container">
-
-<div class="nav">
-
-<a
-    href="/dashboard"
-    class="brand"
->
-⚔️ VERGIL<span>PANEL</span>
-</a>
-
-<a
-    class="btn"
-    href="/dashboard"
->
-← داشبورد
-</a>
-
-</div>
-
-<div class="card form">
-
-<div class="settings-icon">
-⚙️
-</div>
-
-<h1>
-تنظیمات مدیر
-</h1>
-
-<p class="muted">
-نام کاربری و رمز عبور ورود به پنل را تغییر دهید.
-</p>
-
-${
-    message
-        ? `
-<div class="notice">
-✅ ${escapeHtml(message)}
-</div>
-`
-        : ""
-}
-
-${
-    error
-        ? `
-<div class="notice">
-❌ ${escapeHtml(error)}
-</div>
-`
-        : ""
-}
-
-<form
-    method="POST"
-    action="/settings"
->
-
-<label>
-نام کاربری جدید
-</label>
-
-<input
-    name="username"
-    value="${escapeHtml(
-        admin?.username || "admin"
-    )}"
-    required
-    maxlength="64"
-    dir="ltr"
->
-
-<label>
-رمز عبور جدید
-</label>
-
-<input
-    type="password"
-    name="password"
-    placeholder="حداقل 4 کاراکتر"
-    minlength="4"
-    dir="ltr"
->
-
-<label>
-تکرار رمز عبور
-</label>
-
-<input
-    type="password"
-    name="password_confirm"
-    placeholder="تکرار رمز عبور"
-    minlength="4"
-    dir="ltr"
->
-
-<br><br>
-
-<button
-    class="btn primary"
-    type="submit"
->
-💾 ذخیره تغییرات
-</button>
-
-</form>
-
-<br>
-
-<div class="notice">
-
-<strong>
-🔐 اطلاعات ورود
-</strong>
-
-<br><br>
-
-اگر رمز عبور را خالی بگذارید،
-رمز فعلی تغییر نمی‌کند.
-
-</div>
-
-</div>
-
-<div class="footer">
-POWERED BY YASIN BEHZAD
-</div>
-
-</div>
-`
-    );
-}
-
-async function configPage(req, user) {
-    const origin =
-        getPublicOrigin(req);
-
-    const links =
-        makeVlessLinks(
-            user,
-            origin
-        );
-
-    const subscriptionUrl =
-        `${origin}/sub/${user.subscription_token}`;
-
-    const xhttpQr =
-        await qrCode(
-            links.xhttp
-        );
-
-    const wsQr =
-        await qrCode(
-            links.websocket
-        );
-
-    const subQr =
-        await qrCode(
-            subscriptionUrl
-        );
-
-    return layout(
-        `${user.username} Config`,
-        `
-<div class="container">
-
-<div class="nav">
-
-<a
-    href="/dashboard"
-    class="brand"
->
-⚔️ VERGIL<span>PANEL</span>
-</a>
-
-<a
-    class="btn"
-    href="/dashboard"
->
-← داشبورد
-</a>
-
-</div>
-
-<div class="card">
-
-<h1>
-⚔️ ${escapeHtml(user.username)}
-</h1>
-
-<p class="muted">
-VLESS · XHTTP + WebSocket
-</p>
-
-<div class="notice">
-
-<strong>
-📡 Subscription
-</strong>
-
-<pre class="config">${escapeHtml(
-    subscriptionUrl
-)}</pre>
-
-<button
-    class="btn primary"
-    onclick='copyText(${JSON.stringify(
-        subscriptionUrl
-    )})'
->
-📋 کپی Subscription
-</button>
-
-</div>
-
-<div class="qr-grid">
-
-<div class="qr-card">
-
-<h3>
-📡 Subscription QR
-</h3>
-
-<img
-    src="${subQr}"
-    alt="Subscription QR"
->
-
-<br><br>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        subscriptionUrl
-    )})'
->
-کپی لینک
-</button>
-
-</div>
-
-<div class="qr-card">
-
-<h3>
-🔥 XHTTP QR
-</h3>
-
-<img
-    src="${xhttpQr}"
-    alt="XHTTP QR"
->
-
-<br><br>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        links.xhttp
-    )})'
->
-کپی
-</button>
-
-</div>
-
-</div>
-
-<h2>
-🚀 VLESS + XHTTP
-</h2>
-
-<pre class="config">${escapeHtml(
-    links.xhttp
-)}</pre>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        links.xhttp
-    )})'
->
-📋 Copy XHTTP
-</button>
-
-<br><br>
-
-<h2>
-🌐 VLESS + WebSocket
-</h2>
-
-<pre class="config">${escapeHtml(
-    links.websocket
-)}</pre>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        links.websocket
-    )})'
->
-📋 Copy WebSocket
-</button>
-
-<div class="qr-grid">
-
-<div class="qr-card">
-
-<h3>
-🔥 XHTTP
-</h3>
-
-<img
-    src="${xhttpQr}"
-    alt="XHTTP QR"
->
-
-</div>
-
-<div class="qr-card">
-
-<h3>
-🌐 WebSocket
-</h3>
-
-<img
-    src="${wsQr}"
-    alt="WebSocket QR"
->
-
-</div>
-
-</div>
-
-<br>
-
-<div class="notice">
-
-<strong>
-💙 ساخته شده توسط یاسین
-</strong>
-
-<br>
-
-کاملاً رایگان و غیرقابل فروش
-
-<br><br>
-
-<span class="muted small">
-این پیام داخل Subscription نیز قرار گرفته است.
-</span>
-
-</div>
-
-<h2>
-🆔 UUID
-</h2>
-
-<pre class="config">${escapeHtml(
-    user.uuid
-)}</pre>
-
-<div class="footer">
-POWERED BY YASIN BEHZAD
-</div>
-
-</div>
-
-</div>
-
-<script>
-
-async function copyText(text){
-
-    try{
-
-        await navigator.clipboard.writeText(text);
-
-        alert("کپی شد ✅");
-
-    }catch{
-
-        prompt(
-            "متن را کپی کنید:",
-            text
-        );
-
-    }
-
-}
-
-</script>
-`
-    );
-}
-
-/*
- * Default Admin
- *
- * Fresh deployment:
- *
- * admin / admin
- *
- * Railway Variables can override it.
- */
-
-function ensureDefaultAdmin() {
-
-    const username =
-        String(
-            process.env.ADMIN_USERNAME || "admin"
-        ).trim();
-
-    const password =
-        String(
-            process.env.ADMIN_PASSWORD || "admin"
-        );
-
-    const existing =
-        db.prepare(`
-            SELECT id
-            FROM admins
-            WHERE username = ?
-        `).get(username);
-
-    if (existing) {
-
-        db.prepare(`
-            UPDATE admins
-            SET password_hash = ?
-            WHERE id = ?
-        `).run(
-            hashPassword(password),
-            existing.id
-        );
-
-        console.log(
-            `👤 Admin ready: ${username}`
-        );
-
-        return;
-    }
-
-    db.prepare(`
-        INSERT INTO admins(
-            username,
-            password_hash,
-            created_at
+    return Buffer
+        .from(
+            links.join("\n"),
+            "utf8"
         )
-        VALUES (?, ?, ?)
-    `).run(
-        username,
-        hashPassword(password),
-        nowIso()
-    );
-
-    console.log(
-        `👤 Default admin created: ${username}`
-    );
+        .toString("base64");
 }
 
-function authenticate(
-    username,
-    password
-) {
-    const admin =
-        db.prepare(`
-            SELECT *
-            FROM admins
-            WHERE username = ?
-        `).get(username);
 
-    if (!admin) {
-        return false;
-    }
+// ------------------------------------------------------------
+// User creation
+// ------------------------------------------------------------
 
-    return (
-        admin.password_hash ===
-        hashPassword(password)
-    );
-}
-
-async function createUser(form) {
-
+function createUser(form) {
     const username =
+        String(form.get("username") || "")
+            .trim();
+
+    const protocol =
+        normalizeProtocol(
+            form.get("protocol")
+        );
+
+    const trafficLimitGB =
+        Number(
+            form.get("traffic_limit") || 0
+        );
+
+    const expiresAt =
         String(
-            form.get("username") || ""
+            form.get("expires_at") || ""
         ).trim();
 
     if (!username) {
         throw new Error(
-            "نام کاربری الزامی است."
+            "Username is required"
         );
     }
 
-    const exists =
+    if (
+        !/^[a-zA-Z0-9_.-]{2,32}$/.test(
+            username
+        )
+    ) {
+        throw new Error(
+            "Username must be 2-32 characters and contain only letters, numbers, _, -, ."
+        );
+    }
+
+    const existing =
         db.prepare(`
             SELECT id
             FROM users
             WHERE username = ?
         `).get(username);
 
-    if (exists) {
+    if (existing) {
         throw new Error(
-            "این نام کاربری قبلاً وجود دارد."
+            "Username already exists"
         );
     }
 
@@ -2497,40 +928,19 @@ async function createUser(form) {
     const subscriptionToken =
         randomToken(32);
 
-    const trafficLimit =
-        Number(
-            form.get("traffic_limit") || 0
-        );
-
-    let expiresAt = null;
-
-    const expiry =
-        String(
-            form.get("expires_at") || ""
-        ).trim();
-
-    if (expiry) {
-
-        const date =
-            new Date(expiry);
-
-        if (
-            Number.isNaN(
-                date.getTime()
-            )
-        ) {
-            throw new Error(
-                "تاریخ انقضا نامعتبر است."
-            );
-        }
-
-        expiresAt =
-            date.toISOString();
-    }
+    const trafficLimitBytes =
+        Math.max(
+            0,
+            trafficLimitGB
+        ) *
+        1024 *
+        1024 *
+        1024;
 
     const result =
         db.prepare(`
-            INSERT INTO users(
+            INSERT INTO users
+            (
                 username,
                 uuid,
                 protocol,
@@ -2541,168 +951,32 @@ async function createUser(form) {
                 subscription_token,
                 created_at
             )
-            VALUES (
-                ?,
-                ?,
-                'vless',
-                ?,
-                0,
-                ?,
-                'active',
-                ?,
-                ?
-            )
+            VALUES (?, ?, ?, ?, 0, ?, 'active', ?, ?)
         `).run(
             username,
             uuid,
-            Number.isFinite(
-                trafficLimit
-            )
-                ? trafficLimit
-                : 0,
-            expiresAt,
+            protocol,
+            trafficLimitBytes,
+            expiresAt || null,
             subscriptionToken,
             nowIso()
         );
 
-    await restartXray();
+    console.log(
+        `👤 User created: ${username} (${protocol})`
+    );
 
     return db.prepare(`
         SELECT *
         FROM users
         WHERE id = ?
-    `).get(
-        result.lastInsertRowid
-    );
+    `).get(result.lastInsertRowid);
 }
 
-async function deleteUser(id) {
 
-    db.prepare(`
-        DELETE FROM users
-        WHERE id = ?
-    `).run(
-        Number(id)
-    );
-
-    await restartXray();
-}
-
-async function toggleUser(id) {
-
-    const user =
-        db.prepare(`
-            SELECT *
-            FROM users
-            WHERE id = ?
-        `).get(
-            Number(id)
-        );
-
-    if (!user) {
-        throw new Error(
-            "User not found."
-        );
-    }
-
-    const newStatus =
-        user.status === "active"
-            ? "disabled"
-            : "active";
-
-    db.prepare(`
-        UPDATE users
-        SET status = ?
-        WHERE id = ?
-    `).run(
-        newStatus,
-        Number(id)
-    );
-
-    await restartXray();
-}
-
-function updateAdmin(
-    username,
-    password
-) {
-    const admin =
-        getAdmin();
-
-    if (!admin) {
-        throw new Error(
-            "Admin account not found."
-        );
-    }
-
-    const cleanUsername =
-        String(
-            username || ""
-        ).trim();
-
-    if (!cleanUsername) {
-        throw new Error(
-            "نام کاربری نمی‌تواند خالی باشد."
-        );
-    }
-
-    if (
-        cleanUsername !==
-        admin.username
-    ) {
-
-        const duplicate =
-            db.prepare(`
-                SELECT id
-                FROM admins
-                WHERE username = ?
-                AND id != ?
-            `).get(
-                cleanUsername,
-                admin.id
-            );
-
-        if (duplicate) {
-            throw new Error(
-                "این نام کاربری قبلاً استفاده شده است."
-            );
-        }
-    }
-
-    if (password) {
-
-        if (
-            String(password).length < 4
-        ) {
-            throw new Error(
-                "رمز عبور باید حداقل 4 کاراکتر باشد."
-            );
-        }
-
-        db.prepare(`
-            UPDATE admins
-            SET
-                username = ?,
-                password_hash = ?
-            WHERE id = ?
-        `).run(
-            cleanUsername,
-            hashPassword(password),
-            admin.id
-        );
-
-    } else {
-
-        db.prepare(`
-            UPDATE admins
-            SET username = ?
-            WHERE id = ?
-        `).run(
-            cleanUsername,
-            admin.id
-        );
-    }
-}
+// ------------------------------------------------------------
+// HTTP proxy
+// ------------------------------------------------------------
 
 function proxyHttpToXray(
     req,
@@ -2717,8 +991,7 @@ function proxyHttpToXray(
 
         headers: {
             ...req.headers,
-            host:
-                `127.0.0.1:${targetPort}`
+            host: `127.0.0.1:${targetPort}`
         }
     };
 
@@ -2726,7 +999,6 @@ function proxyHttpToXray(
         http.request(
             options,
             upstream => {
-
                 res.writeHead(
                     upstream.statusCode || 502,
                     upstream.headers
@@ -2739,45 +1011,50 @@ function proxyHttpToXray(
     proxy.on(
         "error",
         error => {
-
             console.error(
                 "HTTP proxy error:",
                 error
             );
 
             if (!res.headersSent) {
-
                 res.writeHead(
                     502,
                     {
                         "Content-Type":
-                            "text/plain"
+                            "text/plain; charset=utf-8"
                     }
                 );
             }
 
-            res.end("Bad Gateway");
+            res.end(
+                "Bad Gateway"
+            );
         }
     );
 
     req.pipe(proxy);
 }
 
+
+// ------------------------------------------------------------
+// WebSocket proxy
+// ------------------------------------------------------------
+
 function proxyWebSocket(
     req,
     clientSocket,
-    head
+    head,
+    targetPort
 ) {
     const upstream =
         net.connect({
             host: "127.0.0.1",
-            port: XRAY_WS_PORT
+            port: targetPort
         });
 
     upstream.on(
         "connect",
         () => {
-
             const headers = [];
 
             headers.push(
@@ -2788,23 +1065,16 @@ function proxyWebSocket(
                 const [key, value]
                 of Object.entries(req.headers)
             ) {
-
-                if (
-                    Array.isArray(value)
-                ) {
-
+                if (Array.isArray(value)) {
                     for (
                         const item
                         of value
                     ) {
-
                         headers.push(
                             `${key}: ${item}`
                         );
                     }
-
                 } else {
-
                     headers.push(
                         `${key}: ${value}`
                     );
@@ -2833,7 +1103,6 @@ function proxyWebSocket(
     upstream.on(
         "error",
         error => {
-
             console.error(
                 "WebSocket proxy error:",
                 error
@@ -2848,7 +1117,6 @@ function proxyWebSocket(
     clientSocket.on(
         "error",
         () => {
-
             try {
                 upstream.destroy();
             } catch {}
@@ -2858,7 +1126,6 @@ function proxyWebSocket(
     clientSocket.on(
         "close",
         () => {
-
             try {
                 upstream.destroy();
             } catch {}
@@ -2866,106 +1133,1712 @@ function proxyWebSocket(
     );
 }
 
-async function subscriptionResponse(
-    req,
-    res,
-    token
+
+// ------------------------------------------------------------
+// Raw TCP proxy for Shadowsocks
+// ------------------------------------------------------------
+
+function proxyTcpToXray(
+    clientSocket
 ) {
-    const user =
-        db.prepare(`
-            SELECT *
-            FROM users
-            WHERE subscription_token = ?
-        `).get(token);
+    const upstream =
+        net.connect({
+            host: "127.0.0.1",
+            port: XRAY_SS_PORT
+        });
 
-    if (!user) {
-
-        sendJson(
-            res,
-            {
-                ok: false,
-                error:
-                    "Subscription not found."
-            },
-            404
-        );
-
-        return;
-    }
-
-    if (
-        user.status !== "active"
-    ) {
-
-        sendJson(
-            res,
-            {
-                ok: false,
-                error:
-                    "Subscription disabled."
-            },
-            403
-        );
-
-        return;
-    }
-
-    if (
-        user.expires_at &&
-        user.expires_at <= nowIso()
-    ) {
-
-        sendJson(
-            res,
-            {
-                ok: false,
-                error:
-                    "Subscription expired."
-            },
-            403
-        );
-
-        return;
-    }
-
-    const content =
-        makeSubscription(
-            user,
-            getPublicOrigin(req)
-        );
-
-    res.writeHead(
-        200,
-        {
-            "Content-Type":
-                "text/plain; charset=utf-8",
-
-            "Cache-Control":
-                "no-store"
+    upstream.on(
+        "connect",
+        () => {
+            clientSocket.pipe(upstream);
+            upstream.pipe(clientSocket);
         }
     );
 
-    res.end(content);
+    upstream.on(
+        "error",
+        error => {
+            console.error(
+                "TCP proxy error:",
+                error
+            );
+
+            try {
+                clientSocket.destroy();
+            } catch {}
+        }
+    );
+
+    clientSocket.on(
+        "error",
+        () => {
+            try {
+                upstream.destroy();
+            } catch {}
+        }
+    );
+
+    clientSocket.on(
+        "close",
+        () => {
+            try {
+                upstream.destroy();
+            } catch {}
+        }
+    );
 }
 
-async function handleRequest(
-    req,
-    res
-) {
-    try {
 
+// ------------------------------------------------------------
+// Login page
+// ------------------------------------------------------------
+
+function loginPage(error = "") {
+    return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1.0">
+
+<title>VergilPanel - Login</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+        radial-gradient(
+            circle at top,
+            #102a46 0,
+            #07111e 45%,
+            #030812 100%
+        );
+    color: #e5f3ff;
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.card {
+    width: min(420px, 92%);
+    padding: 35px;
+
+    background:
+        rgba(8, 21, 36, .92);
+
+    border:
+        1px solid rgba(56,189,248,.25);
+
+    border-radius: 22px;
+
+    box-shadow:
+        0 25px 80px
+        rgba(0,0,0,.55);
+}
+
+.logo {
+    text-align: center;
+    font-size: 34px;
+    font-weight: 900;
+    color: #38bdf8;
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    text-align: center;
+    color: #7fa2bb;
+    margin-bottom: 30px;
+}
+
+label {
+    display: block;
+    margin-bottom: 8px;
+    color: #9fc0d5;
+}
+
+input {
+    width: 100%;
+    padding: 13px 15px;
+
+    border-radius: 12px;
+    border:
+        1px solid
+        rgba(255,255,255,.1);
+
+    background: #071321;
+    color: white;
+
+    outline: none;
+    margin-bottom: 18px;
+}
+
+input:focus {
+    border-color: #38bdf8;
+}
+
+button {
+    width: 100%;
+    border: 0;
+    padding: 14px;
+
+    border-radius: 12px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #0284c7,
+            #38bdf8
+        );
+
+    color: white;
+    font-weight: 800;
+    cursor: pointer;
+}
+
+.error {
+    background: rgba(239,68,68,.12);
+    border: 1px solid rgba(239,68,68,.3);
+    color: #fca5a5;
+    padding: 12px;
+    border-radius: 10px;
+    margin-bottom: 18px;
+}
+
+.footer {
+    text-align: center;
+    margin-top: 25px;
+    color: #57768c;
+    font-size: 12px;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+    <div class="logo">
+        ⚔️ VergilPanel
+    </div>
+
+    <div class="subtitle">
+        V1.0.0
+    </div>
+
+    ${
+        error
+            ? `<div class="error">${escapeHtml(error)}</div>`
+            : ""
+    }
+
+    <form method="POST"
+          action="/login">
+
+        <label>Username</label>
+
+        <input
+            name="username"
+            autocomplete="username"
+            required
+        >
+
+        <label>Password</label>
+
+        <input
+            type="password"
+            name="password"
+            autocomplete="current-password"
+            required
+        >
+
+        <button type="submit">
+            LOGIN
+        </button>
+
+    </form>
+
+    <div class="footer">
+        POWERED BY YASIN BEHZAD
+    </div>
+
+</div>
+
+</body>
+</html>
+`;
+}
+
+
+// ------------------------------------------------------------
+// Dashboard
+// ------------------------------------------------------------
+
+function dashboardPage(users, req) {
+    const origin =
+        getPublicOrigin(req);
+
+    const rows =
+        users.map(user => {
+            const protocol =
+                protocolLabel(
+                    user.protocol
+                );
+
+            const color =
+                protocolColor(
+                    user.protocol
+                );
+
+            const expires =
+                user.expires_at
+                    ? new Date(
+                        user.expires_at
+                    ).toLocaleString()
+                    : "Unlimited";
+
+            const traffic =
+                user.traffic_limit_bytes
+                    ? `${(
+                        user.traffic_limit_bytes /
+                        1024 /
+                        1024 /
+                        1024
+                    ).toFixed(2)} GB`
+                    : "Unlimited";
+
+            return `
+<tr>
+
+<td>
+    <strong>
+        ${escapeHtml(user.username)}
+    </strong>
+
+    <div class="muted">
+        ${escapeHtml(user.uuid)}
+    </div>
+</td>
+
+<td>
+    <span
+        class="protocol"
+        style="--protocol:${color}">
+        ${protocol}
+    </span>
+</td>
+
+<td>
+    ${traffic}
+</td>
+
+<td>
+    ${escapeHtml(expires)}
+</td>
+
+<td>
+    <span class="${
+        user.status === "active"
+            ? "active"
+            : "disabled"
+    }">
+        ${escapeHtml(user.status)}
+    </span>
+</td>
+
+<td>
+
+<div class="actions">
+
+<a
+    class="btn small"
+    href="/users/config?id=${user.id}">
+    CONFIG
+</a>
+
+<form
+    method="POST"
+    action="/users/toggle"
+    style="display:inline">
+
+<input
+    type="hidden"
+    name="id"
+    value="${user.id}">
+
+<button
+    class="btn small secondary"
+    type="submit">
+    ${
+        user.status === "active"
+            ? "DISABLE"
+            : "ENABLE"
+    }
+</button>
+
+</form>
+
+<form
+    method="POST"
+    action="/users/delete"
+    style="display:inline"
+    onsubmit="return confirm('Delete this user?')">
+
+<input
+    type="hidden"
+    name="id"
+    value="${user.id}">
+
+<button
+    class="btn small danger"
+    type="submit">
+    DELETE
+</button>
+
+</form>
+
+</div>
+
+</td>
+
+</tr>
+`;
+        })
+        .join("");
+
+    return `
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1.0">
+
+<title>VergilPanel</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+
+    background:
+        radial-gradient(
+            circle at top,
+            #102b48,
+            #06101d 50%,
+            #03070e
+        );
+
+    color: #e8f5ff;
+
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
+
+    min-height: 100vh;
+}
+
+nav {
+    height: 70px;
+
+    padding:
+        0 25px;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    border-bottom:
+        1px solid
+        rgba(56,189,248,.12);
+
+    background:
+        rgba(3,10,20,.65);
+
+    backdrop-filter: blur(12px);
+}
+
+.logo {
+    color: #38bdf8;
+    font-weight: 900;
+    font-size: 22px;
+}
+
+.navlinks {
+    display: flex;
+    gap: 10px;
+}
+
+.navlinks a {
+    color: #9fc0d5;
+    text-decoration: none;
+    padding: 8px 12px;
+    border-radius: 8px;
+}
+
+.navlinks a:hover {
+    background: rgba(56,189,248,.1);
+    color: white;
+}
+
+.container {
+    width: min(1250px, 94%);
+    margin: 35px auto;
+}
+
+.hero {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    margin-bottom: 25px;
+}
+
+.hero h1 {
+    margin: 0;
+    font-size: 30px;
+}
+
+.hero p {
+    color: #7897ad;
+}
+
+.btn {
+    display: inline-block;
+
+    border: 0;
+
+    padding: 11px 16px;
+
+    border-radius: 10px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #0284c7,
+            #38bdf8
+        );
+
+    color: white;
+
+    font-weight: 800;
+
+    text-decoration: none;
+
+    cursor: pointer;
+}
+
+.small {
+    padding: 7px 9px;
+    font-size: 11px;
+}
+
+.secondary {
+    background: #16283b;
+}
+
+.danger {
+    background: #7f1d1d;
+}
+
+.card {
+    background:
+        rgba(7,20,34,.88);
+
+    border:
+        1px solid
+        rgba(56,189,248,.12);
+
+    border-radius: 18px;
+
+    overflow: hidden;
+
+    box-shadow:
+        0 20px 60px
+        rgba(0,0,0,.25);
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th,
+td {
+    text-align: left;
+    padding: 17px;
+    border-bottom:
+        1px solid
+        rgba(255,255,255,.05);
+}
+
+th {
+    color: #7394aa;
+    font-size: 12px;
+    text-transform: uppercase;
+}
+
+.muted {
+    color: #526f83;
+    font-size: 11px;
+    margin-top: 5px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.protocol {
+    display: inline-block;
+    color: var(--protocol);
+    border:
+        1px solid
+        color-mix(
+            in srgb,
+            var(--protocol) 30%,
+            transparent
+        );
+
+    background:
+        color-mix(
+            in srgb,
+            var(--protocol) 8%,
+            transparent
+        );
+
+    padding:
+        5px 9px;
+
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.active,
+.disabled {
+    padding: 5px 9px;
+    border-radius: 20px;
+    font-size: 11px;
+}
+
+.active {
+    color: #34d399;
+    background: rgba(52,211,153,.1);
+}
+
+.disabled {
+    color: #fb7185;
+    background: rgba(251,113,133,.1);
+}
+
+.actions {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+}
+
+.empty {
+    text-align: center;
+    padding: 60px;
+    color: #658197;
+}
+
+.brand {
+    margin-top: 25px;
+    text-align: center;
+    color: #58758a;
+    font-size: 12px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<nav>
+
+<div class="logo">
+    ⚔️ VergilPanel
+    <span style="font-size:12px;color:#647f94">
+        v${VERSION}
+    </span>
+</div>
+
+<div class="navlinks">
+
+<a href="/">
+    Dashboard
+</a>
+
+<a href="/users/new">
+    + New User
+</a>
+
+<a href="/settings">
+    Settings
+</a>
+
+<a href="/logout">
+    Logout
+</a>
+
+</div>
+
+</nav>
+
+<div class="container">
+
+<div class="hero">
+
+<div>
+    <h1>
+        Users
+    </h1>
+
+    <p>
+        Manage your VPN users and configurations.
+    </p>
+</div>
+
+<a
+    class="btn"
+    href="/users/new">
+    + CREATE USER
+</a>
+
+</div>
+
+<div class="card">
+
+${
+    users.length
+        ? `
+<table>
+
+<thead>
+
+<tr>
+<th>User</th>
+<th>Protocol</th>
+<th>Traffic</th>
+<th>Expiration</th>
+<th>Status</th>
+<th>Actions</th>
+</tr>
+
+</thead>
+
+<tbody>
+${rows}
+</tbody>
+
+</table>
+`
+        : `
+<div class="empty">
+    No users yet.
+</div>
+`
+}
+
+</div>
+
+<div class="brand">
+    💙 ${escapeHtml(BRAND_1)}
+    <br>
+    🖤 ${escapeHtml(BRAND_2)}
+    <br><br>
+    POWERED BY YASIN BEHZAD
+</div>
+
+</div>
+
+</body>
+
+</html>
+`;
+}
+
+
+// ------------------------------------------------------------
+// New user page
+// ------------------------------------------------------------
+
+function newUserPage(error = "") {
+    return `
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1.0">
+
+<title>Create User - VergilPanel</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+
+    min-height: 100vh;
+
+    background:
+        radial-gradient(
+            circle at top,
+            #102b48,
+            #06101d 50%,
+            #03070e
+        );
+
+    color: #e8f5ff;
+
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
+}
+
+nav {
+    height: 70px;
+
+    padding: 0 25px;
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    background:
+        rgba(3,10,20,.7);
+
+    border-bottom:
+        1px solid
+        rgba(56,189,248,.12);
+}
+
+.logo {
+    color: #38bdf8;
+    font-weight: 900;
+    font-size: 22px;
+}
+
+nav a {
+    color: #9fc0d5;
+    text-decoration: none;
+}
+
+.container {
+    width: min(650px, 92%);
+    margin: 45px auto;
+}
+
+.card {
+    padding: 30px;
+
+    background:
+        rgba(7,20,34,.9);
+
+    border:
+        1px solid
+        rgba(56,189,248,.15);
+
+    border-radius: 20px;
+}
+
+h1 {
+    margin-top: 0;
+}
+
+.subtitle {
+    color: #708ca0;
+    margin-bottom: 25px;
+}
+
+label {
+    display: block;
+    margin: 18px 0 8px;
+    color: #a5c1d2;
+}
+
+input,
+select {
+    width: 100%;
+
+    padding: 13px;
+
+    background: #071321;
+
+    color: white;
+
+    border:
+        1px solid
+        rgba(255,255,255,.1);
+
+    border-radius: 10px;
+
+    outline: none;
+}
+
+input:focus,
+select:focus {
+    border-color: #38bdf8;
+}
+
+button {
+    width: 100%;
+
+    margin-top: 25px;
+
+    border: 0;
+
+    padding: 14px;
+
+    border-radius: 11px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #0284c7,
+            #38bdf8
+        );
+
+    color: white;
+
+    font-weight: 900;
+
+    cursor: pointer;
+}
+
+.error {
+    background: rgba(239,68,68,.1);
+    border: 1px solid rgba(239,68,68,.3);
+    color: #fca5a5;
+    padding: 12px;
+    border-radius: 10px;
+}
+
+.info {
+    margin-top: 18px;
+    padding: 14px;
+
+    background: rgba(56,189,248,.05);
+
+    border:
+        1px solid
+        rgba(56,189,248,.1);
+
+    border-radius: 10px;
+
+    color: #7192a7;
+
+    font-size: 12px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<nav>
+
+<div class="logo">
+    ⚔️ VergilPanel
+</div>
+
+<a href="/">
+    ← Dashboard
+</a>
+
+</nav>
+
+<div class="container">
+
+<div class="card">
+
+<h1>
+    Create User
+</h1>
+
+<div class="subtitle">
+    Create a new VPN account.
+</div>
+
+${
+    error
+        ? `<div class="error">${escapeHtml(error)}</div>`
+        : ""
+}
+
+<form
+    method="POST"
+    action="/users/new">
+
+<label>
+    Username
+</label>
+
+<input
+    name="username"
+    placeholder="example"
+    required>
+
+<label>
+    Protocol
+</label>
+
+<select
+    name="protocol"
+    required>
+
+<option value="vless">
+    VLESS
+</option>
+
+<option value="vmess">
+    VMess
+</option>
+
+<option value="trojan">
+    Trojan
+</option>
+
+<option value="shadowsocks">
+    Shadowsocks
+</option>
+
+</select>
+
+<label>
+    Traffic Limit (GB)
+</label>
+
+<input
+    type="number"
+    name="traffic_limit"
+    min="0"
+    step="1"
+    value="0">
+
+<label>
+    Expiration
+</label>
+
+<input
+    type="datetime-local"
+    name="expires_at">
+
+<div class="info">
+    Traffic value 0 means unlimited.
+    <br><br>
+    VLESS supports XHTTP + WebSocket.
+    VMess and Trojan use WebSocket.
+    Shadowsocks uses Railway TCP Proxy.
+</div>
+
+<button type="submit">
+    CREATE USER
+</button>
+
+</form>
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+`;
+}
+
+
+// ------------------------------------------------------------
+// Config page
+// ------------------------------------------------------------
+
+async function configPage(user, req) {
+    const origin =
+        getPublicOrigin(req);
+
+    const protocol =
+        normalizeProtocol(
+            user.protocol
+        );
+
+    const links = [];
+
+    if (protocol === "vless") {
+        const vless =
+            makeVlessLinks(
+                user,
+                origin
+            );
+
+        links.push({
+            name: "VLESS XHTTP",
+            value: vless.xhttp
+        });
+
+        links.push({
+            name: "VLESS WebSocket",
+            value: vless.websocket
+        });
+    }
+
+    if (protocol === "vmess") {
+        links.push({
+            name: "VMess WebSocket",
+            value: makeVmessLink(
+                user,
+                origin
+            )
+        });
+    }
+
+    if (protocol === "trojan") {
+        links.push({
+            name: "Trojan WebSocket",
+            value: makeTrojanLink(
+                user,
+                origin
+            )
+        });
+    }
+
+    if (protocol === "shadowsocks") {
+        links.push({
+            name: "Shadowsocks TCP",
+            value: makeShadowsocksLink(
+                user
+            )
+        });
+    }
+
+    const subscriptionUrl =
+        `${origin}/sub/${user.subscription_token}`;
+
+    const subscriptionQr =
+        await QRCode.toDataURL(
+            subscriptionUrl
+        );
+
+    const configCards =
+        await Promise.all(
+            links.map(
+                async link => ({
+                    ...link,
+                    qr:
+                        await QRCode.toDataURL(
+                            link.value
+                        )
+                })
+            )
+        );
+
+    return `
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1.0">
+
+<title>
+    ${escapeHtml(user.username)}
+    - VergilPanel
+</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+
+    min-height: 100vh;
+
+    background:
+        radial-gradient(
+            circle at top,
+            #102b48,
+            #06101d 50%,
+            #03070e
+        );
+
+    color: #e8f5ff;
+
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
+}
+
+nav {
+    height: 70px;
+
+    padding: 0 25px;
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    background:
+        rgba(3,10,20,.7);
+
+    border-bottom:
+        1px solid
+        rgba(56,189,248,.12);
+}
+
+.logo {
+    color: #38bdf8;
+    font-weight: 900;
+    font-size: 22px;
+}
+
+nav a {
+    color: #9fc0d5;
+    text-decoration: none;
+}
+
+.container {
+    width: min(1000px, 94%);
+    margin: 35px auto;
+}
+
+.header {
+    margin-bottom: 25px;
+}
+
+.header h1 {
+    margin-bottom: 5px;
+}
+
+.muted {
+    color: #678499;
+    font-size: 13px;
+}
+
+.badge {
+    display: inline-block;
+
+    margin-top: 12px;
+
+    padding: 6px 12px;
+
+    border-radius: 20px;
+
+    color: #38bdf8;
+
+    background:
+        rgba(56,189,248,.08);
+
+    border:
+        1px solid
+        rgba(56,189,248,.2);
+
+    font-size: 12px;
+
+    font-weight: 800;
+}
+
+.subscription {
+    padding: 25px;
+
+    background:
+        rgba(7,20,34,.9);
+
+    border:
+        1px solid
+        rgba(56,189,248,.14);
+
+    border-radius: 18px;
+
+    margin-bottom: 22px;
+
+    text-align: center;
+}
+
+.subscription img {
+    width: 190px;
+    height: 190px;
+
+    background: white;
+
+    padding: 10px;
+
+    border-radius: 12px;
+}
+
+.url {
+    margin-top: 20px;
+
+    padding: 13px;
+
+    background: #030b14;
+
+    border-radius: 10px;
+
+    color: #7dd3fc;
+
+    word-break: break-all;
+
+    font-size: 12px;
+}
+
+.grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            auto-fit,
+            minmax(300px, 1fr)
+        );
+
+    gap: 18px;
+}
+
+.card {
+    background:
+        rgba(7,20,34,.9);
+
+    border:
+        1px solid
+        rgba(56,189,248,.12);
+
+    border-radius: 18px;
+
+    padding: 22px;
+}
+
+.card h3 {
+    margin-top: 0;
+}
+
+.qr {
+    width: 170px;
+    height: 170px;
+
+    background: white;
+
+    padding: 8px;
+
+    border-radius: 10px;
+
+    display: block;
+
+    margin: 15px auto;
+}
+
+.link {
+    padding: 12px;
+
+    background: #030b14;
+
+    border-radius: 9px;
+
+    color: #9bdcff;
+
+    font-size: 11px;
+
+    word-break: break-all;
+}
+
+.brand {
+    margin-top: 25px;
+
+    padding: 20px;
+
+    text-align: center;
+
+    color: #7290a4;
+
+    background:
+        rgba(7,20,34,.65);
+
+    border-radius: 15px;
+
+    font-size: 12px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<nav>
+
+<div class="logo">
+    ⚔️ VergilPanel
+</div>
+
+<a href="/">
+    ← Dashboard
+</a>
+
+</nav>
+
+<div class="container">
+
+<div class="header">
+
+<h1>
+    ${escapeHtml(user.username)}
+</h1>
+
+<div class="muted">
+    UUID:
+    ${escapeHtml(user.uuid)}
+</div>
+
+<div class="badge">
+    ${escapeHtml(
+        protocolLabel(
+            user.protocol
+        )
+    )}
+</div>
+
+</div>
+
+<div class="subscription">
+
+<h2>
+    Subscription
+</h2>
+
+<img
+    src="${subscriptionQr}"
+    alt="Subscription QR">
+
+<div class="url">
+    ${escapeHtml(subscriptionUrl)}
+</div>
+
+</div>
+
+<div class="grid">
+
+${
+    configCards
+        .map(card => `
+<div class="card">
+
+<h3>
+    ${escapeHtml(card.name)}
+</h3>
+
+<img
+    class="qr"
+    src="${card.qr}"
+    alt="QR">
+
+<div class="link">
+    ${escapeHtml(card.value)}
+</div>
+
+</div>
+`)
+        .join("")
+}
+
+</div>
+
+<div class="brand">
+
+💙 ${escapeHtml(BRAND_1)}
+
+<br><br>
+
+🖤 ${escapeHtml(BRAND_2)}
+
+<br><br>
+
+POWERED BY YASIN BEHZAD
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+`;
+}
+
+
+// ------------------------------------------------------------
+// Settings
+// ------------------------------------------------------------
+
+function settingsPage(message = "") {
+    const admin =
+        getAdmin();
+
+    return `
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1.0">
+
+<title>Settings - VergilPanel</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+
+    min-height: 100vh;
+
+    background:
+        radial-gradient(
+            circle at top,
+            #102b48,
+            #06101d 50%,
+            #03070e
+        );
+
+    color: #e8f5ff;
+
+    font-family: Arial, sans-serif;
+}
+
+nav {
+    height: 70px;
+
+    padding: 0 25px;
+
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    background:
+        rgba(3,10,20,.7);
+
+    border-bottom:
+        1px solid
+        rgba(56,189,248,.12);
+}
+
+.logo {
+    color: #38bdf8;
+    font-weight: 900;
+    font-size: 22px;
+}
+
+nav a {
+    color: #9fc0d5;
+    text-decoration: none;
+}
+
+.container {
+    width: min(600px, 92%);
+    margin: 45px auto;
+}
+
+.card {
+    padding: 30px;
+
+    background:
+        rgba(7,20,34,.9);
+
+    border:
+        1px solid
+        rgba(56,189,248,.12);
+
+    border-radius: 20px;
+}
+
+label {
+    display: block;
+    margin: 18px 0 8px;
+    color: #a3bfce;
+}
+
+input {
+    width: 100%;
+    padding: 13px;
+
+    background: #071321;
+    color: white;
+
+    border:
+        1px solid
+        rgba(255,255,255,.1);
+
+    border-radius: 10px;
+}
+
+button {
+    width: 100%;
+    padding: 14px;
+    margin-top: 25px;
+
+    border: 0;
+    border-radius: 10px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #0284c7,
+            #38bdf8
+        );
+
+    color: white;
+    font-weight: 900;
+}
+
+.message {
+    padding: 12px;
+
+    margin-bottom: 15px;
+
+    background:
+        rgba(52,211,153,.1);
+
+    color: #6ee7b7;
+
+    border-radius: 10px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<nav>
+
+<div class="logo">
+    ⚔️ VergilPanel
+</div>
+
+<a href="/">
+    ← Dashboard
+</a>
+
+</nav>
+
+<div class="container">
+
+<div class="card">
+
+<h1>
+    Settings
+</h1>
+
+${
+    message
+        ? `<div class="message">${escapeHtml(message)}</div>`
+        : ""
+}
+
+<form
+    method="POST"
+    action="/settings">
+
+<label>
+    Admin Username
+</label>
+
+<input
+    name="username"
+    value="${escapeHtml(
+        admin?.username || ""
+    )}"
+    required>
+
+<label>
+    New Password
+</label>
+
+<input
+    type="password"
+    name="password"
+    placeholder="Leave blank to keep current password">
+
+<button type="submit">
+    SAVE SETTINGS
+</button>
+
+</form>
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+`;
+}
+
+
+// ------------------------------------------------------------
+// HTTP request handler
+// ------------------------------------------------------------
+
+async function handleRequest(req, res) {
+    try {
         const url =
             new URL(
                 req.url,
-                `http://${req.headers.host || "localhost"}`
+                `http://${getPublicHost(req)}`
             );
 
         const pathname =
             url.pathname;
 
-        /*
-         * XHTTP
-         */
+
+        // ----------------------------------------------------
+        // XHTTP
+        // ----------------------------------------------------
 
         if (
             pathname === XHTTP_PATH ||
@@ -2973,7 +2846,6 @@ async function handleRequest(
                 `${XHTTP_PATH}/`
             )
         ) {
-
             proxyHttpToXray(
                 req,
                 res,
@@ -2983,70 +2855,98 @@ async function handleRequest(
             return;
         }
 
-        /*
-         * Subscription
-         */
+
+        // ----------------------------------------------------
+        // Subscription
+        // ----------------------------------------------------
 
         if (
             pathname.startsWith("/sub/")
         ) {
-
             const token =
-                pathname.slice(5);
+                pathname.slice(
+                    "/sub/".length
+                );
 
-            await subscriptionResponse(
-                req,
-                res,
-                token
-            );
+            const user =
+                db.prepare(`
+                    SELECT *
+                    FROM users
+                    WHERE subscription_token = ?
+                      AND status = 'active'
+                `).get(token);
+
+            if (!user) {
+                sendJson(
+                    res,
+                    {
+                        ok: false,
+                        error: "Invalid subscription"
+                    },
+                    404
+                );
+
+                return;
+            }
+
+            const subscription =
+                makeSubscription(
+                    user,
+                    getPublicOrigin(req)
+                );
+
+            res.writeHead(200, {
+                "Content-Type":
+                    "text/plain; charset=utf-8",
+
+                "Cache-Control":
+                    "no-store",
+
+                "Profile-Update-Interval":
+                    "1"
+            });
+
+            res.end(subscription);
 
             return;
         }
 
-        /*
-         * Health
-         */
+
+        // ----------------------------------------------------
+        // Health
+        // ----------------------------------------------------
 
         if (
             pathname === "/health"
         ) {
-
             sendJson(
                 res,
                 {
                     ok: true,
-                    panel: VERSION,
-
+                    version: VERSION,
                     xray:
-                        Boolean(
-                            xrayProcess &&
-                            !xrayProcess.killed
-                        ),
-
-                    transports: [
-                        "xhttp",
-                        "websocket"
-                    ]
+                        Boolean(xrayProcess),
+                    users:
+                        activeUsers().length
                 }
             );
 
             return;
         }
 
-        /*
-         * Login
-         */
+
+        // ----------------------------------------------------
+        // Login GET
+        // ----------------------------------------------------
 
         if (
             pathname === "/login" &&
             req.method === "GET"
         ) {
-
             if (getSession(req)) {
-
                 redirect(
                     res,
-                    "/dashboard"
+                    "/"
                 );
 
                 return;
@@ -3060,35 +2960,44 @@ async function handleRequest(
             return;
         }
 
+
+        // ----------------------------------------------------
+        // Login POST
+        // ----------------------------------------------------
+
         if (
             pathname === "/login" &&
             req.method === "POST"
         ) {
-
             const form =
                 await readForm(req);
 
             const username =
                 String(
                     form.get("username") || ""
-                ).trim();
+                );
 
             const password =
                 String(
                     form.get("password") || ""
                 );
 
-            if (
-                !authenticate(
-                    username,
-                    password
-                )
-            ) {
+            const admin =
+                db.prepare(`
+                    SELECT *
+                    FROM admins
+                    WHERE username = ?
+                `).get(username);
 
+            if (
+                !admin ||
+                hashPassword(password) !==
+                    admin.password_hash
+            ) {
                 sendHtml(
                     res,
                     loginPage(
-                        "نام کاربری یا رمز عبور اشتباه است."
+                        "Invalid username or password."
                     ),
                     401
                 );
@@ -3102,35 +3011,17 @@ async function handleRequest(
             sessions.set(
                 token,
                 {
-                    username,
-                    createdAt:
-                        Date.now()
+                    adminId: admin.id,
+                    username: admin.username
                 }
             );
-
-            /*
-             * اگر ورود با admin/admin باشد،
-             * کاربر را برای تغییر اطلاعات به Settings می‌فرستیم.
-             */
-
-            const admin =
-                getAdmin();
-
-            const isDefaultLogin =
-                admin &&
-                username === "admin" &&
-                password === "admin";
 
             res.writeHead(
                 302,
                 {
-                    Location:
-                        isDefaultLogin
-                            ? "/settings"
-                            : "/dashboard",
-
+                    Location: "/",
                     "Set-Cookie":
-                        `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Secure`
+                        `session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`
                 }
             );
 
@@ -3139,23 +3030,20 @@ async function handleRequest(
             return;
         }
 
-        /*
-         * Logout
-         */
+
+        // ----------------------------------------------------
+        // Logout
+        // ----------------------------------------------------
 
         if (
             pathname === "/logout"
         ) {
-
             const cookies =
                 parseCookies(req);
 
-            if (
-                cookies.vergil_session
-            ) {
-
+            if (cookies.session) {
                 sessions.delete(
-                    cookies.vergil_session
+                    cookies.session
                 );
             }
 
@@ -3163,9 +3051,8 @@ async function handleRequest(
                 302,
                 {
                     Location: "/login",
-
                     "Set-Cookie":
-                        "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
+                        "session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
                 }
             );
 
@@ -3174,9 +3061,10 @@ async function handleRequest(
             return;
         }
 
-        /*
-         * Protected routes
-         */
+
+        // ----------------------------------------------------
+        // Authentication
+        // ----------------------------------------------------
 
         const session =
             requireAuth(
@@ -3188,120 +3076,120 @@ async function handleRequest(
             return;
         }
 
-        /*
-         * Dashboard
-         */
+
+        // ----------------------------------------------------
+        // Dashboard
+        // ----------------------------------------------------
 
         if (
             pathname === "/" ||
             pathname === "/dashboard"
         ) {
-
             sendHtml(
                 res,
-                dashboardPage(req)
+                dashboardPage(
+                    allUsers(),
+                    req
+                )
             );
 
             return;
         }
 
-        /*
-         * Settings
-         */
+
+        // ----------------------------------------------------
+        // Settings GET
+        // ----------------------------------------------------
 
         if (
             pathname === "/settings" &&
             req.method === "GET"
         ) {
-
             sendHtml(
                 res,
-                settingsPage(req)
+                settingsPage()
             );
 
             return;
         }
+
+
+        // ----------------------------------------------------
+        // Settings POST
+        // ----------------------------------------------------
 
         if (
             pathname === "/settings" &&
             req.method === "POST"
         ) {
+            const form =
+                await readForm(req);
 
-            try {
+            const username =
+                String(
+                    form.get("username") || ""
+                ).trim();
 
-                const form =
-                    await readForm(req);
-
-                const username =
-                    String(
-                        form.get("username") || ""
-                    ).trim();
-
-                const password =
-                    String(
-                        form.get("password") || ""
-                    );
-
-                const confirm =
-                    String(
-                        form.get(
-                            "password_confirm"
-                        ) || ""
-                    );
-
-                if (
-                    password &&
-                    password !== confirm
-                ) {
-
-                    throw new Error(
-                        "رمزهای عبور یکسان نیستند."
-                    );
-                }
-
-                updateAdmin(
-                    username,
-                    password
+            const password =
+                String(
+                    form.get("password") || ""
                 );
 
-                /*
-                 * تمام Sessionهای قبلی حذف می‌شوند
-                 * تا با اطلاعات جدید دوباره Login شود.
-                 */
-
-                sessions.clear();
-
-                redirect(
-                    res,
-                    "/login"
-                );
-
-            } catch (error) {
-
+            if (!username) {
                 sendHtml(
                     res,
                     settingsPage(
-                        req,
-                        "",
-                        error?.message ||
-                            "خطا در ذخیره تنظیمات."
-                    ),
-                    400
+                        "Username cannot be empty."
+                    )
+                );
+
+                return;
+            }
+
+            if (password) {
+                db.prepare(`
+                    UPDATE admins
+                    SET username = ?,
+                        password_hash = ?
+                    WHERE id = ?
+                `).run(
+                    username,
+                    hashPassword(password),
+                    session.adminId
+                );
+            } else {
+                db.prepare(`
+                    UPDATE admins
+                    SET username = ?
+                    WHERE id = ?
+                `).run(
+                    username,
+                    session.adminId
                 );
             }
+
+            session.username =
+                username;
+
+            sendHtml(
+                res,
+                settingsPage(
+                    "Settings saved successfully."
+                )
+            );
 
             return;
         }
 
-        /*
-         * New User
-         */
+
+        // ----------------------------------------------------
+        // New user GET
+        // ----------------------------------------------------
 
         if (
             pathname === "/users/new" &&
             req.method === "GET"
         ) {
-
             sendHtml(
                 res,
                 newUserPage()
@@ -3310,54 +3198,55 @@ async function handleRequest(
             return;
         }
 
+
+        // ----------------------------------------------------
+        // New user POST
+        // ----------------------------------------------------
+
         if (
             pathname === "/users/new" &&
             req.method === "POST"
         ) {
+            const form =
+                await readForm(req);
 
             try {
-
-                const form =
-                    await readForm(req);
-
                 const user =
-                    await createUser(
-                        form
-                    );
+                    createUser(form);
 
-                console.log(
-                    `👤 User created: ${user.username}`
-                );
+                await restartXray();
 
                 redirect(
                     res,
                     `/users/config?id=${user.id}`
                 );
-
             } catch (error) {
+                console.error(
+                    "Create user error:",
+                    error
+                );
 
                 sendHtml(
                     res,
                     newUserPage(
-                        error?.message ||
-                        "خطا در ساخت کاربر."
+                        error.message
                     ),
-                    500
+                    400
                 );
             }
 
             return;
         }
 
-        /*
-         * User Config
-         */
+
+        // ----------------------------------------------------
+        // User config
+        // ----------------------------------------------------
 
         if (
             pathname === "/users/config" &&
             req.method === "GET"
         ) {
-
             const id =
                 Number(
                     url.searchParams.get("id")
@@ -3371,32 +3260,9 @@ async function handleRequest(
                 `).get(id);
 
             if (!user) {
-
                 sendHtml(
                     res,
-                    layout(
-                        "404",
-                        `
-<div class="container">
-
-<div class="card">
-
-<h1>
-کاربر پیدا نشد
-</h1>
-
-<a
-    class="btn"
-    href="/dashboard"
->
-داشبورد
-</a>
-
-</div>
-
-</div>
-`
-                    ),
+                    "<h1>User not found</h1>",
                     404
                 );
 
@@ -3406,127 +3272,143 @@ async function handleRequest(
             sendHtml(
                 res,
                 await configPage(
-                    req,
-                    user
+                    user,
+                    req
                 )
             );
 
             return;
         }
 
-        /*
-         * Toggle
-         */
+
+        // ----------------------------------------------------
+        // Toggle user
+        // ----------------------------------------------------
 
         if (
             pathname === "/users/toggle" &&
             req.method === "POST"
         ) {
-
             const form =
                 await readForm(req);
 
-            try {
-
-                await toggleUser(
+            const id =
+                Number(
                     form.get("id")
                 );
 
-            } catch (error) {
+            const user =
+                db.prepare(`
+                    SELECT *
+                    FROM users
+                    WHERE id = ?
+                `).get(id);
 
-                console.error(
-                    error
+            if (user) {
+                const next =
+                    user.status === "active"
+                        ? "disabled"
+                        : "active";
+
+                db.prepare(`
+                    UPDATE users
+                    SET status = ?
+                    WHERE id = ?
+                `).run(
+                    next,
+                    id
                 );
+
+                await restartXray();
             }
 
             redirect(
                 res,
-                "/dashboard"
+                "/"
             );
 
             return;
         }
 
-        /*
-         * Delete
-         */
+
+        // ----------------------------------------------------
+        // Delete user
+        // ----------------------------------------------------
 
         if (
             pathname === "/users/delete" &&
             req.method === "POST"
         ) {
-
             const form =
                 await readForm(req);
 
-            try {
-
-                await deleteUser(
+            const id =
+                Number(
                     form.get("id")
                 );
 
-            } catch (error) {
+            db.prepare(`
+                DELETE FROM users
+                WHERE id = ?
+            `).run(id);
 
-                console.error(
-                    error
-                );
-            }
+            await restartXray();
 
             redirect(
                 res,
-                "/dashboard"
+                "/"
             );
 
             return;
         }
 
+
+        // ----------------------------------------------------
+        // 404
+        // ----------------------------------------------------
+
         sendHtml(
             res,
-            layout(
-                "404",
-                `
-<div class="container">
-
-<div class="card">
-
-<h1>
-404
-</h1>
-
-<p class="muted">
-صفحه مورد نظر پیدا نشد.
-</p>
-
-<a
-    class="btn"
-    href="/dashboard"
->
-بازگشت
+            `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>404</title>
+<style>
+body {
+    background:#030812;
+    color:#38bdf8;
+    font-family:Arial;
+    text-align:center;
+    padding-top:100px;
+}
+</style>
+</head>
+<body>
+<h1>404</h1>
+<p>VergilPanel - Page not found.</p>
+<a href="/" style="color:#38bdf8">
+Dashboard
 </a>
-
-</div>
-
-</div>
-`
-            ),
+</body>
+</html>
+            `,
             404
         );
 
     } catch (error) {
-
         console.error(
-            "Unhandled server error:",
+            "Request error:",
             error
         );
 
         if (!res.headersSent) {
-
             sendJson(
                 res,
                 {
                     ok: false,
-                    error:
-                        "Internal Server Error"
+                    error: error.message
                 },
                 500
             );
@@ -3534,34 +3416,77 @@ async function handleRequest(
     }
 }
 
+
+// ------------------------------------------------------------
+// HTTP server
+// ------------------------------------------------------------
+
 const server =
     http.createServer(
         handleRequest
     );
 
+
+// ------------------------------------------------------------
+// WebSocket upgrade routing
+// ------------------------------------------------------------
+
 server.on(
     "upgrade",
     (req, socket, head) => {
-
         try {
-
-            const url =
+            const pathname =
                 new URL(
                     req.url,
                     `http://${req.headers.host || "localhost"}`
-                );
+                ).pathname;
+
 
             if (
-                url.pathname === WS_PATH ||
-                url.pathname.startsWith(
-                    `${WS_PATH}/`
+                pathname === VLESS_WS_PATH ||
+                pathname.startsWith(
+                    `${VLESS_WS_PATH}/`
                 )
             ) {
-
                 proxyWebSocket(
                     req,
                     socket,
-                    head
+                    head,
+                    XRAY_VLESS_WS_PORT
+                );
+
+                return;
+            }
+
+
+            if (
+                pathname === VMESS_WS_PATH ||
+                pathname.startsWith(
+                    `${VMESS_WS_PATH}/`
+                )
+            ) {
+                proxyWebSocket(
+                    req,
+                    socket,
+                    head,
+                    XRAY_VMESS_WS_PORT
+                );
+
+                return;
+            }
+
+
+            if (
+                pathname === TROJAN_WS_PATH ||
+                pathname.startsWith(
+                    `${TROJAN_WS_PATH}/`
+                )
+            ) {
+                proxyWebSocket(
+                    req,
+                    socket,
+                    head,
+                    XRAY_TROJAN_WS_PORT
                 );
 
                 return;
@@ -3569,12 +3494,37 @@ server.on(
 
             socket.destroy();
 
-        } catch {
+        } catch (error) {
+            console.error(
+                "Upgrade error:",
+                error
+            );
 
-            socket.destroy();
+            try {
+                socket.destroy();
+            } catch {}
         }
     }
 );
+
+
+// ------------------------------------------------------------
+// TCP proxy listener
+// ------------------------------------------------------------
+
+const tcpServer =
+    net.createServer(
+        socket => {
+            proxyTcpToXray(
+                socket
+            );
+        }
+    );
+
+
+// ------------------------------------------------------------
+// Startup
+// ------------------------------------------------------------
 
 ensureDefaultAdmin();
 
@@ -3584,7 +3534,6 @@ server.listen(
     PORT,
     HOST,
     () => {
-
         console.log(
             `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
         );
@@ -3598,21 +3547,73 @@ server.listen(
         );
 
         console.log(
-            `⚔️ Railway TCP Proxy NOT required`
+            `🖤 ${BRAND_2}`
+        );
+
+        console.log(
+            `🌐 HTTP: ${PORT}`
+        );
+
+        console.log(
+            `⚔️ XHTTP: ${XRAY_XHTTP_PORT}`
+        );
+
+        console.log(
+            `⚔️ VLESS WS: ${XRAY_VLESS_WS_PORT}`
+        );
+
+        console.log(
+            `⚔️ VMess WS: ${XRAY_VMESS_WS_PORT}`
+        );
+
+        console.log(
+            `⚔️ Trojan WS: ${XRAY_TROJAN_WS_PORT}`
+        );
+
+        console.log(
+            `⚔️ Shadowsocks TCP: ${XRAY_SS_PORT}`
         );
     }
 );
 
+
+// ------------------------------------------------------------
+// Raw TCP server
+//
+// IMPORTANT:
+// Railway TCP Proxy must point to XRAY_SS_PORT.
+// ------------------------------------------------------------
+
+tcpServer.listen(
+    XRAY_SS_PORT,
+    "0.0.0.0",
+    () => {
+        console.log(
+            `🔌 TCP listener running on 0.0.0.0:${XRAY_SS_PORT}`
+        );
+    }
+);
+
+
+// ------------------------------------------------------------
+// Shutdown
+// ------------------------------------------------------------
+
 async function shutdown(signal) {
-
     console.log(
-        `Received ${signal}`
+        `\n🛑 Received ${signal}. Shutting down...`
     );
-
-    stoppingXray = true;
 
     try {
         await stopXray();
+    } catch {}
+
+    try {
+        server.close();
+    } catch {}
+
+    try {
+        tcpServer.close();
     } catch {}
 
     try {
