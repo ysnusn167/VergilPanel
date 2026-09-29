@@ -12,42 +12,26 @@ const HOST = "0.0.0.0";
 const DATA_DIR = process.env.DATA_DIR || "/app/data";
 const DB_PATH = `${DATA_DIR}/vergilpanel.db`;
 
-const XRAY_BIN = process.env.XRAY_BIN || "/opt/xray/xray";
-const XRAY_CONFIG = process.env.XRAY_CONFIG || "/app/xray/generated-config.json";
+const XRAY_BIN =
+    process.env.XRAY_BIN || "/opt/xray/xray";
 
-const XRAY_XHTTP_PORT = Number(process.env.XRAY_XHTTP_PORT || 10001);
-const XRAY_WS_PORT = Number(process.env.XRAY_WS_PORT || 10002);
+const XRAY_CONFIG =
+    process.env.XRAY_CONFIG ||
+    "/app/xray/generated-config.json";
 
-const XHTTP_PATH = process.env.XHTTP_PATH || "/xhttp";
-const WS_PATH = process.env.WS_PATH || "/ws";
+const XRAY_XHTTP_PORT =
+    Number(process.env.XRAY_XHTTP_PORT || 10001);
 
-const VERSION = "0.8.1-fixed-paths";
+const XRAY_WS_PORT =
+    Number(process.env.XRAY_WS_PORT || 10002);
 
-/*
- * ============================================================
- * PUBLIC PATHS
- * ============================================================
- *
- * هر کاربر به صورت خودکار:
- * - یک مسیر XHTTP
- * - یک مسیر WebSocket
- *
- * دریافت می‌کند.
- *
- * مسیرها ثابت هستند و رندوم 16 کاراکتری نیستند.
- */
+const XHTTP_PATH =
+    process.env.XHTTP_PATH || "/xhttp";
 
-const XHTTP_PATHS = [
-  "/xhttp-cdn",
-  "/xhttp-sni",
-  "/xhttp-game"
-];
+const WS_PATH =
+    process.env.WS_PATH || "/ws";
 
-const WS_PATHS = [
-  "/ws-cdn",
-  "/ws-sni",
-  "/ws-game"
-];
+const VERSION = "0.8.0";
 
 let xrayProcess = null;
 let stoppingXray = false;
@@ -62,570 +46,466 @@ const db = new Database(DB_PATH);
 
 db.pragma("journal_mode = WAL");
 
-/*
- * ============================================================
- * DATABASE
- * ============================================================
- */
-
 db.exec(`
 CREATE TABLE IF NOT EXISTS admins (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- username TEXT UNIQUE NOT NULL,
- password_hash TEXT NOT NULL,
- created_at TEXT NOT NULL
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS users (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- username TEXT UNIQUE NOT NULL,
- uuid TEXT UNIQUE NOT NULL,
- protocol TEXT NOT NULL DEFAULT 'vless',
- traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
- traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
- expires_at TEXT,
- status TEXT NOT NULL DEFAULT 'active',
- subscription_token TEXT UNIQUE,
- created_at TEXT NOT NULL
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    uuid TEXT UNIQUE NOT NULL,
+    protocol TEXT NOT NULL DEFAULT 'vless',
+    traffic_limit_bytes INTEGER NOT NULL DEFAULT 0,
+    traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    subscription_token TEXT UNIQUE,
+    created_at TEXT NOT NULL
 );
 `);
 
-function addColumnIfMissing(name, type) {
-  const cols = db.prepare("PRAGMA table_info(users)").all();
-
-  if (!cols.some(c => c.name === name)) {
-    db.exec(`ALTER TABLE users ADD COLUMN ${name} ${type}`);
-  }
-}
-
-addColumnIfMissing("xhttp_path", "TEXT");
-addColumnIfMissing("ws_path", "TEXT");
-
-/*
- * ============================================================
- * HELPERS
- * ============================================================
- */
-
-const randomChoice = arr => arr[crypto.randomInt(arr.length)];
-
 function hashPassword(password) {
-  return crypto
-    .createHash("sha256")
-    .update(String(password))
-    .digest("hex");
+    return crypto
+        .createHash("sha256")
+        .update(String(password))
+        .digest("hex");
 }
 
 function randomToken(bytes = 32) {
-  return crypto.randomBytes(bytes).toString("hex");
+    return crypto.randomBytes(bytes).toString("hex");
 }
 
 function nowIso() {
-  return new Date().toISOString();
+    return new Date().toISOString();
 }
 
 function escapeHtml(value = "") {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
 }
 
 function parseCookies(req) {
-  const out = {};
+    const header = req.headers.cookie || "";
+    const result = {};
 
-  for (const part of String(req.headers.cookie || "").split(";")) {
-    const i = part.indexOf("=");
+    for (const part of header.split(";")) {
+        const index = part.indexOf("=");
 
-    if (i < 0) continue;
+        if (index === -1) continue;
 
-    const k = part.slice(0, i).trim();
-    const v = part.slice(i + 1).trim();
+        const key = part.slice(0, index).trim();
+        const value = part.slice(index + 1).trim();
 
-    try {
-      out[k] = decodeURIComponent(v);
-    } catch {
-      out[k] = v;
+        try {
+            result[key] = decodeURIComponent(value);
+        } catch {
+            result[key] = value;
+        }
     }
-  }
 
-  return out;
+    return result;
 }
 
 function getSession(req) {
-  const cookies = parseCookies(req);
+    const cookies = parseCookies(req);
 
-  if (!cookies.vergil_session) {
-    return null;
-  }
+    if (!cookies.vergil_session) {
+        return null;
+    }
 
-  return sessions.get(cookies.vergil_session) || null;
+    return sessions.get(cookies.vergil_session) || null;
 }
 
 function redirect(res, location) {
-  res.writeHead(302, {
-    Location: location,
-    "Cache-Control": "no-store"
-  });
+    res.writeHead(302, {
+        Location: location,
+        "Cache-Control": "no-store"
+    });
 
-  res.end();
+    res.end();
 }
 
 function sendHtml(res, html, status = 200) {
-  res.writeHead(status, {
-    "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store"
-  });
+    res.writeHead(status, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store"
+    });
 
-  res.end(html);
+    res.end(html);
 }
 
 function sendJson(res, data, status = 200) {
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
-  });
+    res.writeHead(status, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store"
+    });
 
-  res.end(JSON.stringify(data));
+    res.end(JSON.stringify(data));
 }
 
 async function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
+    return new Promise((resolve, reject) => {
+        let body = "";
 
-    req.on("data", chunk => {
-      body += chunk;
+        req.on("data", chunk => {
+            body += chunk;
 
-      if (body.length > 1024 * 1024) {
-        reject(new Error("Request body too large"));
-        req.destroy();
-      }
+            if (body.length > 1024 * 1024) {
+                reject(new Error("Request body too large"));
+                req.destroy();
+            }
+        });
+
+        req.on("end", () => resolve(body));
+        req.on("error", reject);
     });
-
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
 }
 
 async function readForm(req) {
-  return new URLSearchParams(await readBody(req));
+    return new URLSearchParams(
+        await readBody(req)
+    );
 }
 
 function requireAuth(req, res) {
-  const session = getSession(req);
+    const session = getSession(req);
 
-  if (!session) {
-    redirect(res, "/login");
-    return null;
-  }
+    if (!session) {
+        redirect(res, "/login");
+        return null;
+    }
 
-  return session;
+    return session;
 }
 
 function getPublicHost(req) {
-  return String(
-    req.headers["x-forwarded-host"] ||
-    process.env.RAILWAY_PUBLIC_DOMAIN ||
-    req.headers.host ||
-    "localhost:8080"
-  )
-    .split(",")[0]
-    .trim();
+    const forwarded =
+        req.headers["x-forwarded-host"];
+
+    const host =
+        forwarded ||
+        process.env.RAILWAY_PUBLIC_DOMAIN ||
+        req.headers.host ||
+        "localhost:8080";
+
+    return String(host)
+        .split(",")[0]
+        .trim();
 }
 
 function getPublicOrigin(req) {
-  const host = getPublicHost(req);
+    const host = getPublicHost(req);
 
-  if (
-    host.startsWith("localhost") ||
-    host.startsWith("127.0.0.1") ||
-    host.includes(":8080")
-  ) {
-    return `http://${host}`;
-  }
+    if (
+        host.startsWith("localhost") ||
+        host.startsWith("127.0.0.1") ||
+        host.includes(":8080")
+    ) {
+        return `http://${host}`;
+    }
 
-  return `https://${host}`;
+    return `https://${host}`;
 }
 
 function activeUsers() {
-  return db
-    .prepare(`
-      SELECT *
-      FROM users
-      WHERE status='active'
-      AND (
-        expires_at IS NULL
-        OR expires_at=''
-        OR expires_at>?
-      )
-      ORDER BY id DESC
-    `)
-    .all(nowIso());
+    return db.prepare(`
+        SELECT *
+        FROM users
+        WHERE status = 'active'
+        AND (
+            expires_at IS NULL
+            OR expires_at = ''
+            OR expires_at > ?
+        )
+        ORDER BY id DESC
+    `).all(nowIso());
 }
 
 function allUsers() {
-  return db
-    .prepare("SELECT * FROM users ORDER BY id DESC")
-    .all();
+    return db.prepare(`
+        SELECT *
+        FROM users
+        ORDER BY id DESC
+    `).all();
 }
 
 function getAdmin() {
-  return db
-    .prepare("SELECT * FROM admins ORDER BY id ASC LIMIT 1")
-    .get();
+    return db.prepare(`
+        SELECT *
+        FROM admins
+        ORDER BY id ASC
+        LIMIT 1
+    `).get();
 }
-
-/*
- * ============================================================
- * USER PATH ASSIGNMENT
- * ============================================================
- */
-
-function ensureUserPaths(user) {
-  let xhttpPath = user.xhttp_path;
-  let wsPath = user.ws_path;
-
-  if (!XHTTP_PATHS.includes(xhttpPath)) {
-    xhttpPath = randomChoice(XHTTP_PATHS);
-  }
-
-  if (!WS_PATHS.includes(wsPath)) {
-    wsPath = randomChoice(WS_PATHS);
-  }
-
-  if (
-    xhttpPath !== user.xhttp_path ||
-    wsPath !== user.ws_path
-  ) {
-    db
-      .prepare(
-        "UPDATE users SET xhttp_path=?, ws_path=? WHERE id=?"
-      )
-      .run(
-        xhttpPath,
-        wsPath,
-        user.id
-      );
-  }
-
-  return {
-    ...user,
-    xhttp_path: xhttpPath,
-    ws_path: wsPath
-  };
-}
-
-function ensureAllUserPaths() {
-  const users = db
-    .prepare("SELECT * FROM users")
-    .all();
-
-  for (const user of users) {
-    ensureUserPaths(user);
-  }
-}
-
-/*
- * ============================================================
- * XRAY CONFIG
- * ============================================================
- */
 
 function generateXrayConfig() {
-  const clients = activeUsers().map(user => ({
-    id: user.uuid,
-    email: user.username
-  }));
+    const clients = activeUsers().map(user => ({
+        id: user.uuid,
+        email: user.username
+    }));
 
-  return {
-    log: {
-      loglevel: "warning"
-    },
-
-    inbounds: [
-      {
-        listen: "127.0.0.1",
-        port: XRAY_XHTTP_PORT,
-
-        protocol: "vless",
-
-        settings: {
-          clients,
-          decryption: "none"
+    return {
+        log: {
+            loglevel: "warning"
         },
 
-        streamSettings: {
-          network: "xhttp",
-          security: "none",
+        inbounds: [
+            {
+                listen: "127.0.0.1",
+                port: XRAY_XHTTP_PORT,
+                protocol: "vless",
 
-          xhttpSettings: {
-            path: XHTTP_PATH,
-            mode: "auto"
-          }
-        }
-      },
+                settings: {
+                    clients,
+                    decryption: "none"
+                },
 
-      {
-        listen: "127.0.0.1",
-        port: XRAY_WS_PORT,
+                streamSettings: {
+                    network: "xhttp",
+                    security: "none",
 
-        protocol: "vless",
+                    xhttpSettings: {
+                        path: XHTTP_PATH,
+                        mode: "auto"
+                    }
+                }
+            },
 
-        settings: {
-          clients,
-          decryption: "none"
-        },
+            {
+                listen: "127.0.0.1",
+                port: XRAY_WS_PORT,
+                protocol: "vless",
 
-        streamSettings: {
-          network: "websocket",
-          security: "none",
+                settings: {
+                    clients,
+                    decryption: "none"
+                },
 
-          wsSettings: {
-            path: WS_PATH
-          }
-        }
-      }
-    ],
+                streamSettings: {
+                    network: "websocket",
+                    security: "none",
 
-    outbounds: [
-      {
-        protocol: "freedom"
-      }
-    ]
-  };
+                    wsSettings: {
+                        path: WS_PATH
+                    }
+                }
+            }
+        ],
+
+        outbounds: [
+            {
+                protocol: "freedom"
+            }
+        ]
+    };
 }
 
 async function writeXrayConfig() {
-  const config = generateXrayConfig();
+    const config = generateXrayConfig();
 
-  await fs.writeFile(
-    XRAY_CONFIG,
-    JSON.stringify(config, null, 2),
-    "utf8"
-  );
+    await fs.writeFile(
+        XRAY_CONFIG,
+        JSON.stringify(config, null, 2),
+        "utf8"
+    );
 
-  console.log(
-    `⚙️ Xray config synced: ${activeUsers().length} active user(s)`
-  );
+    console.log(
+        `⚙️ Xray config synced: ${activeUsers().length} active user(s)`
+    );
 }
 
 function stopXray() {
-  return new Promise(resolve => {
-    if (!xrayProcess) {
-      return resolve();
-    }
+    return new Promise(resolve => {
+        if (!xrayProcess) {
+            resolve();
+            return;
+        }
 
-    const process = xrayProcess;
+        const processToStop = xrayProcess;
+        xrayProcess = null;
 
-    xrayProcess = null;
+        const timer = setTimeout(() => {
+            try {
+                processToStop.kill("SIGKILL");
+            } catch {}
 
-    const timeout = setTimeout(() => {
-      try {
-        process.kill("SIGKILL");
-      } catch {}
+            resolve();
+        }, 3000);
 
-      resolve();
-    }, 3000);
+        processToStop.once("exit", () => {
+            clearTimeout(timer);
+            resolve();
+        });
 
-    process.once("exit", () => {
-      clearTimeout(timeout);
-      resolve();
+        try {
+            processToStop.kill("SIGTERM");
+        } catch {
+            clearTimeout(timer);
+            resolve();
+        }
     });
-
-    try {
-      process.kill("SIGTERM");
-    } catch {
-      clearTimeout(timeout);
-      resolve();
-    }
-  });
 }
 
 async function startXray() {
-  await writeXrayConfig();
+    await writeXrayConfig();
 
-  console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
+    console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
 
-  xrayProcess = spawn(
-    XRAY_BIN,
-    [
-      "run",
-      "-config",
-      XRAY_CONFIG
-    ],
-    {
-      stdio: [
-        "ignore",
-        "pipe",
-        "pipe"
-      ]
-    }
-  );
-
-  xrayProcess.stdout.on("data", data => {
-    process.stdout.write(`[XRAY] ${data}`);
-  });
-
-  xrayProcess.stderr.on("data", data => {
-    process.stderr.write(`[XRAY] ${data}`);
-  });
-
-  xrayProcess.on("error", error => {
-    console.error(
-      "❌ Xray process error:",
-      error
+    xrayProcess = spawn(
+        XRAY_BIN,
+        [
+            "run",
+            "-config",
+            XRAY_CONFIG
+        ],
+        {
+            stdio: ["ignore", "pipe", "pipe"]
+        }
     );
-  });
 
-  xrayProcess.on(
-    "exit",
-    (code, signal) => {
-      console.log(
-        `⚠️ Xray exited. code=${code} signal=${signal}`
-      );
+    xrayProcess.stdout.on("data", data => {
+        process.stdout.write(`[XRAY] ${data}`);
+    });
 
-      xrayProcess = null;
+    xrayProcess.stderr.on("data", data => {
+        process.stderr.write(`[XRAY] ${data}`);
+    });
 
-      if (
-        !stoppingXray &&
-        !xrayRestarting
-      ) {
-        setTimeout(
-          () =>
-            startXray().catch(
-              error =>
-                console.error(
-                  "❌ Xray restart failed:",
-                  error
-                )
-            ),
-          1500
+    xrayProcess.on("error", error => {
+        console.error(
+            "❌ Xray process error:",
+            error
         );
-      }
-    }
-  );
+    });
+
+    xrayProcess.on("exit", (code, signal) => {
+        console.log(
+            `⚠️ Xray exited. code=${code} signal=${signal}`
+        );
+
+        xrayProcess = null;
+
+        if (
+            !stoppingXray &&
+            !xrayRestarting
+        ) {
+            setTimeout(() => {
+                startXray().catch(error => {
+                    console.error(
+                        "❌ Xray restart failed:",
+                        error
+                    );
+                });
+            }, 1500);
+        }
+    });
 }
 
 async function restartXray() {
-  if (xrayRestarting) {
-    return;
-  }
+    if (xrayRestarting) return;
 
-  xrayRestarting = true;
+    xrayRestarting = true;
 
-  try {
-    await stopXray();
-    await startXray();
-  } finally {
-    xrayRestarting = false;
-  }
+    try {
+        await stopXray();
+        await startXray();
+    } finally {
+        xrayRestarting = false;
+    }
 }
-
-/*
- * ============================================================
- * VLESS LINKS
- * ============================================================
- */
 
 function makeVlessLinks(user, origin) {
-  user = ensureUserPaths(user);
+    const domain =
+        new URL(origin).hostname;
 
-  const domain = new URL(origin).hostname;
+    const xhttpParams =
+        new URLSearchParams({
+            encryption: "none",
+            security: "tls",
+            type: "xhttp",
+            path: XHTTP_PATH,
+            host: domain,
+            mode: "auto"
+        });
 
-  const xhttpParams = new URLSearchParams({
-    encryption: "none",
-    security: "tls",
-    type: "xhttp",
-    path: user.xhttp_path,
-    host: domain,
-    mode: "auto"
-  });
+    const wsParams =
+        new URLSearchParams({
+            encryption: "none",
+            security: "tls",
+            type: "ws",
+            path: WS_PATH,
+            host: domain
+        });
 
-  const wsParams = new URLSearchParams({
-    encryption: "none",
-    security: "tls",
-    type: "ws",
-    path: user.ws_path,
-    host: domain
-  });
+    return {
+        xhttp:
+            `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(user.username)}-XHTTP`,
 
-  return {
-    xhttp:
-      `vless://${user.uuid}@${domain}:443?` +
-      `${xhttpParams.toString()}#` +
-      `${encodeURIComponent(user.username)}-XHTTP`,
-
-    websocket:
-      `vless://${user.uuid}@${domain}:443?` +
-      `${wsParams.toString()}#` +
-      `${encodeURIComponent(user.username)}-WS`
-  };
+        websocket:
+            `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(user.username)}-WS`
+    };
 }
 
 /*
- * ============================================================
- * DUMMY CONFIG
- * ============================================================
+ * Dummy configuration
+ *
+ * این کانفیگ عمداً کار نمی‌کند.
+ * فقط برای نمایش پیام مالک/برند داخل Subscription است.
  */
 
 function makeDummyConfig() {
-  return (
-    "vless://00000000-0000-0000-0000-000000000000" +
-    "@0.0.0.0:443" +
-    "?encryption=none&security=none&type=tcp#" +
-    encodeURIComponent(
-      "ساخته شده توسط یاسین - پنل کاملاً رایگان و غیرقابل فروش است"
-    )
-  );
+    const params =
+        new URLSearchParams({
+            encryption: "none",
+            security: "none",
+            type: "tcp"
+        });
+
+    return (
+        `vless://00000000-0000-0000-0000-000000000000@0.0.0.0:443?${params.toString()}#${encodeURIComponent(
+            "ساخته شده توسط یاسین - کاملا رایگان و غیرقابل فروش"
+        )}`
+    );
 }
 
-/*
- * ============================================================
- * SUBSCRIPTION
- * ============================================================
- */
-
 function makeSubscription(user, origin) {
-  const links = makeVlessLinks(
-    user,
-    origin
-  );
+    const links =
+        makeVlessLinks(
+            user,
+            origin
+        );
 
-  const lines = [
-    links.xhttp,
-    links.websocket,
-    makeDummyConfig()
-  ];
+    const dummy =
+        makeDummyConfig();
 
-  return Buffer
-    .from(
-      lines.join("\n"),
-      "utf8"
-    )
-    .toString("base64");
+    return Buffer.from(
+        [
+            links.xhttp,
+            links.websocket,
+            dummy
+        ].join("\n"),
+        "utf8"
+    ).toString("base64");
 }
 
 async function qrCode(text) {
-  return QRCode.toDataURL(
-    text,
-    {
-      width: 260,
-      margin: 2,
-      errorCorrectionLevel: "M"
-    }
-  );
+    return QRCode.toDataURL(text, {
+        width: 260,
+        margin: 2,
+        errorCorrectionLevel: "M"
+    });
 }
 
-/*
- * ============================================================
- * HTML LAYOUT
- * ============================================================
- */
-
 function layout(title, body) {
-  return `
+    return `
 <!doctype html>
 
 <html lang="fa" dir="rtl">
@@ -635,8 +515,8 @@ function layout(title, body) {
 <meta charset="utf-8">
 
 <meta
-  name="viewport"
-  content="width=device-width,initial-scale=1"
+    name="viewport"
+    content="width=device-width,initial-scale=1"
 >
 
 <title>
@@ -646,363 +526,877 @@ ${escapeHtml(title)} — VergilPanel
 <style>
 
 :root{
-  --bg:#03070d;
-  --card:rgba(10,22,36,.82);
-  --border:rgba(100,210,255,.16);
-  --text:#eefaff;
-  --muted:#7895a8;
-  --blue:#38cfff;
-  --cyan:#79e7ff;
-  --green:#38e39a;
-  --red:#ff5d73;
+    --bg:#03070d;
+    --bg2:#07111d;
+    --card:rgba(10,22,36,.78);
+    --card2:rgba(12,30,48,.9);
+    --border:rgba(100,210,255,.16);
+
+    --text:#eefaff;
+    --muted:#7895a8;
+
+    --blue:#38cfff;
+    --cyan:#79e7ff;
+    --deep:#075b83;
+
+    --green:#38e39a;
+    --red:#ff5d73;
+
+    --shadow:
+        0 20px 70px rgba(0,0,0,.45);
 }
 
 *{
-  box-sizing:border-box;
+    box-sizing:border-box;
+}
+
+html{
+    scroll-behavior:smooth;
 }
 
 body{
-  margin:0;
-  color:var(--text);
-  font-family:Tahoma,Arial,sans-serif;
+    margin:0;
 
-  background:
-    radial-gradient(
-      circle at 80% 5%,
-      rgba(35,198,255,.16),
-      transparent 28%
-    ),
-    linear-gradient(
-      135deg,
-      #02050a,
-      #06111d 50%,
-      #02070d
-    );
+    color:var(--text);
 
-  min-height:100vh;
+    font-family:
+        Vazirmatn,
+        Tahoma,
+        Arial,
+        sans-serif;
+
+    background:
+        radial-gradient(
+            circle at 80% 5%,
+            rgba(35,198,255,.16),
+            transparent 28%
+        ),
+        radial-gradient(
+            circle at 10% 90%,
+            rgba(0,94,145,.16),
+            transparent 30%
+        ),
+        linear-gradient(
+            135deg,
+            #02050a,
+            #06111d 50%,
+            #02070d
+        );
+
+    min-height:100vh;
+}
+
+body::before{
+    content:"";
+
+    position:fixed;
+
+    inset:0;
+
+    pointer-events:none;
+
+    background:
+        linear-gradient(
+            120deg,
+            transparent 30%,
+            rgba(92,221,255,.025),
+            transparent 70%
+        );
+
+    z-index:-1;
 }
 
 a{
-  color:inherit;
-  text-decoration:none;
+    color:inherit;
+    text-decoration:none;
 }
 
 .container{
-  width:min(1250px,100%);
-  margin:auto;
-  padding:24px;
+    width:min(1250px,100%);
+    margin:auto;
+    padding:24px;
 }
 
 .nav{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:15px;
-  margin-bottom:24px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:15px;
+    margin-bottom:24px;
 }
 
 .brand{
-  font-size:23px;
-  font-weight:1000;
+    display:flex;
+    align-items:center;
+    gap:10px;
+
+    font-size:23px;
+    font-weight:1000;
+
+    letter-spacing:-1px;
 }
 
-.brand span,
-.hero-title{
-  color:var(--cyan);
+.brand-icon{
+    width:39px;
+    height:39px;
+
+    display:grid;
+    place-items:center;
+
+    border-radius:12px;
+
+    background:
+        linear-gradient(
+            145deg,
+            rgba(111,227,255,.22),
+            rgba(0,92,145,.18)
+        );
+
+    border:1px solid
+        rgba(94,218,255,.25);
+
+    box-shadow:
+        0 0 30px
+        rgba(39,201,255,.15);
 }
 
-.nav-right,
-.actions{
-  display:flex;
-  align-items:center;
-  gap:8px;
+.brand span{
+    color:var(--cyan);
+
+    text-shadow:
+        0 0 25px
+        rgba(64,210,255,.45);
+}
+
+.nav-right{
+    display:flex;
+    align-items:center;
+    gap:9px;
 }
 
 .btn{
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
 
-  border:1px solid var(--border);
+    border:1px solid var(--border);
 
-  background:
-    rgba(12,28,44,.8);
+    background:
+        rgba(12,28,44,.8);
 
-  color:var(--text);
+    color:var(--text);
 
-  padding:10px 15px;
-  border-radius:11px;
+    padding:10px 15px;
 
-  cursor:pointer;
-  font-size:13px;
+    border-radius:11px;
+
+    cursor:pointer;
+
+    font-size:13px;
+
+    transition:
+        .2s ease;
+
+    box-shadow:
+        inset 0 1px
+        rgba(255,255,255,.03);
+}
+
+.btn:hover{
+    transform:translateY(-2px);
+
+    border-color:
+        rgba(91,221,255,.45);
+
+    box-shadow:
+        0 8px 25px
+        rgba(0,150,210,.12);
 }
 
 .btn.primary{
-  color:#001018;
+    color:#001018;
 
-  background:
-    linear-gradient(
-      135deg,
-      var(--cyan),
-      var(--blue)
-    );
+    background:
+        linear-gradient(
+            135deg,
+            var(--cyan),
+            var(--blue)
+        );
 
-  font-weight:900;
+    border-color:var(--blue);
+
+    font-weight:900;
+
+    box-shadow:
+        0 0 25px
+        rgba(54,207,255,.2);
 }
 
 .btn.danger{
-  color:#ff9aa8;
-  background:rgba(91,18,32,.45);
+    background:
+        rgba(91,18,32,.45);
+
+    border-color:
+        rgba(255,75,100,.25);
+
+    color:#ff9aa8;
 }
 
 .grid{
-  display:grid;
-  grid-template-columns:
-    repeat(4,1fr);
+    display:grid;
 
-  gap:15px;
+    grid-template-columns:
+        repeat(4,1fr);
+
+    gap:15px;
 }
 
-.card,
+.card{
+    background:
+        linear-gradient(
+            145deg,
+            rgba(27,68,94,.15),
+            rgba(5,13,22,.82)
+        );
+
+    border:1px solid var(--border);
+
+    border-radius:19px;
+
+    padding:20px;
+
+    box-shadow:var(--shadow);
+
+    backdrop-filter:
+        blur(16px);
+}
+
+.stat-label{
+    color:var(--muted);
+    font-size:12px;
+}
+
+.stat-value{
+    font-size:30px;
+    font-weight:1000;
+    margin-top:7px;
+
+    direction:ltr;
+    text-align:right;
+}
+
 .hero{
-  background:
-    linear-gradient(
-      145deg,
-      rgba(27,68,94,.15),
-      rgba(5,13,22,.88)
-    );
+    position:relative;
 
-  border:1px solid var(--border);
+    min-height:350px;
 
-  border-radius:18px;
+    overflow:hidden;
 
-  padding:20px;
+    border-radius:25px;
 
-  box-shadow:
-    0 20px 60px
-    rgba(0,0,0,.25);
+    border:1px solid
+        rgba(94,218,255,.2);
+
+    margin-bottom:20px;
+
+    background:
+        radial-gradient(
+            circle at 80% 55%,
+            rgba(47,210,255,.22),
+            transparent 23%
+        ),
+        linear-gradient(
+            110deg,
+            #02060b,
+            #071522 55%,
+            #02070d
+        );
+
+    box-shadow:
+        0 30px 100px
+        rgba(0,0,0,.5),
+        inset 0 0 100px
+        rgba(45,195,255,.04);
 }
 
-.hero{
-  margin-bottom:18px;
+.hero::after{
+    content:"";
+
+    position:absolute;
+
+    right:-10%;
+    bottom:-65%;
+
+    width:70%;
+    height:120%;
+
+    background:
+        radial-gradient(
+            ellipse,
+            rgba(61,220,255,.24),
+            transparent 62%
+        );
+
+    filter:blur(25px);
+
+    transform:
+        rotate(-15deg);
+
+    pointer-events:none;
 }
 
-h1,
-h2,
-h3{
-  margin-top:0;
+.hero-content{
+    position:relative;
+
+    z-index:3;
+
+    padding:46px;
+
+    max-width:650px;
+
+    text-align:right;
 }
 
-.muted{
-  color:var(--muted);
+.hero-kicker{
+    color:var(--cyan);
+
+    font-size:12px;
+
+    letter-spacing:4px;
+
+    font-weight:900;
+
+    margin-bottom:12px;
+
+    direction:ltr;
+    text-align:right;
 }
 
-.stat{
-  font-size:28px;
-  font-weight:1000;
+.hero-title{
+    direction:ltr;
+    text-align:left;
+
+    font-size:
+        clamp(42px,7vw,75px);
+
+    line-height:.95;
+
+    font-weight:1000;
+
+    letter-spacing:-5px;
+
+    background:
+        linear-gradient(
+            120deg,
+            #ffffff,
+            #8eeeff 50%,
+            #28bce9
+        );
+
+    -webkit-background-clip:text;
+    background-clip:text;
+
+    color:transparent;
+
+    filter:
+        drop-shadow(
+            0 0 25px
+            rgba(58,210,255,.25)
+        );
+}
+
+.hero-sub{
+    margin-top:18px;
+
+    color:#a5c0ce;
+
+    font-size:15px;
+
+    max-width:500px;
+}
+
+.powered{
+    margin-top:20px;
+
+    font-size:11px;
+
+    letter-spacing:3px;
+
+    color:
+        rgba(136,226,255,.7);
+
+    direction:ltr;
+    text-align:left;
+}
+
+.flame{
+    position:absolute;
+
+    right:2%;
+    bottom:-20%;
+
+    width:54%;
+    height:125%;
+
+    opacity:.8;
+
+    transform:
+        rotate(-18deg);
+
+    background:
+        radial-gradient(
+            ellipse at 50% 75%,
+            rgba(42,218,255,.55),
+            rgba(13,124,177,.22) 32%,
+            transparent 67%
+        );
+
+    filter:
+        blur(9px);
+
+    mix-blend-mode:
+        screen;
+}
+
+.sword{
+    position:absolute;
+
+    right:15%;
+    top:-10%;
+
+    width:5px;
+    height:125%;
+
+    transform:
+        rotate(22deg);
+
+    background:
+        linear-gradient(
+            180deg,
+            transparent,
+            #d8faff 25%,
+            #4edaff 55%,
+            transparent
+        );
+
+    box-shadow:
+        0 0 30px
+        rgba(63,218,255,.75);
+
+    opacity:.7;
+}
+
+.status{
+    display:inline-flex;
+
+    align-items:center;
+
+    padding:7px 11px;
+
+    border-radius:999px;
+
+    background:
+        rgba(11,30,43,.8);
+
+    border:1px solid
+        rgba(85,220,255,.14);
+
+    font-size:12px;
+
+    margin-top:20px;
+}
+
+.status-dot{
+    width:8px;
+    height:8px;
+
+    border-radius:50%;
+
+    background:var(--red);
+
+    margin-left:7px;
+}
+
+.status-dot.online{
+    background:var(--green);
+
+    box-shadow:
+        0 0 14px
+        var(--green);
+}
+
+.table-wrap{
+    overflow:auto;
+
+    margin-top:18px;
 }
 
 table{
-  width:100%;
-  border-collapse:collapse;
+    width:100%;
+
+    border-collapse:
+        collapse;
 }
 
 th,
 td{
-  padding:13px 10px;
-  border-bottom:
-    1px solid
-    rgba(255,255,255,.06);
+    padding:14px 12px;
 
-  text-align:right;
+    text-align:right;
+
+    border-bottom:
+        1px solid
+        rgba(120,190,220,.09);
+
+    white-space:nowrap;
+}
+
+th{
+    color:var(--muted);
+
+    font-size:11px;
+}
+
+.badge{
+    display:inline-flex;
+
+    align-items:center;
+
+    padding:5px 9px;
+
+    border-radius:999px;
+
+    background:
+        rgba(110,150,175,.09);
+
+    border:1px solid
+        rgba(130,190,215,.08);
+
+    font-size:11px;
+}
+
+.badge.green{
+    color:#6ff0ae;
+
+    background:
+        rgba(26,100,68,.2);
+
+    border-color:
+        rgba(64,221,142,.14);
+}
+
+.badge.red{
+    color:#ff8999;
+
+    background:
+        rgba(112,24,40,.2);
+}
+
+.actions{
+    display:flex;
+    gap:7px;
+}
+
+h1{
+    margin:0 0 8px;
+
+    font-size:28px;
+}
+
+h2{
+    font-size:19px;
+}
+
+h3{
+    font-size:15px;
+}
+
+.muted{
+    color:var(--muted);
+}
+
+.small{
+    font-size:11px;
+}
+
+.form{
+    max-width:600px;
+    margin:auto;
+}
+
+label{
+    display:block;
+
+    margin:
+        17px 0 7px;
+
+    color:#9ab7c7;
+
+    font-size:12px;
 }
 
 input,
 select{
-  width:100%;
+    width:100%;
 
-  background:#07131f;
+    padding:13px 14px;
 
-  border:
-    1px solid
-    rgba(110,210,255,.18);
+    background:
+        rgba(2,9,15,.75);
 
-  color:white;
+    color:var(--text);
 
-  padding:12px;
+    border:
+        1px solid
+        rgba(100,200,235,.13);
 
-  border-radius:10px;
+    border-radius:11px;
 
-  outline:none;
+    outline:none;
+
+    font-family:inherit;
 }
 
-label{
-  display:block;
-  margin-bottom:7px;
-  color:#9bb3c2;
-  font-size:13px;
-}
+input:focus,
+select:focus{
+    border-color:
+        rgba(65,211,255,.55);
 
-.form-grid{
-  display:grid;
-  grid-template-columns:
-    repeat(2,1fr);
-
-  gap:15px;
-}
-
-.full{
-  grid-column:1/-1;
+    box-shadow:
+        0 0 0 3px
+        rgba(50,200,255,.07);
 }
 
 .notice{
-  padding:14px;
+    padding:15px;
 
-  border:
-    1px solid
-    rgba(88,213,255,.15);
+    border-radius:13px;
 
-  background:
-    rgba(15,42,58,.35);
+    background:
+        rgba(18,49,67,.35);
 
-  border-radius:13px;
+    border:
+        1px solid
+        rgba(73,208,255,.13);
 
-  margin:15px 0;
+    margin:
+        15px 0;
 }
 
-.config{
-  direction:ltr;
-  text-align:left;
+pre.config{
+    white-space:pre-wrap;
 
-  white-space:pre-wrap;
-  word-break:break-all;
+    word-break:break-all;
 
-  background:#02060a;
+    direction:ltr;
 
-  border:
-    1px solid
-    rgba(255,255,255,.06);
+    text-align:left;
 
-  padding:14px;
+    background:
+        rgba(1,7,12,.8);
 
-  border-radius:12px;
+    border:
+        1px solid
+        rgba(94,218,255,.1);
 
-  color:#9deaff;
+    padding:14px;
 
-  font-family:
-    ui-monospace,
-    SFMono-Regular,
-    Menlo,
-    monospace;
+    border-radius:11px;
 
-  font-size:12px;
+    font-size:11px;
+
+    line-height:1.7;
 }
 
 .qr-grid{
-  display:grid;
-  grid-template-columns:
-    repeat(2,1fr);
+    display:grid;
 
-  gap:15px;
+    grid-template-columns:
+        repeat(2,1fr);
+
+    gap:18px;
+
+    margin-top:18px;
 }
 
 .qr-card{
-  text-align:center;
+    text-align:center;
 
-  background:
-    rgba(255,255,255,.025);
+    background:
+        rgba(3,12,20,.72);
 
-  border:
-    1px solid
-    rgba(255,255,255,.06);
+    border:
+        1px solid
+        rgba(90,210,245,.1);
 
-  border-radius:15px;
+    border-radius:17px;
 
-  padding:15px;
+    padding:18px;
 }
 
 .qr-card img{
-  max-width:260px;
-  width:100%;
-  background:white;
-  padding:8px;
-  border-radius:12px;
+    width:220px;
+
+    max-width:100%;
+
+    background:#fff;
+
+    padding:8px;
+
+    border-radius:12px;
 }
 
-.badge{
-  display:inline-block;
+.settings-icon{
+    font-size:40px;
 
-  padding:5px 9px;
-
-  border-radius:99px;
-
-  font-size:11px;
-
-  background:
-    rgba(56,227,154,.12);
-
-  color:var(--green);
-}
-
-.badge.off{
-  background:
-    rgba(255,93,115,.12);
-
-  color:var(--red);
+    margin-bottom:10px;
 }
 
 .login{
-  min-height:100vh;
+    min-height:100vh;
 
-  display:flex;
-  align-items:center;
-  justify-content:center;
+    display:grid;
 
-  padding:20px;
+    place-items:center;
+
+    padding:20px;
 }
 
 .login-card{
-  width:min(430px,100%);
+    width:min(440px,100%);
+
+    position:relative;
+
+    overflow:hidden;
+}
+
+.login-card::before{
+    content:"";
+
+    position:absolute;
+
+    width:250px;
+    height:250px;
+
+    right:-100px;
+    top:-120px;
+
+    background:
+        radial-gradient(
+            circle,
+            rgba(43,211,255,.25),
+            transparent 65%
+        );
+
+    pointer-events:none;
+}
+
+.login-logo{
+    text-align:center;
+
+    font-size:34px;
+
+    font-weight:1000;
+
+    direction:ltr;
+}
+
+.login-logo span{
+    color:var(--cyan);
+}
+
+.login-sub{
+    text-align:center;
+
+    color:var(--muted);
+
+    margin-bottom:25px;
+
+    font-size:12px;
+}
+
+.section-title{
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    gap:10px;
 }
 
 .footer{
-  text-align:center;
-  margin-top:30px;
-  color:var(--muted);
-  font-size:12px;
+    text-align:center;
+
+    color:
+        rgba(115,160,180,.55);
+
+    padding:35px 0 10px;
+
+    font-size:10px;
+
+    letter-spacing:2px;
+
+    direction:ltr;
 }
 
-@media(max-width:900px){
-  .grid{
-    grid-template-columns:
-      repeat(2,1fr);
-  }
+@media(max-width:850px){
+
+    .grid{
+        grid-template-columns:
+            repeat(2,1fr);
+    }
+
+    .qr-grid{
+        grid-template-columns:1fr;
+    }
+
+    .hero-content{
+        padding:35px;
+    }
+
+    .flame{
+        opacity:.35;
+        width:80%;
+    }
+
 }
 
-@media(max-width:600px){
-  .container{
-    padding:14px;
-  }
+@media(max-width:550px){
 
-  .grid,
-  .form-grid,
-  .qr-grid{
-    grid-template-columns:1fr;
-  }
+    .container{
+        padding:14px;
+    }
 
-  .nav{
-    align-items:flex-start;
-    flex-direction:column;
-  }
+    .grid{
+        grid-template-columns:1fr;
+    }
 
-  table{
-    font-size:12px;
-  }
+    .nav{
+        align-items:flex-start;
+    }
 
-  th:nth-child(3),
-  td:nth-child(3){
-    display:none;
-  }
+    .nav-right{
+        flex-wrap:wrap;
+        justify-content:flex-end;
+    }
+
+    .hero{
+        min-height:330px;
+    }
+
+    .hero-title{
+        font-size:43px;
+    }
+
+    .hero-content{
+        padding:27px;
+    }
+
+    .hero-sub{
+        font-size:13px;
+    }
+
 }
 
 </style>
@@ -1019,126 +1413,136 @@ ${body}
 `;
 }
 
-/*
- * ============================================================
- * LOGIN PAGE
- * ============================================================
- */
-
 function loginPage(error = "") {
-  return layout(
-    "Login",
-    `
+    return layout(
+        "Login",
+        `
 <div class="login">
 
 <div class="card login-card">
 
-<h1>
-⚔️ VergilPanel
-</h1>
-
-<p class="muted">
-مدیریت Xray / VLESS
-</p>
-
-${error ? `
-<div class="notice">
-❌ ${escapeHtml(error)}
+<div class="login-logo">
+⚔️ VERGIL<span>PANEL</span>
 </div>
-` : ""}
+
+<div class="login-sub">
+X R A Y   M A N A G E M E N T   S Y S T E M
+</div>
+
+${
+    error
+        ? `
+<div class="notice">
+${escapeHtml(error)}
+</div>
+`
+        : ""
+}
 
 <form
-  method="POST"
-  action="/login"
+    method="POST"
+    action="/login"
 >
-
-<div style="margin-bottom:14px">
 
 <label>
 نام کاربری
 </label>
 
 <input
-  name="username"
-  autocomplete="username"
-  required
+    name="username"
+    required
+    autocomplete="username"
+    dir="ltr"
 >
-
-</div>
-
-<div style="margin-bottom:15px">
 
 <label>
 رمز عبور
 </label>
 
 <input
-  type="password"
-  name="password"
-  autocomplete="current-password"
-  required
+    type="password"
+    name="password"
+    required
+    autocomplete="current-password"
+    dir="ltr"
 >
 
-</div>
+<br>
 
 <button
-  class="btn primary"
-  style="width:100%"
+    class="btn primary"
+    type="submit"
+    style="width:100%"
 >
-ورود
+ورود به پنل
 </button>
 
 </form>
 
 <div class="footer">
-ساخته شده توسط یاسین
-<br>
-پنل کاملاً رایگان و غیرقابل فروش است
+POWERED BY YASIN BEHZAD
 </div>
 
 </div>
 
 </div>
 `
-  );
+    );
 }
 
-/*
- * ============================================================
- * DASHBOARD
- * ============================================================
- */
+function dashboardPage(req) {
+    const users = allUsers();
+    const active = activeUsers();
 
-function dashboardPage() {
-  const users = allUsers();
+    const online =
+        Boolean(
+            xrayProcess &&
+            !xrayProcess.killed
+        );
 
-  const active = users.filter(
-    u => u.status === "active"
-  ).length;
+    const admin =
+        getAdmin();
 
-  return layout(
-    "Dashboard",
-    `
+    return layout(
+        "Dashboard",
+        `
 <div class="container">
 
 <div class="nav">
 
-<div class="brand">
-⚔️ Vergil<span>Panel</span>
+<a
+    href="/dashboard"
+    class="brand"
+>
+
+<div class="brand-icon">
+⚔️
 </div>
+
+<div>
+VERGIL<span>PANEL</span>
+</div>
+
+</a>
 
 <div class="nav-right">
 
+<span class="muted small">
+${escapeHtml(
+    admin?.username || "admin"
+)}
+</span>
+
 <a
-  class="btn"
-  href="/settings"
+    class="btn"
+    href="/settings"
 >
 ⚙️ تنظیمات
 </a>
 
 <a
-  class="btn danger"
-  href="/logout"
+    class="btn danger"
+    href="/logout"
 >
 خروج
 </a>
@@ -1149,24 +1553,46 @@ function dashboardPage() {
 
 <div class="hero">
 
-<h1 class="hero-title">
-داشبورد مدیریت
-</h1>
+<div class="hero-content">
 
-<p class="muted">
-مدیریت کاربران VLESS و Xray
-</p>
+<div class="hero-kicker">
+XRAY MANAGEMENT SYSTEM
+</div>
 
-<div class="actions">
+<div class="hero-title">
+VERGIL
+</div>
 
-<a
-  class="btn primary"
-  href="/users/new"
->
-➕ ساخت کاربر
-</a>
+<div class="hero-sub">
+مدیریت هوشمند VLESS با Xray
+<br>
+XHTTP + WebSocket
+</div>
+
+<div class="powered">
+POWERED BY YASIN BEHZAD
+</div>
+
+<div class="status">
+
+<span
+    class="status-dot ${
+        online ? "online" : ""
+    }"
+></span>
+
+Xray ${
+    online
+        ? "ONLINE"
+        : "OFFLINE"
+}
 
 </div>
+
+</div>
+
+<div class="flame"></div>
+<div class="sword"></div>
 
 </div>
 
@@ -1174,11 +1600,11 @@ function dashboardPage() {
 
 <div class="card">
 
-<div class="muted">
-کل کاربران
+<div class="stat-label">
+کاربران
 </div>
 
-<div class="stat">
+<div class="stat-value">
 ${users.length}
 </div>
 
@@ -1186,36 +1612,42 @@ ${users.length}
 
 <div class="card">
 
-<div class="muted">
+<div class="stat-label">
 کاربران فعال
 </div>
 
-<div class="stat">
-${active}
+<div class="stat-value">
+${active.length}
 </div>
 
 </div>
 
 <div class="card">
 
-<div class="muted">
-XHTTP
+<div class="stat-label">
+Transport
 </div>
 
-<div class="stat">
-3
+<div
+    class="stat-value"
+    style="font-size:20px"
+>
+XHTTP + WS
 </div>
 
 </div>
 
 <div class="card">
 
-<div class="muted">
-WebSocket
+<div class="stat-label">
+Version
 </div>
 
-<div class="stat">
-3
+<div
+    class="stat-value"
+    style="font-size:20px"
+>
+v${VERSION}
 </div>
 
 </div>
@@ -1226,11 +1658,30 @@ WebSocket
 
 <div class="card">
 
+<div class="section-title">
+
+<div>
+
 <h2>
-👥 کاربران
+👤 کاربران
 </h2>
 
-<div style="overflow:auto">
+<div class="muted">
+مدیریت خودکار کانفیگ‌های Xray
+</div>
+
+</div>
+
+<a
+    class="btn primary"
+    href="/users/new"
+>
+＋ کاربر جدید
+</a>
+
+</div>
+
+<div class="table-wrap">
 
 <table>
 
@@ -1243,15 +1694,15 @@ WebSocket
 </th>
 
 <th>
+پروتکل
+</th>
+
+<th>
 وضعیت
 </th>
 
 <th>
-XHTTP
-</th>
-
-<th>
-WebSocket
+کانفیگ
 </th>
 
 <th>
@@ -1265,8 +1716,9 @@ WebSocket
 <tbody>
 
 ${
-  users.length
-    ? users.map(user => `
+    users.length
+        ? users.map(user => `
+
 <tr>
 
 <td>
@@ -1276,81 +1728,85 @@ ${escapeHtml(user.username)}
 </td>
 
 <td>
-
-<span
-  class="badge ${
-    user.status === "active"
-      ? ""
-      : "off"
-  }"
->
-${
-  user.status === "active"
-    ? "فعال"
-    : "غیرفعال"
-}
+<span class="badge">
+VLESS
 </span>
+</td>
+
+<td>
+
+${
+    user.status === "active"
+        ? `
+<span class="badge green">
+● فعال
+</span>
+`
+        : `
+<span class="badge red">
+● غیرفعال
+</span>
+`
+}
 
 </td>
 
-<td dir="ltr">
-${escapeHtml(user.xhttp_path || "-")}
-</td>
+<td>
 
-<td dir="ltr">
-${escapeHtml(user.ws_path || "-")}
+<a
+    class="btn"
+    href="/users/config?id=${user.id}"
+>
+⚙️ کانفیگ
+</a>
+
 </td>
 
 <td>
 
 <div class="actions">
 
-<a
-  class="btn"
-  href="/users/config?id=${user.id}"
->
-کانفیگ
-</a>
-
 <form
-  method="POST"
-  action="/users/toggle"
-  style="display:inline"
+    method="POST"
+    action="/users/toggle"
 >
 
 <input
-  type="hidden"
-  name="id"
-  value="${user.id}"
+    type="hidden"
+    name="id"
+    value="${user.id}"
 >
 
 <button
-  class="btn"
-  type="submit"
+    class="btn"
+    type="submit"
 >
-${user.status === "active"
-  ? "غیرفعال"
-  : "فعال"}
+
+${
+    user.status === "active"
+        ? "خاموش"
+        : "فعال"
+}
+
 </button>
 
 </form>
 
 <form
-  method="POST"
-  action="/users/delete"
-  style="display:inline"
-  onsubmit="return confirm('کاربر حذف شود؟')"
+    method="POST"
+    action="/users/delete"
+    onsubmit="return confirm('این کاربر حذف شود؟')"
 >
 
 <input
-  type="hidden"
-  name="id"
-  value="${user.id}"
+    type="hidden"
+    name="id"
+    value="${user.id}"
 >
 
 <button
-  class="btn danger"
-  type="submit"
+    class="btn danger"
+    type="submit"
 >
 حذف
 </button>
@@ -1362,14 +1818,14 @@ ${user.status === "active"
 </td>
 
 </tr>
+
 `).join("")
-    : `
+        : `
 <tr>
 
 <td
-  colspan="5"
-  style="text-align:center"
-  class="muted"
+    colspan="5"
+    class="muted"
 >
 هنوز کاربری ساخته نشده است.
 </td>
@@ -1387,306 +1843,124 @@ ${user.status === "active"
 </div>
 
 <div class="footer">
-
-<div>
-ساخته شده توسط یاسین
-</div>
-
-<div>
-پنل کاملاً رایگان و غیرقابل فروش است
-</div>
-
-<div>
-به یاد زنده‌یاد علی نور 🖤
-</div>
-
+VERGILPANEL v${VERSION} · POWERED BY YASIN BEHZAD
 </div>
 
 </div>
 `
-  );
+    );
 }
-
-/*
- * ============================================================
- * SETTINGS
- * ============================================================
- */
-
-function settingsPage(message = "", error = "") {
-  const admin = getAdmin();
-
-  return layout(
-    "Settings",
-    `
-<div class="container">
-
-<div class="nav">
-
-<div class="brand">
-⚔️ VergilPanel
-</div>
-
-<div class="nav-right">
-
-<a
-  class="btn"
-  href="/dashboard"
->
-داشبورد
-</a>
-
-<a
-  class="btn danger"
-  href="/logout"
->
-خروج
-</a>
-
-</div>
-
-</div>
-
-<div class="card">
-
-<h1>
-⚙️ تنظیمات
-</h1>
-
-${
-  message
-    ? `
-<div class="notice">
-✅ ${escapeHtml(message)}
-</div>
-`
-    : ""
-}
-
-${
-  error
-    ? `
-<div class="notice">
-❌ ${escapeHtml(error)}
-</div>
-`
-    : ""
-}
-
-<form
-  method="POST"
-  action="/settings"
->
-
-<div class="form-grid">
-
-<div>
-
-<label>
-نام کاربری ادمین
-</label>
-
-<input
-  name="username"
-  value="${escapeHtml(admin?.username || "admin")}"
-  required
->
-
-</div>
-
-<div>
-
-<label>
-رمز عبور جدید
-</label>
-
-<input
-  type="password"
-  name="password"
->
-
-</div>
-
-<div>
-
-<label>
-تکرار رمز عبور
-</label>
-
-<input
-  type="password"
-  name="password_confirm"
->
-
-</div>
-
-</div>
-
-<br>
-
-<button
-  class="btn primary"
->
-ذخیره تنظیمات
-</button>
-
-</form>
-
-</div>
-
-</div>
-`
-  );
-}
-
-/*
- * ============================================================
- * NEW USER
- * ============================================================
- */
 
 function newUserPage(error = "") {
-  return layout(
-    "New User",
-    `
+    return layout(
+        "New User",
+        `
 <div class="container">
 
 <div class="nav">
 
-<div class="brand">
-⚔️ VergilPanel
-</div>
+<a
+    href="/dashboard"
+    class="brand"
+>
+⚔️ VERGIL<span>PANEL</span>
+</a>
 
 <a
-  class="btn"
-  href="/dashboard"
+    class="btn"
+    href="/dashboard"
 >
-بازگشت
+← داشبورد
 </a>
 
 </div>
 
-<div class="card">
+<div class="card form">
+
+<div class="settings-icon">
+👤
+</div>
 
 <h1>
-➕ ساخت کاربر
+ساخت کاربر
 </h1>
 
+<p class="muted">
+UUID و Subscription به صورت خودکار ساخته می‌شوند.
+</p>
+
 ${
-  error
-    ? `
+    error
+        ? `
 <div class="notice">
-❌ ${escapeHtml(error)}
+${escapeHtml(error)}
 </div>
 `
-    : ""
+        : ""
 }
 
-<div class="notice">
-
-<strong>
-انتخاب مسیرها کاملاً خودکار است.
-</strong>
-
-<br><br>
-
-XHTTP:
-
-<code dir="ltr">
-/xhttp-cdn
-</code>
-
-&nbsp;|&nbsp;
-
-<code dir="ltr">
-/xhttp-sni
-</code>
-
-&nbsp;|&nbsp;
-
-<code dir="ltr">
-/xhttp-game
-</code>
-
-<br><br>
-
-WebSocket:
-
-<code dir="ltr">
-/ws-cdn
-</code>
-
-&nbsp;|&nbsp;
-
-<code dir="ltr">
-/ws-sni
-</code>
-
-&nbsp;|&nbsp;
-
-<code dir="ltr">
-/ws-game
-</code>
-
-</div>
-
 <form
-  method="POST"
-  action="/users/new"
+    method="POST"
+    action="/users/new"
 >
-
-<div class="form-grid">
-
-<div>
 
 <label>
 نام کاربری
 </label>
 
 <input
-  name="username"
-  placeholder="مثلاً user1"
-  required
+    name="username"
+    required
+    maxlength="64"
+    placeholder="User-01"
+    dir="ltr"
 >
-
-</div>
-
-<div>
 
 <label>
-حجم ترافیک به GB
+محدودیت ترافیک
 </label>
 
-<input
-  type="number"
-  name="traffic_limit"
-  value="0"
-  min="0"
->
+<select name="traffic_limit">
 
-</div>
+<option value="0">
+نامحدود
+</option>
 
-<div>
+<option value="10737418240">
+10 GB
+</option>
+
+<option value="53687091200">
+50 GB
+</option>
+
+<option value="107374182400">
+100 GB
+</option>
+
+<option value="536870912000">
+500 GB
+</option>
+
+</select>
 
 <label>
 تاریخ انقضا
 </label>
 
 <input
-  type="datetime-local"
-  name="expires_at"
+    type="datetime-local"
+    name="expires_at"
+    dir="ltr"
 >
 
-</div>
-
-</div>
-
-<br>
+<br><br>
 
 <button
-  class="btn primary"
+    class="btn primary"
+    type="submit"
 >
-ساخت کاربر
+⚔️ ساخت کاربر
 </button>
 
 </form>
@@ -1695,71 +1969,209 @@ WebSocket:
 
 </div>
 `
-  );
+    );
 }
 
-/*
- * ============================================================
- * USER CONFIG PAGE
- * ============================================================
- */
+function settingsPage(
+    req,
+    message = "",
+    error = ""
+) {
+    const admin =
+        getAdmin();
 
-async function configPage(req, user) {
-  user = ensureUserPaths(user);
-
-  const origin = getPublicOrigin(req);
-
-  const links = makeVlessLinks(
-    user,
-    origin
-  );
-
-  const subscription =
-    makeSubscription(
-      user,
-      origin
-    );
-
-  const subscriptionUrl =
-    `${origin}/sub/${user.subscription_token}`;
-
-  const subscriptionQr =
-    await qrCode(subscriptionUrl);
-
-  const xhttpQr =
-    await qrCode(links.xhttp);
-
-  const wsQr =
-    await qrCode(links.websocket);
-
-  return layout(
-    "User Config",
-    `
+    return layout(
+        "Settings",
+        `
 <div class="container">
 
 <div class="nav">
 
-<div class="brand">
-⚔️ VergilPanel
-</div>
-
-<div class="nav-right">
+<a
+    href="/dashboard"
+    class="brand"
+>
+⚔️ VERGIL<span>PANEL</span>
+</a>
 
 <a
-  class="btn"
-  href="/dashboard"
+    class="btn"
+    href="/dashboard"
 >
-داشبورد
+← داشبورد
 </a>
 
 </div>
+
+<div class="card form">
+
+<div class="settings-icon">
+⚙️
+</div>
+
+<h1>
+تنظیمات مدیر
+</h1>
+
+<p class="muted">
+نام کاربری و رمز عبور ورود به پنل را تغییر دهید.
+</p>
+
+${
+    message
+        ? `
+<div class="notice">
+✅ ${escapeHtml(message)}
+</div>
+`
+        : ""
+}
+
+${
+    error
+        ? `
+<div class="notice">
+❌ ${escapeHtml(error)}
+</div>
+`
+        : ""
+}
+
+<form
+    method="POST"
+    action="/settings"
+>
+
+<label>
+نام کاربری جدید
+</label>
+
+<input
+    name="username"
+    value="${escapeHtml(
+        admin?.username || "admin"
+    )}"
+    required
+    maxlength="64"
+    dir="ltr"
+>
+
+<label>
+رمز عبور جدید
+</label>
+
+<input
+    type="password"
+    name="password"
+    placeholder="حداقل 4 کاراکتر"
+    minlength="4"
+    dir="ltr"
+>
+
+<label>
+تکرار رمز عبور
+</label>
+
+<input
+    type="password"
+    name="password_confirm"
+    placeholder="تکرار رمز عبور"
+    minlength="4"
+    dir="ltr"
+>
+
+<br><br>
+
+<button
+    class="btn primary"
+    type="submit"
+>
+💾 ذخیره تغییرات
+</button>
+
+</form>
+
+<br>
+
+<div class="notice">
+
+<strong>
+🔐 اطلاعات ورود
+</strong>
+
+<br><br>
+
+اگر رمز عبور را خالی بگذارید،
+رمز فعلی تغییر نمی‌کند.
+
+</div>
+
+</div>
+
+<div class="footer">
+POWERED BY YASIN BEHZAD
+</div>
+
+</div>
+`
+    );
+}
+
+async function configPage(req, user) {
+    const origin =
+        getPublicOrigin(req);
+
+    const links =
+        makeVlessLinks(
+            user,
+            origin
+        );
+
+    const subscriptionUrl =
+        `${origin}/sub/${user.subscription_token}`;
+
+    const xhttpQr =
+        await qrCode(
+            links.xhttp
+        );
+
+    const wsQr =
+        await qrCode(
+            links.websocket
+        );
+
+    const subQr =
+        await qrCode(
+            subscriptionUrl
+        );
+
+    return layout(
+        `${user.username} Config`,
+        `
+<div class="container">
+
+<div class="nav">
+
+<a
+    href="/dashboard"
+    class="brand"
+>
+⚔️ VERGIL<span>PANEL</span>
+</a>
+
+<a
+    class="btn"
+    href="/dashboard"
+>
+← داشبورد
+</a>
 
 </div>
 
 <div class="card">
 
 <h1>
-👤 ${escapeHtml(user.username)}
+⚔️ ${escapeHtml(user.username)}
 </h1>
 
 <p class="muted">
@@ -1772,13 +2184,17 @@ VLESS · XHTTP + WebSocket
 📡 Subscription
 </strong>
 
-<pre class="config">${escapeHtml(subscriptionUrl)}</pre>
+<pre class="config">${escapeHtml(
+    subscriptionUrl
+)}</pre>
 
 <button
-  class="btn primary"
-  onclick='copyText(${JSON.stringify(subscriptionUrl)})'
+    class="btn primary"
+    onclick='copyText(${JSON.stringify(
+        subscriptionUrl
+    )})'
 >
-📋 کپی Subscription URL
+📋 کپی Subscription
 </button>
 
 </div>
@@ -1792,8 +2208,20 @@ VLESS · XHTTP + WebSocket
 </h3>
 
 <img
-  src="${subscriptionQr}"
+    src="${subQr}"
+    alt="Subscription QR"
 >
+
+<br><br>
+
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(
+        subscriptionUrl
+    )})'
+>
+کپی لینک
+</button>
 
 </div>
 
@@ -1804,36 +2232,38 @@ VLESS · XHTTP + WebSocket
 </h3>
 
 <img
-  src="${xhttpQr}"
+    src="${xhttpQr}"
+    alt="XHTTP QR"
 >
 
-</div>
+<br><br>
+
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(
+        links.xhttp
+    )})'
+>
+کپی
+</button>
 
 </div>
 
-<br>
+</div>
 
 <h2>
 🚀 VLESS + XHTTP
 </h2>
 
-<div class="notice">
-
-<b>
-Path:
-</b>
-
-<span dir="ltr">
-${escapeHtml(user.xhttp_path)}
-</span>
-
-</div>
-
-<pre class="config">${escapeHtml(links.xhttp)}</pre>
+<pre class="config">${escapeHtml(
+    links.xhttp
+)}</pre>
 
 <button
-  class="btn"
-  onclick='copyText(${JSON.stringify(links.xhttp)})'
+    class="btn"
+    onclick='copyText(${JSON.stringify(
+        links.xhttp
+    )})'
 >
 📋 Copy XHTTP
 </button>
@@ -1844,28 +2274,18 @@ ${escapeHtml(user.xhttp_path)}
 🌐 VLESS + WebSocket
 </h2>
 
-<div class="notice">
-
-<b>
-Path:
-</b>
-
-<span dir="ltr">
-${escapeHtml(user.ws_path)}
-</span>
-
-</div>
-
-<pre class="config">${escapeHtml(links.websocket)}</pre>
+<pre class="config">${escapeHtml(
+    links.websocket
+)}</pre>
 
 <button
-  class="btn"
-  onclick='copyText(${JSON.stringify(links.websocket)})'
+    class="btn"
+    onclick='copyText(${JSON.stringify(
+        links.websocket
+    )})'
 >
 📋 Copy WebSocket
 </button>
-
-<br><br>
 
 <div class="qr-grid">
 
@@ -1876,7 +2296,8 @@ ${escapeHtml(user.ws_path)}
 </h3>
 
 <img
-  src="${xhttpQr}"
+    src="${xhttpQr}"
+    alt="XHTTP QR"
 >
 
 </div>
@@ -1888,28 +2309,31 @@ ${escapeHtml(user.ws_path)}
 </h3>
 
 <img
-  src="${wsQr}"
+    src="${wsQr}"
+    alt="WebSocket QR"
 >
 
 </div>
 
 </div>
 
+<br>
+
 <div class="notice">
 
 <strong>
-ساخته شده توسط یاسین
+💙 ساخته شده توسط یاسین
 </strong>
 
 <br>
 
-پنل کاملاً رایگان و غیرقابل فروش است
+کاملاً رایگان و غیرقابل فروش
 
 <br><br>
 
-<strong>
-به یاد زنده‌یاد علی نور 🖤
-</strong>
+<span class="muted small">
+این پیام داخل Subscription نیز قرار گرفته است.
+</span>
 
 </div>
 
@@ -1917,13 +2341,13 @@ ${escapeHtml(user.ws_path)}
 🆔 UUID
 </h2>
 
-<pre class="config">${escapeHtml(user.uuid)}</pre>
+<pre class="config">${escapeHtml(
+    user.uuid
+)}</pre>
 
-<h2>
-📡 Subscription
-</h2>
-
-<pre class="config">${escapeHtml(subscription)}</pre>
+<div class="footer">
+POWERED BY YASIN BEHZAD
+</div>
 
 </div>
 
@@ -1933,1077 +2357,1026 @@ ${escapeHtml(user.ws_path)}
 
 async function copyText(text){
 
-  try{
+    try{
 
-    await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(text);
 
-    alert("کپی شد ✅");
+        alert("کپی شد ✅");
 
-  }catch{
+    }catch{
 
-    prompt(
-      "متن را کپی کنید:",
-      text
-    );
+        prompt(
+            "متن را کپی کنید:",
+            text
+        );
 
-  }
+    }
 
 }
 
 </script>
 `
-  );
+    );
 }
 
 /*
- * ============================================================
- * ADMIN
- * ============================================================
+ * Default Admin
+ *
+ * Fresh deployment:
+ *
+ * admin / admin
+ *
+ * Railway Variables can override it.
  */
 
 function ensureDefaultAdmin() {
 
-  const username =
-    String(
-      process.env.ADMIN_USERNAME ||
-      "admin"
-    ).trim();
+    const username =
+        String(
+            process.env.ADMIN_USERNAME || "admin"
+        ).trim();
 
-  const password =
-    String(
-      process.env.ADMIN_PASSWORD ||
-      "admin"
-    );
+    const password =
+        String(
+            process.env.ADMIN_PASSWORD || "admin"
+        );
 
-  const admin = getAdmin();
+    const existing =
+        db.prepare(`
+            SELECT id
+            FROM admins
+            WHERE username = ?
+        `).get(username);
 
-  if (!admin) {
+    if (existing) {
 
-    db.prepare(
-      `
-      INSERT INTO admins(
+        db.prepare(`
+            UPDATE admins
+            SET password_hash = ?
+            WHERE id = ?
+        `).run(
+            hashPassword(password),
+            existing.id
+        );
+
+        console.log(
+            `👤 Admin ready: ${username}`
+        );
+
+        return;
+    }
+
+    db.prepare(`
+        INSERT INTO admins(
+            username,
+            password_hash,
+            created_at
+        )
+        VALUES (?, ?, ?)
+    `).run(
         username,
-        password_hash,
-        created_at
-      )
-      VALUES(?,?,?)
-      `
-    ).run(
-      username,
-      hashPassword(password),
-      nowIso()
+        hashPassword(password),
+        nowIso()
     );
 
     console.log(
-      `👤 Default admin created: ${username}`
+        `👤 Default admin created: ${username}`
     );
-
-  } else {
-
-    console.log(
-      `👤 Admin ready: ${admin.username}`
-    );
-
-  }
 }
 
 function authenticate(
-  username,
-  password
+    username,
+    password
 ) {
+    const admin =
+        db.prepare(`
+            SELECT *
+            FROM admins
+            WHERE username = ?
+        `).get(username);
 
-  const admin =
-    db.prepare(
-      "SELECT * FROM admins WHERE username=?"
-    ).get(username);
+    if (!admin) {
+        return false;
+    }
 
-  return Boolean(
-    admin &&
-    admin.password_hash ===
-      hashPassword(password)
-  );
+    return (
+        admin.password_hash ===
+        hashPassword(password)
+    );
 }
-
-/*
- * ============================================================
- * CREATE USER
- * ============================================================
- */
 
 async function createUser(form) {
 
-  const username =
-    String(
-      form.get("username") || ""
-    ).trim();
+    const username =
+        String(
+            form.get("username") || ""
+        ).trim();
 
-  if (!username) {
-    throw new Error(
-      "نام کاربری الزامی است."
-    );
-  }
-
-  if (
-    db
-      .prepare(
-        "SELECT id FROM users WHERE username=?"
-      )
-      .get(username)
-  ) {
-    throw new Error(
-      "این نام کاربری قبلاً وجود دارد."
-    );
-  }
-
-  let expiresAt = null;
-
-  const expiry =
-    String(
-      form.get("expires_at") || ""
-    ).trim();
-
-  if (expiry) {
-
-    const date =
-      new Date(expiry);
-
-    if (
-      Number.isNaN(
-        date.getTime()
-      )
-    ) {
-      throw new Error(
-        "تاریخ انقضا نامعتبر است."
-      );
+    if (!username) {
+        throw new Error(
+            "نام کاربری الزامی است."
+        );
     }
 
-    expiresAt =
-      date.toISOString();
-  }
+    const exists =
+        db.prepare(`
+            SELECT id
+            FROM users
+            WHERE username = ?
+        `).get(username);
 
-  const limit =
-    Number(
-      form.get("traffic_limit") || 0
-    );
+    if (exists) {
+        throw new Error(
+            "این نام کاربری قبلاً وجود دارد."
+        );
+    }
 
-  const xhttpPath =
-    randomChoice(XHTTP_PATHS);
+    const uuid =
+        crypto.randomUUID();
 
-  const wsPath =
-    randomChoice(WS_PATHS);
+    const subscriptionToken =
+        randomToken(32);
 
-  const token =
-    randomToken(32);
+    const trafficLimit =
+        Number(
+            form.get("traffic_limit") || 0
+        );
 
-  const uuid =
-    crypto.randomUUID();
+    let expiresAt = null;
 
-  const result =
-    db.prepare(
-      `
-      INSERT INTO users(
-        username,
-        uuid,
-        protocol,
-        traffic_limit_bytes,
-        traffic_used_bytes,
-        expires_at,
-        status,
-        subscription_token,
-        created_at,
-        xhttp_path,
-        ws_path
-      )
+    const expiry =
+        String(
+            form.get("expires_at") || ""
+        ).trim();
 
-      VALUES(
-        ?,
-        ?,
-        'vless',
-        ?,
-        0,
-        ?,
-        'active',
-        ?,
-        ?,
-        ?,
-        ?
-      )
-      `
-    ).run(
-      username,
-      uuid,
-      Number.isFinite(limit)
-        ? limit
-        : 0,
-      expiresAt,
-      token,
-      nowIso(),
-      xhttpPath,
-      wsPath
-    );
+    if (expiry) {
 
-  await restartXray();
+        const date =
+            new Date(expiry);
 
-  return db
-    .prepare(
-      "SELECT * FROM users WHERE id=?"
-    )
-    .get(
-      result.lastInsertRowid
+        if (
+            Number.isNaN(
+                date.getTime()
+            )
+        ) {
+            throw new Error(
+                "تاریخ انقضا نامعتبر است."
+            );
+        }
+
+        expiresAt =
+            date.toISOString();
+    }
+
+    const result =
+        db.prepare(`
+            INSERT INTO users(
+                username,
+                uuid,
+                protocol,
+                traffic_limit_bytes,
+                traffic_used_bytes,
+                expires_at,
+                status,
+                subscription_token,
+                created_at
+            )
+            VALUES (
+                ?,
+                ?,
+                'vless',
+                ?,
+                0,
+                ?,
+                'active',
+                ?,
+                ?
+            )
+        `).run(
+            username,
+            uuid,
+            Number.isFinite(
+                trafficLimit
+            )
+                ? trafficLimit
+                : 0,
+            expiresAt,
+            subscriptionToken,
+            nowIso()
+        );
+
+    await restartXray();
+
+    return db.prepare(`
+        SELECT *
+        FROM users
+        WHERE id = ?
+    `).get(
+        result.lastInsertRowid
     );
 }
 
-/*
- * ============================================================
- * DELETE / TOGGLE
- * ============================================================
- */
-
 async function deleteUser(id) {
 
-  db
-    .prepare(
-      "DELETE FROM users WHERE id=?"
-    )
-    .run(Number(id));
+    db.prepare(`
+        DELETE FROM users
+        WHERE id = ?
+    `).run(
+        Number(id)
+    );
 
-  await restartXray();
+    await restartXray();
 }
 
 async function toggleUser(id) {
 
-  const user =
-    db
-      .prepare(
-        "SELECT * FROM users WHERE id=?"
-      )
-      .get(Number(id));
+    const user =
+        db.prepare(`
+            SELECT *
+            FROM users
+            WHERE id = ?
+        `).get(
+            Number(id)
+        );
 
-  if (!user) {
-    throw new Error(
-      "User not found."
+    if (!user) {
+        throw new Error(
+            "User not found."
+        );
+    }
+
+    const newStatus =
+        user.status === "active"
+            ? "disabled"
+            : "active";
+
+    db.prepare(`
+        UPDATE users
+        SET status = ?
+        WHERE id = ?
+    `).run(
+        newStatus,
+        Number(id)
     );
-  }
 
-  db
-    .prepare(
-      "UPDATE users SET status=? WHERE id=?"
-    )
-    .run(
-      user.status === "active"
-        ? "disabled"
-        : "active",
-      Number(id)
-    );
-
-  await restartXray();
+    await restartXray();
 }
-
-/*
- * ============================================================
- * UPDATE ADMIN
- * ============================================================
- */
 
 function updateAdmin(
-  username,
-  password
+    username,
+    password
 ) {
-
-  const admin =
-    getAdmin();
-
-  const newUsername =
-    String(
-      username || ""
-    ).trim();
-
-  if (!newUsername) {
-    throw new Error(
-      "نام کاربری نمی‌تواند خالی باشد."
-    );
-  }
-
-  if (
-    password &&
-    String(password).length < 4
-  ) {
-    throw new Error(
-      "رمز عبور باید حداقل 4 کاراکتر باشد."
-    );
-  }
-
-  if (password) {
-
-    db.prepare(
-      `
-      UPDATE admins
-      SET username=?,
-          password_hash=?
-      WHERE id=?
-      `
-    ).run(
-      newUsername,
-      hashPassword(password),
-      admin.id
-    );
-
-  } else {
-
-    db.prepare(
-      `
-      UPDATE admins
-      SET username=?
-      WHERE id=?
-      `
-    ).run(
-      newUsername,
-      admin.id
-    );
-
-  }
-}
-
-/*
- * ============================================================
- * HTTP PROXY
- * ============================================================
- */
-
-function proxyHttpToXray(
-  req,
-  res
-) {
-
-  const target =
-    new URL(
-      req.url,
-      `http://${req.headers.host || "localhost"}`
-    );
-
-  /*
-   * مسیر عمومی:
-   *
-   * /xhttp-cdn
-   * /xhttp-sni
-   * /xhttp-game
-   *
-   * تبدیل می‌شود به:
-   *
-   * /xhttp
-   */
-
-  target.pathname =
-    XHTTP_PATH;
-
-  const proxy =
-    http.request(
-      {
-        hostname: "127.0.0.1",
-
-        port:
-          XRAY_XHTTP_PORT,
-
-        path:
-          target.pathname +
-          target.search,
-
-        method:
-          req.method,
-
-        headers: {
-          ...req.headers,
-
-          host:
-            `127.0.0.1:${XRAY_XHTTP_PORT}`
-        }
-      },
-
-      upstream => {
-
-        res.writeHead(
-          upstream.statusCode || 502,
-          upstream.headers
-        );
-
-        upstream.pipe(res);
-      }
-    );
-
-  proxy.on(
-    "error",
-    error => {
-
-      console.error(
-        "HTTP proxy error:",
-        error
-      );
-
-      if (!res.headersSent) {
-
-        res.writeHead(
-          502,
-          {
-            "Content-Type":
-              "text/plain"
-          }
-        );
-
-      }
-
-      res.end(
-        "Bad Gateway"
-      );
-    }
-  );
-
-  req.pipe(proxy);
-}
-
-/*
- * ============================================================
- * WEBSOCKET PROXY
- * ============================================================
- */
-
-function proxyWebSocket(
-  req,
-  clientSocket,
-  head
-) {
-
-  const upstream =
-    net.connect(
-      {
-        host: "127.0.0.1",
-        port: XRAY_WS_PORT
-      }
-    );
-
-  upstream.on(
-    "connect",
-    () => {
-
-      const url =
-        new URL(
-          req.url,
-          `http://${req.headers.host || "localhost"}`
-        );
-
-      /*
-       * مسیر عمومی:
-       *
-       * /ws-cdn
-       * /ws-sni
-       * /ws-game
-       *
-       * تبدیل می‌شود به:
-       *
-       * /ws
-       */
-
-      url.pathname =
-        WS_PATH;
-
-      const lines = [
-        `${req.method} ${url.pathname}${url.search} HTTP/${req.httpVersion}`
-      ];
-
-      for (
-        const [key, value]
-        of Object.entries(req.headers)
-      ) {
-
-        if (Array.isArray(value)) {
-
-          for (const item of value) {
-
-            lines.push(
-              `${key}: ${item}`
-            );
-
-          }
-
-        } else {
-
-          lines.push(
-            `${key}: ${value}`
-          );
-
-        }
-      }
-
-      lines.push(
-        "",
-        ""
-      );
-
-      upstream.write(
-        lines.join("\r\n")
-      );
-
-      if (head?.length) {
-        upstream.write(head);
-      }
-
-      clientSocket.pipe(
-        upstream
-      );
-
-      upstream.pipe(
-        clientSocket
-      );
-    }
-  );
-
-  upstream.on(
-    "error",
-    error => {
-
-      console.error(
-        "WebSocket proxy error:",
-        error
-      );
-
-      try {
-        clientSocket.destroy();
-      } catch {}
-
-    }
-  );
-
-  clientSocket.on(
-    "error",
-    () => {
-
-      try {
-        upstream.destroy();
-      } catch {}
-
-    }
-  );
-
-  clientSocket.on(
-    "close",
-    () => {
-
-      try {
-        upstream.destroy();
-      } catch {}
-
-    }
-  );
-}
-
-/*
- * ============================================================
- * SUBSCRIPTION RESPONSE
- * ============================================================
- */
-
-async function subscriptionResponse(
-  req,
-  res,
-  token
-) {
-
-  const user =
-    db
-      .prepare(
-        "SELECT * FROM users WHERE subscription_token=?"
-      )
-      .get(token);
-
-  if (!user) {
-
-    return sendJson(
-      res,
-      {
-        ok: false,
-        error:
-          "Subscription not found."
-      },
-      404
-    );
-
-  }
-
-  if (
-    user.status !== "active"
-  ) {
-
-    return sendJson(
-      res,
-      {
-        ok: false,
-        error:
-          "Subscription disabled."
-      },
-      403
-    );
-
-  }
-
-  if (
-    user.expires_at &&
-    user.expires_at <= nowIso()
-  ) {
-
-    return sendJson(
-      res,
-      {
-        ok: false,
-        error:
-          "Subscription expired."
-      },
-      403
-    );
-
-  }
-
-  res.writeHead(
-    200,
-    {
-      "Content-Type":
-        "text/plain; charset=utf-8",
-
-      "Cache-Control":
-        "no-store"
-    }
-  );
-
-  res.end(
-    makeSubscription(
-      ensureUserPaths(user),
-      getPublicOrigin(req)
-    )
-  );
-}
-
-/*
- * ============================================================
- * MAIN HTTP HANDLER
- * ============================================================
- */
-
-async function handleRequest(
-  req,
-  res
-) {
-
-  try {
-
-    const url =
-      new URL(
-        req.url,
-        `http://${req.headers.host || "localhost"}`
-      );
-
-    const path =
-      url.pathname;
-
-    /*
-     * XHTTP PUBLIC PATHS
-     */
-
-    if (
-      XHTTP_PATHS.includes(path) ||
-      XHTTP_PATHS.some(
-        x => path.startsWith(`${x}/`)
-      )
-    ) {
-
-      proxyHttpToXray(
-        req,
-        res
-      );
-
-      return;
-    }
-
-    /*
-     * SUBSCRIPTION
-     */
-
-    if (
-      path.startsWith("/sub/")
-    ) {
-
-      await subscriptionResponse(
-        req,
-        res,
-        path.slice(5)
-      );
-
-      return;
-    }
-
-    /*
-     * HEALTH
-     */
-
-    if (
-      path === "/health"
-    ) {
-
-      return sendJson(
-        res,
-        {
-          ok: true,
-
-          panel:
-            VERSION,
-
-          xray:
-            Boolean(
-              xrayProcess &&
-              !xrayProcess.killed
-            ),
-
-          transports: [
-            "xhttp",
-            "websocket"
-          ],
-
-          xhttp_paths:
-            XHTTP_PATHS,
-
-          ws_paths:
-            WS_PATHS,
-
-          bind:
-            HOST
-        }
-      );
-
-    }
-
-    /*
-     * LOGIN GET
-     */
-
-    if (
-      path === "/login" &&
-      req.method === "GET"
-    ) {
-
-      return getSession(req)
-        ? redirect(
-            res,
-            "/dashboard"
-          )
-        : sendHtml(
-            res,
-            loginPage()
-          );
-
-    }
-
-    /*
-     * LOGIN POST
-     */
-
-    if (
-      path === "/login" &&
-      req.method === "POST"
-    ) {
-
-      const form =
-        await readForm(req);
-
-      const username =
-        String(
-          form.get("username") || ""
-        ).trim();
-
-      const password =
-        String(
-          form.get("password") || ""
-        );
-
-      if (
-        !authenticate(
-          username,
-          password
-        )
-      ) {
-
-        return sendHtml(
-          res,
-          loginPage(
-            "نام کاربری یا رمز عبور اشتباه است."
-          ),
-          401
-        );
-
-      }
-
-      const token =
-        randomToken(32);
-
-      sessions.set(
-        token,
-        {
-          username,
-          createdAt: Date.now()
-        }
-      );
-
-      const admin =
+    const admin =
         getAdmin();
 
-      const defaultLogin =
-        admin &&
-        username === "admin" &&
-        password === "admin";
-
-      res.writeHead(
-        302,
-        {
-          Location:
-            defaultLogin
-              ? "/settings"
-              : "/dashboard",
-
-          "Set-Cookie":
-            `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Secure`
-        }
-      );
-
-      return res.end();
-    }
-
-    /*
-     * LOGOUT
-     */
-
-    if (
-      path === "/logout"
-    ) {
-
-      const cookies =
-        parseCookies(req);
-
-      if (
-        cookies.vergil_session
-      ) {
-
-        sessions.delete(
-          cookies.vergil_session
+    if (!admin) {
+        throw new Error(
+            "Admin account not found."
         );
+    }
 
-      }
+    const cleanUsername =
+        String(
+            username || ""
+        ).trim();
 
-      res.writeHead(
-        302,
-        {
-          Location:
-            "/login",
+    if (!cleanUsername) {
+        throw new Error(
+            "نام کاربری نمی‌تواند خالی باشد."
+        );
+    }
 
-          "Set-Cookie":
-            "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
+    if (
+        cleanUsername !==
+        admin.username
+    ) {
+
+        const duplicate =
+            db.prepare(`
+                SELECT id
+                FROM admins
+                WHERE username = ?
+                AND id != ?
+            `).get(
+                cleanUsername,
+                admin.id
+            );
+
+        if (duplicate) {
+            throw new Error(
+                "این نام کاربری قبلاً استفاده شده است."
+            );
         }
-      );
-
-      return res.end();
     }
 
-    /*
-     * AUTH
-     */
-
-    if (
-      !requireAuth(
-        req,
-        res
-      )
-    ) {
-      return;
-    }
-
-    /*
-     * DASHBOARD
-     */
-
-    if (
-      path === "/" ||
-      path === "/dashboard"
-    ) {
-
-      return sendHtml(
-        res,
-        dashboardPage()
-      );
-
-    }
-
-    /*
-     * SETTINGS GET
-     */
-
-    if (
-      path === "/settings" &&
-      req.method === "GET"
-    ) {
-
-      return sendHtml(
-        res,
-        settingsPage()
-      );
-
-    }
-
-    /*
-     * SETTINGS POST
-     */
-
-    if (
-      path === "/settings" &&
-      req.method === "POST"
-    ) {
-
-      try {
-
-        const form =
-          await readForm(req);
-
-        const password =
-          String(
-            form.get("password") || ""
-          );
-
-        const confirmPassword =
-          String(
-            form.get("password_confirm") || ""
-          );
+    if (password) {
 
         if (
-          password &&
-          password !== confirmPassword
+            String(password).length < 4
         ) {
-
-          throw new Error(
-            "رمزهای عبور یکسان نیستند."
-          );
-
+            throw new Error(
+                "رمز عبور باید حداقل 4 کاراکتر باشد."
+            );
         }
 
-        updateAdmin(
-          String(
-            form.get("username") || ""
-          ),
-          password
+        db.prepare(`
+            UPDATE admins
+            SET
+                username = ?,
+                password_hash = ?
+            WHERE id = ?
+        `).run(
+            cleanUsername,
+            hashPassword(password),
+            admin.id
         );
 
-        sessions.clear();
+    } else {
 
-        redirect(
-          res,
-          "/login"
+        db.prepare(`
+            UPDATE admins
+            SET username = ?
+            WHERE id = ?
+        `).run(
+            cleanUsername,
+            admin.id
+        );
+    }
+}
+
+function proxyHttpToXray(
+    req,
+    res,
+    targetPort
+) {
+    const options = {
+        hostname: "127.0.0.1",
+        port: targetPort,
+        path: req.url,
+        method: req.method,
+
+        headers: {
+            ...req.headers,
+            host:
+                `127.0.0.1:${targetPort}`
+        }
+    };
+
+    const proxy =
+        http.request(
+            options,
+            upstream => {
+
+                res.writeHead(
+                    upstream.statusCode || 502,
+                    upstream.headers
+                );
+
+                upstream.pipe(res);
+            }
         );
 
-      } catch (error) {
+    proxy.on(
+        "error",
+        error => {
 
-        sendHtml(
-          res,
-          settingsPage(
-            "",
-            error?.message ||
-              "خطا"
-          ),
-          400
+            console.error(
+                "HTTP proxy error:",
+                error
+            );
+
+            if (!res.headersSent) {
+
+                res.writeHead(
+                    502,
+                    {
+                        "Content-Type":
+                            "text/plain"
+                    }
+                );
+            }
+
+            res.end("Bad Gateway");
+        }
+    );
+
+    req.pipe(proxy);
+}
+
+function proxyWebSocket(
+    req,
+    clientSocket,
+    head
+) {
+    const upstream =
+        net.connect({
+            host: "127.0.0.1",
+            port: XRAY_WS_PORT
+        });
+
+    upstream.on(
+        "connect",
+        () => {
+
+            const headers = [];
+
+            headers.push(
+                `${req.method} ${req.url} HTTP/${req.httpVersion}`
+            );
+
+            for (
+                const [key, value]
+                of Object.entries(req.headers)
+            ) {
+
+                if (
+                    Array.isArray(value)
+                ) {
+
+                    for (
+                        const item
+                        of value
+                    ) {
+
+                        headers.push(
+                            `${key}: ${item}`
+                        );
+                    }
+
+                } else {
+
+                    headers.push(
+                        `${key}: ${value}`
+                    );
+                }
+            }
+
+            headers.push("");
+            headers.push("");
+
+            upstream.write(
+                headers.join("\r\n")
+            );
+
+            if (
+                head &&
+                head.length
+            ) {
+                upstream.write(head);
+            }
+
+            clientSocket.pipe(upstream);
+            upstream.pipe(clientSocket);
+        }
+    );
+
+    upstream.on(
+        "error",
+        error => {
+
+            console.error(
+                "WebSocket proxy error:",
+                error
+            );
+
+            try {
+                clientSocket.destroy();
+            } catch {}
+        }
+    );
+
+    clientSocket.on(
+        "error",
+        () => {
+
+            try {
+                upstream.destroy();
+            } catch {}
+        }
+    );
+
+    clientSocket.on(
+        "close",
+        () => {
+
+            try {
+                upstream.destroy();
+            } catch {}
+        }
+    );
+}
+
+async function subscriptionResponse(
+    req,
+    res,
+    token
+) {
+    const user =
+        db.prepare(`
+            SELECT *
+            FROM users
+            WHERE subscription_token = ?
+        `).get(token);
+
+    if (!user) {
+
+        sendJson(
+            res,
+            {
+                ok: false,
+                error:
+                    "Subscription not found."
+            },
+            404
         );
 
-      }
-
-      return;
+        return;
     }
 
-    /*
-     * NEW USER GET
-     */
-
     if (
-      path === "/users/new" &&
-      req.method === "GET"
+        user.status !== "active"
     ) {
 
-      return sendHtml(
-        res,
-        newUserPage()
-      );
+        sendJson(
+            res,
+            {
+                ok: false,
+                error:
+                    "Subscription disabled."
+            },
+            403
+        );
 
+        return;
     }
 
-    /*
-     * NEW USER POST
-     */
-
     if (
-      path === "/users/new" &&
-      req.method === "POST"
+        user.expires_at &&
+        user.expires_at <= nowIso()
     ) {
 
-      try {
-
-        const user =
-          await createUser(
-            await readForm(req)
-          );
-
-        console.log(
-          `👤 User created: ${user.username} | ${user.xhttp_path} | ${user.ws_path}`
+        sendJson(
+            res,
+            {
+                ok: false,
+                error:
+                    "Subscription expired."
+            },
+            403
         );
 
-        redirect(
-          res,
-          `/users/config?id=${user.id}`
-        );
-
-      } catch (error) {
-
-        sendHtml(
-          res,
-          newUserPage(
-            error?.message ||
-              "خطا در ساخت کاربر"
-          ),
-          400
-        );
-
-      }
-
-      return;
+        return;
     }
 
-    /*
-     * USER CONFIG
-     */
-
-    if (
-      path === "/users/config" &&
-      req.method === "GET"
-    ) {
-
-      const id =
-        Number(
-          url.searchParams.get("id")
+    const content =
+        makeSubscription(
+            user,
+            getPublicOrigin(req)
         );
 
-      const user =
-        db
-          .prepare(
-            "SELECT * FROM users WHERE id=?"
-          )
-          .get(id);
+    res.writeHead(
+        200,
+        {
+            "Content-Type":
+                "text/plain; charset=utf-8",
 
-      if (!user) {
+            "Cache-Control":
+                "no-store"
+        }
+    );
 
-        return sendHtml(
-          res,
-          layout(
-            "404",
-            `
+    res.end(content);
+}
+
+async function handleRequest(
+    req,
+    res
+) {
+    try {
+
+        const url =
+            new URL(
+                req.url,
+                `http://${req.headers.host || "localhost"}`
+            );
+
+        const pathname =
+            url.pathname;
+
+        /*
+         * XHTTP
+         */
+
+        if (
+            pathname === XHTTP_PATH ||
+            pathname.startsWith(
+                `${XHTTP_PATH}/`
+            )
+        ) {
+
+            proxyHttpToXray(
+                req,
+                res,
+                XRAY_XHTTP_PORT
+            );
+
+            return;
+        }
+
+        /*
+         * Subscription
+         */
+
+        if (
+            pathname.startsWith("/sub/")
+        ) {
+
+            const token =
+                pathname.slice(5);
+
+            await subscriptionResponse(
+                req,
+                res,
+                token
+            );
+
+            return;
+        }
+
+        /*
+         * Health
+         */
+
+        if (
+            pathname === "/health"
+        ) {
+
+            sendJson(
+                res,
+                {
+                    ok: true,
+                    panel: VERSION,
+
+                    xray:
+                        Boolean(
+                            xrayProcess &&
+                            !xrayProcess.killed
+                        ),
+
+                    transports: [
+                        "xhttp",
+                        "websocket"
+                    ]
+                }
+            );
+
+            return;
+        }
+
+        /*
+         * Login
+         */
+
+        if (
+            pathname === "/login" &&
+            req.method === "GET"
+        ) {
+
+            if (getSession(req)) {
+
+                redirect(
+                    res,
+                    "/dashboard"
+                );
+
+                return;
+            }
+
+            sendHtml(
+                res,
+                loginPage()
+            );
+
+            return;
+        }
+
+        if (
+            pathname === "/login" &&
+            req.method === "POST"
+        ) {
+
+            const form =
+                await readForm(req);
+
+            const username =
+                String(
+                    form.get("username") || ""
+                ).trim();
+
+            const password =
+                String(
+                    form.get("password") || ""
+                );
+
+            if (
+                !authenticate(
+                    username,
+                    password
+                )
+            ) {
+
+                sendHtml(
+                    res,
+                    loginPage(
+                        "نام کاربری یا رمز عبور اشتباه است."
+                    ),
+                    401
+                );
+
+                return;
+            }
+
+            const token =
+                randomToken(32);
+
+            sessions.set(
+                token,
+                {
+                    username,
+                    createdAt:
+                        Date.now()
+                }
+            );
+
+            /*
+             * اگر ورود با admin/admin باشد،
+             * کاربر را برای تغییر اطلاعات به Settings می‌فرستیم.
+             */
+
+            const admin =
+                getAdmin();
+
+            const isDefaultLogin =
+                admin &&
+                username === "admin" &&
+                password === "admin";
+
+            res.writeHead(
+                302,
+                {
+                    Location:
+                        isDefaultLogin
+                            ? "/settings"
+                            : "/dashboard",
+
+                    "Set-Cookie":
+                        `vergil_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax; Secure`
+                }
+            );
+
+            res.end();
+
+            return;
+        }
+
+        /*
+         * Logout
+         */
+
+        if (
+            pathname === "/logout"
+        ) {
+
+            const cookies =
+                parseCookies(req);
+
+            if (
+                cookies.vergil_session
+            ) {
+
+                sessions.delete(
+                    cookies.vergil_session
+                );
+            }
+
+            res.writeHead(
+                302,
+                {
+                    Location: "/login",
+
+                    "Set-Cookie":
+                        "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
+                }
+            );
+
+            res.end();
+
+            return;
+        }
+
+        /*
+         * Protected routes
+         */
+
+        const session =
+            requireAuth(
+                req,
+                res
+            );
+
+        if (!session) {
+            return;
+        }
+
+        /*
+         * Dashboard
+         */
+
+        if (
+            pathname === "/" ||
+            pathname === "/dashboard"
+        ) {
+
+            sendHtml(
+                res,
+                dashboardPage(req)
+            );
+
+            return;
+        }
+
+        /*
+         * Settings
+         */
+
+        if (
+            pathname === "/settings" &&
+            req.method === "GET"
+        ) {
+
+            sendHtml(
+                res,
+                settingsPage(req)
+            );
+
+            return;
+        }
+
+        if (
+            pathname === "/settings" &&
+            req.method === "POST"
+        ) {
+
+            try {
+
+                const form =
+                    await readForm(req);
+
+                const username =
+                    String(
+                        form.get("username") || ""
+                    ).trim();
+
+                const password =
+                    String(
+                        form.get("password") || ""
+                    );
+
+                const confirm =
+                    String(
+                        form.get(
+                            "password_confirm"
+                        ) || ""
+                    );
+
+                if (
+                    password &&
+                    password !== confirm
+                ) {
+
+                    throw new Error(
+                        "رمزهای عبور یکسان نیستند."
+                    );
+                }
+
+                updateAdmin(
+                    username,
+                    password
+                );
+
+                /*
+                 * تمام Sessionهای قبلی حذف می‌شوند
+                 * تا با اطلاعات جدید دوباره Login شود.
+                 */
+
+                sessions.clear();
+
+                redirect(
+                    res,
+                    "/login"
+                );
+
+            } catch (error) {
+
+                sendHtml(
+                    res,
+                    settingsPage(
+                        req,
+                        "",
+                        error?.message ||
+                            "خطا در ذخیره تنظیمات."
+                    ),
+                    400
+                );
+            }
+
+            return;
+        }
+
+        /*
+         * New User
+         */
+
+        if (
+            pathname === "/users/new" &&
+            req.method === "GET"
+        ) {
+
+            sendHtml(
+                res,
+                newUserPage()
+            );
+
+            return;
+        }
+
+        if (
+            pathname === "/users/new" &&
+            req.method === "POST"
+        ) {
+
+            try {
+
+                const form =
+                    await readForm(req);
+
+                const user =
+                    await createUser(
+                        form
+                    );
+
+                console.log(
+                    `👤 User created: ${user.username}`
+                );
+
+                redirect(
+                    res,
+                    `/users/config?id=${user.id}`
+                );
+
+            } catch (error) {
+
+                sendHtml(
+                    res,
+                    newUserPage(
+                        error?.message ||
+                        "خطا در ساخت کاربر."
+                    ),
+                    500
+                );
+            }
+
+            return;
+        }
+
+        /*
+         * User Config
+         */
+
+        if (
+            pathname === "/users/config" &&
+            req.method === "GET"
+        ) {
+
+            const id =
+                Number(
+                    url.searchParams.get("id")
+                );
+
+            const user =
+                db.prepare(`
+                    SELECT *
+                    FROM users
+                    WHERE id = ?
+                `).get(id);
+
+            if (!user) {
+
+                sendHtml(
+                    res,
+                    layout(
+                        "404",
+                        `
 <div class="container">
 
 <div class="card">
@@ -3013,8 +3386,8 @@ async function handleRequest(
 </h1>
 
 <a
-  class="btn"
-  href="/dashboard"
+    class="btn"
+    href="/dashboard"
 >
 داشبورد
 </a>
@@ -3023,94 +3396,95 @@ async function handleRequest(
 
 </div>
 `
-          ),
-          404
-        );
+                    ),
+                    404
+                );
 
-      }
+                return;
+            }
 
-      return sendHtml(
-        res,
-        await configPage(
-          req,
-          user
-        )
-      );
-    }
+            sendHtml(
+                res,
+                await configPage(
+                    req,
+                    user
+                )
+            );
 
-    /*
-     * TOGGLE USER
-     */
+            return;
+        }
 
-    if (
-      path === "/users/toggle" &&
-      req.method === "POST"
-    ) {
+        /*
+         * Toggle
+         */
 
-      try {
+        if (
+            pathname === "/users/toggle" &&
+            req.method === "POST"
+        ) {
 
-        const form =
-          await readForm(req);
+            const form =
+                await readForm(req);
 
-        await toggleUser(
-          form.get("id")
-        );
+            try {
 
-      } catch (error) {
+                await toggleUser(
+                    form.get("id")
+                );
 
-        console.error(
-          error
-        );
+            } catch (error) {
 
-      }
+                console.error(
+                    error
+                );
+            }
 
-      return redirect(
-        res,
-        "/dashboard"
-      );
-    }
+            redirect(
+                res,
+                "/dashboard"
+            );
 
-    /*
-     * DELETE USER
-     */
+            return;
+        }
 
-    if (
-      path === "/users/delete" &&
-      req.method === "POST"
-    ) {
+        /*
+         * Delete
+         */
 
-      try {
+        if (
+            pathname === "/users/delete" &&
+            req.method === "POST"
+        ) {
 
-        const form =
-          await readForm(req);
+            const form =
+                await readForm(req);
 
-        await deleteUser(
-          form.get("id")
-        );
+            try {
 
-      } catch (error) {
+                await deleteUser(
+                    form.get("id")
+                );
 
-        console.error(
-          error
-        );
+            } catch (error) {
 
-      }
+                console.error(
+                    error
+                );
+            }
 
-      return redirect(
-        res,
-        "/dashboard"
-      );
-    }
+            redirect(
+                res,
+                "/dashboard"
+            );
 
-    /*
-     * 404
-     */
+            return;
+        }
 
-    return sendHtml(
-      res,
-      layout(
-        "404",
-        `
+        sendHtml(
+            res,
+            layout(
+                "404",
+                `
 <div class="container">
 
 <div class="card">
@@ -3119,9 +3493,13 @@ async function handleRequest(
 404
 </h1>
 
+<p class="muted">
+صفحه مورد نظر پیدا نشد.
+</p>
+
 <a
-  class="btn"
-  href="/dashboard"
+    class="btn"
+    href="/dashboard"
 >
 بازگشت
 </a>
@@ -3130,174 +3508,126 @@ async function handleRequest(
 
 </div>
 `
-      ),
-      404
-    );
+            ),
+            404
+        );
 
-  } catch (error) {
+    } catch (error) {
 
-    console.error(
-      "Unhandled server error:",
-      error
-    );
+        console.error(
+            "Unhandled server error:",
+            error
+        );
 
-    if (!res.headersSent) {
+        if (!res.headersSent) {
 
-      sendJson(
-        res,
-        {
-          ok: false,
-          error:
-            "Internal Server Error"
-        },
-        500
-      );
-
+            sendJson(
+                res,
+                {
+                    ok: false,
+                    error:
+                        "Internal Server Error"
+                },
+                500
+            );
+        }
     }
-
-  }
 }
 
-/*
- * ============================================================
- * SERVER
- * ============================================================
- */
-
 const server =
-  http.createServer(
-    handleRequest
-  );
-
-/*
- * ============================================================
- * WEBSOCKET UPGRADE
- * ============================================================
- */
+    http.createServer(
+        handleRequest
+    );
 
 server.on(
-  "upgrade",
-  (
-    req,
-    socket,
-    head
-  ) => {
+    "upgrade",
+    (req, socket, head) => {
 
-    try {
+        try {
 
-      const url =
-        new URL(
-          req.url,
-          `http://${req.headers.host || "localhost"}`
-        );
+            const url =
+                new URL(
+                    req.url,
+                    `http://${req.headers.host || "localhost"}`
+                );
 
-      const path =
-        url.pathname;
+            if (
+                url.pathname === WS_PATH ||
+                url.pathname.startsWith(
+                    `${WS_PATH}/`
+                )
+            ) {
 
-      if (
-        WS_PATHS.includes(path) ||
-        WS_PATHS.some(
-          x => path.startsWith(`${x}/`)
-        )
-      ) {
+                proxyWebSocket(
+                    req,
+                    socket,
+                    head
+                );
 
-        proxyWebSocket(
-          req,
-          socket,
-          head
-        );
+                return;
+            }
 
-        return;
-      }
+            socket.destroy();
 
-      socket.destroy();
+        } catch {
 
-    } catch {
-
-      socket.destroy();
-
+            socket.destroy();
+        }
     }
-  }
 );
 
-/*
- * ============================================================
- * STARTUP
- * ============================================================
- */
-
 ensureDefaultAdmin();
-
-ensureAllUserPaths();
 
 await startXray();
 
 server.listen(
-  PORT,
-  HOST,
-  () => {
+    PORT,
+    HOST,
+    () => {
 
-    console.log(
-      `⚔️ VergilPanel ${VERSION} running on ${HOST}:${PORT}`
-    );
+        console.log(
+            `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
+        );
 
-    console.log(
-      `👤 Login: admin / admin`
-    );
+        console.log(
+            `👤 Login: admin / admin`
+        );
 
-    console.log(
-      `🌐 WS public paths: ${WS_PATHS.join(", ")}`
-    );
+        console.log(
+            `💙 POWERED BY YASIN BEHZAD`
+        );
 
-    console.log(
-      `📡 XHTTP public paths: ${XHTTP_PATHS.join(", ")}`
-    );
-
-    console.log(
-      `🌍 Bind address: ${HOST}`
-    );
-
-    console.log(
-      `🖤 به یاد زنده‌یاد علی نور`
-    );
-
-    console.log(
-      `💙 ساخته شده توسط یاسین | پنل کاملاً رایگان و غیرقابل فروش است`
-    );
-  }
+        console.log(
+            `⚔️ Railway TCP Proxy NOT required`
+        );
+    }
 );
-
-/*
- * ============================================================
- * SHUTDOWN
- * ============================================================
- */
 
 async function shutdown(signal) {
 
-  console.log(
-    `Received ${signal}`
-  );
+    console.log(
+        `Received ${signal}`
+    );
 
-  stoppingXray = true;
+    stoppingXray = true;
 
-  try {
-    await stopXray();
-  } catch {}
+    try {
+        await stopXray();
+    } catch {}
 
-  try {
-    db.close();
-  } catch {}
+    try {
+        db.close();
+    } catch {}
 
-  process.exit(0);
+    process.exit(0);
 }
 
 process.on(
-  "SIGTERM",
-  () => shutdown("SIGTERM")
+    "SIGTERM",
+    () => shutdown("SIGTERM")
 );
 
 process.on(
-  "SIGINT",
-  () => shutdown("SIGINT")
+    "SIGINT",
+    () => shutdown("SIGINT")
 );
