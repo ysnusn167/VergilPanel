@@ -31,7 +31,7 @@ const XHTTP_PATH =
 const WS_PATH =
     process.env.WS_PATH || "/ws";
 
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 
 let xrayProcess = null;
 let stoppingXray = false;
@@ -68,6 +68,49 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `);
 
+/*
+ * ---------------------------------------------------------
+ * Database migration
+ * ---------------------------------------------------------
+ *
+ * کاربران قدیمی v0.8.0 این ستون‌ها را ندارند.
+ * در اولین اجرای v0.9.0 ستون‌ها خودکار ساخته می‌شوند.
+ */
+
+function addColumnIfMissing(
+    table,
+    column,
+    definition
+) {
+    const columns =
+        db.prepare(
+            `PRAGMA table_info(${table})`
+        ).all();
+
+    const exists =
+        columns.some(
+            item => item.name === column
+        );
+
+    if (!exists) {
+        db.exec(
+            `ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`
+        );
+    }
+}
+
+addColumnIfMissing(
+    "users",
+    "xhttp_paths",
+    "TEXT"
+);
+
+addColumnIfMissing(
+    "users",
+    "ws_paths",
+    "TEXT"
+);
+
 function hashPassword(password) {
     return crypto
         .createHash("sha256")
@@ -76,7 +119,9 @@ function hashPassword(password) {
 }
 
 function randomToken(bytes = 32) {
-    return crypto.randomBytes(bytes).toString("hex");
+    return crypto
+        .randomBytes(bytes)
+        .toString("hex");
 }
 
 function nowIso() {
@@ -93,19 +138,29 @@ function escapeHtml(value = "") {
 }
 
 function parseCookies(req) {
-    const header = req.headers.cookie || "";
+    const header =
+        req.headers.cookie || "";
+
     const result = {};
 
-    for (const part of header.split(";")) {
-        const index = part.indexOf("=");
+    for (
+        const part
+        of header.split(";")
+    ) {
+        const index =
+            part.indexOf("=");
 
         if (index === -1) continue;
 
-        const key = part.slice(0, index).trim();
-        const value = part.slice(index + 1).trim();
+        const key =
+            part.slice(0, index).trim();
+
+        const value =
+            part.slice(index + 1).trim();
 
         try {
-            result[key] = decodeURIComponent(value);
+            result[key] =
+                decodeURIComponent(value);
         } catch {
             result[key] = value;
         }
@@ -115,58 +170,112 @@ function parseCookies(req) {
 }
 
 function getSession(req) {
-    const cookies = parseCookies(req);
+    const cookies =
+        parseCookies(req);
 
     if (!cookies.vergil_session) {
         return null;
     }
 
-    return sessions.get(cookies.vergil_session) || null;
+    return (
+        sessions.get(
+            cookies.vergil_session
+        ) || null
+    );
 }
 
-function redirect(res, location) {
-    res.writeHead(302, {
-        Location: location,
-        "Cache-Control": "no-store"
-    });
+function redirect(
+    res,
+    location
+) {
+    res.writeHead(
+        302,
+        {
+            Location: location,
+            "Cache-Control":
+                "no-store"
+        }
+    );
 
     res.end();
 }
 
-function sendHtml(res, html, status = 200) {
-    res.writeHead(status, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store"
-    });
+function sendHtml(
+    res,
+    html,
+    status = 200
+) {
+    res.writeHead(
+        status,
+        {
+            "Content-Type":
+                "text/html; charset=utf-8",
+
+            "Cache-Control":
+                "no-store"
+        }
+    );
 
     res.end(html);
 }
 
-function sendJson(res, data, status = 200) {
-    res.writeHead(status, {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store"
-    });
+function sendJson(
+    res,
+    data,
+    status = 200
+) {
+    res.writeHead(
+        status,
+        {
+            "Content-Type":
+                "application/json; charset=utf-8",
 
-    res.end(JSON.stringify(data));
+            "Cache-Control":
+                "no-store"
+        }
+    );
+
+    res.end(
+        JSON.stringify(data)
+    );
 }
 
 async function readBody(req) {
-    return new Promise((resolve, reject) => {
-        let body = "";
+    return new Promise(
+        (resolve, reject) => {
+            let body = "";
 
-        req.on("data", chunk => {
-            body += chunk;
+            req.on(
+                "data",
+                chunk => {
+                    body += chunk;
 
-            if (body.length > 1024 * 1024) {
-                reject(new Error("Request body too large"));
-                req.destroy();
-            }
-        });
+                    if (
+                        body.length >
+                        1024 * 1024
+                    ) {
+                        reject(
+                            new Error(
+                                "Request body too large"
+                            )
+                        );
 
-        req.on("end", () => resolve(body));
-        req.on("error", reject);
-    });
+                        req.destroy();
+                    }
+                }
+            );
+
+            req.on(
+                "end",
+                () => resolve(body)
+            );
+
+            req.on(
+                "error",
+                reject
+            );
+        }
+    );
 }
 
 async function readForm(req) {
@@ -175,11 +284,19 @@ async function readForm(req) {
     );
 }
 
-function requireAuth(req, res) {
-    const session = getSession(req);
+function requireAuth(
+    req,
+    res
+) {
+    const session =
+        getSession(req);
 
     if (!session) {
-        redirect(res, "/login");
+        redirect(
+            res,
+            "/login"
+        );
+
         return null;
     }
 
@@ -188,7 +305,9 @@ function requireAuth(req, res) {
 
 function getPublicHost(req) {
     const forwarded =
-        req.headers["x-forwarded-host"];
+        req.headers[
+            "x-forwarded-host"
+        ];
 
     const host =
         forwarded ||
@@ -202,7 +321,8 @@ function getPublicHost(req) {
 }
 
 function getPublicOrigin(req) {
-    const host = getPublicHost(req);
+    const host =
+        getPublicHost(req);
 
     if (
         host.startsWith("localhost") ||
@@ -226,7 +346,9 @@ function activeUsers() {
             OR expires_at > ?
         )
         ORDER BY id DESC
-    `).all(nowIso());
+    `).all(
+        nowIso()
+    );
 }
 
 function allUsers() {
@@ -246,11 +368,177 @@ function getAdmin() {
     `).get();
 }
 
+/*
+ * ---------------------------------------------------------
+ * Random per-user Paths
+ * ---------------------------------------------------------
+ */
+
+const PATH_ALPHABET =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+function randomPath(
+    prefix
+) {
+    let value = "";
+
+    for (
+        let i = 0;
+        i < 16;
+        i++
+    ) {
+        value +=
+            PATH_ALPHABET[
+                crypto.randomInt(
+                    0,
+                    PATH_ALPHABET.length
+                )
+            ];
+    }
+
+    return `/${prefix}-${value}`;
+}
+
+function generateUserPaths() {
+    return {
+        xhttp: [
+            randomPath("xhttp"),
+            randomPath("xhttp"),
+            randomPath("xhttp")
+        ],
+
+        ws: [
+            randomPath("ws"),
+            randomPath("ws"),
+            randomPath("ws")
+        ]
+    };
+}
+
+function saveUserPaths(
+    userId,
+    paths
+) {
+    db.prepare(`
+        UPDATE users
+        SET
+            xhttp_paths = ?,
+            ws_paths = ?
+        WHERE id = ?
+    `).run(
+        JSON.stringify(
+            paths.xhttp
+        ),
+        JSON.stringify(
+            paths.ws
+        ),
+        Number(userId)
+    );
+}
+
+function getUserPaths(user) {
+    let xhttp = [];
+    let ws = [];
+
+    try {
+        xhttp =
+            JSON.parse(
+                user.xhttp_paths || "[]"
+            );
+    } catch {
+        xhttp = [];
+    }
+
+    try {
+        ws =
+            JSON.parse(
+                user.ws_paths || "[]"
+            );
+    } catch {
+        ws = [];
+    }
+
+    if (
+        !Array.isArray(xhttp) ||
+        xhttp.length !== 3
+    ) {
+        xhttp = [];
+    }
+
+    if (
+        !Array.isArray(ws) ||
+        ws.length !== 3
+    ) {
+        ws = [];
+    }
+
+    return {
+        xhttp,
+        ws
+    };
+}
+
+function ensureUserPaths(
+    user
+) {
+    const current =
+        getUserPaths(user);
+
+    if (
+        current.xhttp.length === 3 &&
+        current.ws.length === 3
+    ) {
+        return current;
+    }
+
+    const paths =
+        generateUserPaths();
+
+    saveUserPaths(
+        user.id,
+        paths
+    );
+
+    return paths;
+}
+
+function ensureAllUserPaths() {
+    const users =
+        db.prepare(`
+            SELECT *
+            FROM users
+        `).all();
+
+    for (
+        const user
+        of users
+    ) {
+        ensureUserPaths(user);
+    }
+
+    console.log(
+        `🛣️ User paths synced: ${users.length} user(s)`
+    );
+}
+
+/*
+ * ---------------------------------------------------------
+ * Xray configuration
+ * ---------------------------------------------------------
+ *
+ * Xray همچنان فقط دو inbound داخلی دارد.
+ * Pathهای اختصاصی توسط Node به این دو Path داخلی
+ * ترجمه می‌شوند.
+ */
+
 function generateXrayConfig() {
-    const clients = activeUsers().map(user => ({
-        id: user.uuid,
-        email: user.username
-    }));
+    const clients =
+        activeUsers().map(
+            user => ({
+                id: user.uuid,
+                email: user.username
+            })
+        );
 
     return {
         log: {
@@ -259,42 +547,64 @@ function generateXrayConfig() {
 
         inbounds: [
             {
-                listen: "127.0.0.1",
-                port: XRAY_XHTTP_PORT,
-                protocol: "vless",
+                listen:
+                    "127.0.0.1",
+
+                port:
+                    XRAY_XHTTP_PORT,
+
+                protocol:
+                    "vless",
 
                 settings: {
                     clients,
-                    decryption: "none"
+                    decryption:
+                        "none"
                 },
 
                 streamSettings: {
-                    network: "xhttp",
-                    security: "none",
+                    network:
+                        "xhttp",
+
+                    security:
+                        "none",
 
                     xhttpSettings: {
-                        path: XHTTP_PATH,
-                        mode: "auto"
+                        path:
+                            XHTTP_PATH,
+
+                        mode:
+                            "auto"
                     }
                 }
             },
 
             {
-                listen: "127.0.0.1",
-                port: XRAY_WS_PORT,
-                protocol: "vless",
+                listen:
+                    "127.0.0.1",
+
+                port:
+                    XRAY_WS_PORT,
+
+                protocol:
+                    "vless",
 
                 settings: {
                     clients,
-                    decryption: "none"
+                    decryption:
+                        "none"
                 },
 
                 streamSettings: {
-                    network: "websocket",
-                    security: "none",
+                    network:
+                        "websocket",
+
+                    security:
+                        "none",
 
                     wsSettings: {
-                        path: WS_PATH
+                        path:
+                            WS_PATH
                     }
                 }
             }
@@ -302,18 +612,24 @@ function generateXrayConfig() {
 
         outbounds: [
             {
-                protocol: "freedom"
+                protocol:
+                    "freedom"
             }
         ]
     };
 }
 
 async function writeXrayConfig() {
-    const config = generateXrayConfig();
+    const config =
+        generateXrayConfig();
 
     await fs.writeFile(
         XRAY_CONFIG,
-        JSON.stringify(config, null, 2),
+        JSON.stringify(
+            config,
+            null,
+            2
+        ),
         "utf8"
     );
 
@@ -323,94 +639,146 @@ async function writeXrayConfig() {
 }
 
 function stopXray() {
-    return new Promise(resolve => {
-        if (!xrayProcess) {
-            resolve();
-            return;
-        }
+    return new Promise(
+        resolve => {
+            if (!xrayProcess) {
+                resolve();
+                return;
+            }
 
-        const processToStop = xrayProcess;
-        xrayProcess = null;
+            const processToStop =
+                xrayProcess;
 
-        const timer = setTimeout(() => {
+            xrayProcess = null;
+
+            const timer =
+                setTimeout(
+                    () => {
+                        try {
+                            processToStop.kill(
+                                "SIGKILL"
+                            );
+                        } catch {}
+
+                        resolve();
+                    },
+                    3000
+                );
+
+            processToStop.once(
+                "exit",
+                () => {
+                    clearTimeout(
+                        timer
+                    );
+
+                    resolve();
+                }
+            );
+
             try {
-                processToStop.kill("SIGKILL");
-            } catch {}
+                processToStop.kill(
+                    "SIGTERM"
+                );
+            } catch {
+                clearTimeout(
+                    timer
+                );
 
-            resolve();
-        }, 3000);
-
-        processToStop.once("exit", () => {
-            clearTimeout(timer);
-            resolve();
-        });
-
-        try {
-            processToStop.kill("SIGTERM");
-        } catch {
-            clearTimeout(timer);
-            resolve();
+                resolve();
+            }
         }
-    });
+    );
 }
 
 async function startXray() {
     await writeXrayConfig();
 
-    console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
+    console.log(
+        `⚙️ Xray binary: ${XRAY_BIN}`
+    );
 
-    xrayProcess = spawn(
-        XRAY_BIN,
-        [
-            "run",
-            "-config",
-            XRAY_CONFIG
-        ],
-        {
-            stdio: ["ignore", "pipe", "pipe"]
+    xrayProcess =
+        spawn(
+            XRAY_BIN,
+            [
+                "run",
+                "-config",
+                XRAY_CONFIG
+            ],
+            {
+                stdio: [
+                    "ignore",
+                    "pipe",
+                    "pipe"
+                ]
+            }
+        );
+
+    xrayProcess.stdout.on(
+        "data",
+        data => {
+            process.stdout.write(
+                `[XRAY] ${data}`
+            );
         }
     );
 
-    xrayProcess.stdout.on("data", data => {
-        process.stdout.write(`[XRAY] ${data}`);
-    });
-
-    xrayProcess.stderr.on("data", data => {
-        process.stderr.write(`[XRAY] ${data}`);
-    });
-
-    xrayProcess.on("error", error => {
-        console.error(
-            "❌ Xray process error:",
-            error
-        );
-    });
-
-    xrayProcess.on("exit", (code, signal) => {
-        console.log(
-            `⚠️ Xray exited. code=${code} signal=${signal}`
-        );
-
-        xrayProcess = null;
-
-        if (
-            !stoppingXray &&
-            !xrayRestarting
-        ) {
-            setTimeout(() => {
-                startXray().catch(error => {
-                    console.error(
-                        "❌ Xray restart failed:",
-                        error
-                    );
-                });
-            }, 1500);
+    xrayProcess.stderr.on(
+        "data",
+        data => {
+            process.stderr.write(
+                `[XRAY] ${data}`
+            );
         }
-    });
+    );
+
+    xrayProcess.on(
+        "error",
+        error => {
+            console.error(
+                "❌ Xray process error:",
+                error
+            );
+        }
+    );
+
+    xrayProcess.on(
+        "exit",
+        (code, signal) => {
+            console.log(
+                `⚠️ Xray exited. code=${code} signal=${signal}`
+            );
+
+            xrayProcess = null;
+
+            if (
+                !stoppingXray &&
+                !xrayRestarting
+            ) {
+                setTimeout(
+                    () => {
+                        startXray()
+                            .catch(
+                                error => {
+                                    console.error(
+                                        "❌ Xray restart failed:",
+                                        error
+                                    );
+                                }
+                            );
+                    },
+                    1500
+                );
+            }
+        }
+    );
 }
 
 async function restartXray() {
-    if (xrayRestarting) return;
+    if (xrayRestarting) {
+        return;
+    }
 
     xrayRestarting = true;
 
@@ -422,89 +790,181 @@ async function restartXray() {
     }
 }
 
-function makeVlessLinks(user, origin) {
+/*
+ * ---------------------------------------------------------
+ * VLESS links
+ * ---------------------------------------------------------
+ */
+
+function makeVlessLinks(
+    user,
+    origin
+) {
     const domain =
         new URL(origin).hostname;
 
-    const xhttpParams =
-        new URLSearchParams({
-            encryption: "none",
-            security: "tls",
-            type: "xhttp",
-            path: XHTTP_PATH,
-            host: domain,
-            mode: "auto"
-        });
+    const paths =
+        ensureUserPaths(user);
 
-    const wsParams =
-        new URLSearchParams({
-            encryption: "none",
-            security: "tls",
-            type: "ws",
-            path: WS_PATH,
-            host: domain
-        });
+    const xhttpLinks =
+        paths.xhttp.map(
+            (
+                path,
+                index
+            ) => {
+                const params =
+                    new URLSearchParams({
+                        encryption:
+                            "none",
+
+                        security:
+                            "tls",
+
+                        type:
+                            "xhttp",
+
+                        path,
+
+                        host:
+                            domain,
+
+                        mode:
+                            "auto"
+                    });
+
+                return (
+                    `vless://${user.uuid}@${domain}:443?${params.toString()}#${encodeURIComponent(
+                        user.username
+                    )}-XHTTP-${index + 1}`
+                );
+            }
+        );
+
+    const websocketLinks =
+        paths.ws.map(
+            (
+                path,
+                index
+            ) => {
+                const params =
+                    new URLSearchParams({
+                        encryption:
+                            "none",
+
+                        security:
+                            "tls",
+
+                        type:
+                            "ws",
+
+                        path,
+
+                        host:
+                            domain
+                    });
+
+                return (
+                    `vless://${user.uuid}@${domain}:443?${params.toString()}#${encodeURIComponent(
+                        user.username
+                    )}-WS-${index + 1}`
+                );
+            }
+        );
 
     return {
         xhttp:
-            `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(user.username)}-XHTTP`,
+            xhttpLinks[0],
 
         websocket:
-            `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(user.username)}-WS`
+            websocketLinks[0],
+
+        xhttpLinks,
+
+        websocketLinks
     };
 }
 
 /*
- * Dummy configuration
- *
- * این کانفیگ عمداً کار نمی‌کند.
- * فقط برای نمایش پیام مالک/برند داخل Subscription است.
+ * ---------------------------------------------------------
+ * Dummy / Branding configurations
+ * ---------------------------------------------------------
  */
 
-function makeDummyConfig() {
+function makeDummyConfig(
+    message
+) {
     const params =
         new URLSearchParams({
-            encryption: "none",
-            security: "none",
-            type: "tcp"
+            encryption:
+                "none",
+
+            security:
+                "none",
+
+            type:
+                "tcp"
         });
 
     return (
         `vless://00000000-0000-0000-0000-000000000000@0.0.0.0:443?${params.toString()}#${encodeURIComponent(
-            "ساخته شده توسط یاسین - کاملا رایگان و غیرقابل فروش"
+            message
         )}`
     );
 }
 
-function makeSubscription(user, origin) {
+function makeSubscription(
+    user,
+    origin
+) {
     const links =
         makeVlessLinks(
             user,
             origin
         );
 
-    const dummy =
-        makeDummyConfig();
+    const dummy1 =
+        makeDummyConfig(
+            "ساخته شده توسط یاسین - کاملا رایگان و غیرقابل فروش"
+        );
+
+    const dummy2 =
+        makeDummyConfig(
+            "به یاد زنده یاد علی نور"
+        );
 
     return Buffer.from(
         [
-            links.xhttp,
-            links.websocket,
-            dummy
+            ...links.xhttpLinks,
+            ...links.websocketLinks,
+            dummy1,
+            dummy2
         ].join("\n"),
         "utf8"
     ).toString("base64");
 }
 
 async function qrCode(text) {
-    return QRCode.toDataURL(text, {
-        width: 260,
-        margin: 2,
-        errorCorrectionLevel: "M"
-    });
+    return QRCode.toDataURL(
+        text,
+        {
+            width: 260,
+            margin: 2,
+            errorCorrectionLevel:
+                "M"
+        }
+    );
 }
 
-function layout(title, body) {
+/*
+ * ---------------------------------------------------------
+ * UI
+ * ---------------------------------------------------------
+ */
+
+function layout(
+    title,
+    body
+) {
     return `
 <!doctype html>
 
@@ -1413,7 +1873,9 @@ ${body}
 `;
 }
 
-function loginPage(error = "") {
+function loginPage(
+    error = ""
+) {
     return layout(
         "Login",
         `
@@ -1491,8 +1953,11 @@ POWERED BY YASIN BEHZAD
 }
 
 function dashboardPage(req) {
-    const users = allUsers();
-    const active = activeUsers();
+    const users =
+        allUsers();
+
+    const active =
+        activeUsers();
 
     const online =
         Boolean(
@@ -1717,13 +2182,16 @@ v${VERSION}
 
 ${
     users.length
-        ? users.map(user => `
+        ? users.map(
+            user => `
 
 <tr>
 
 <td>
 <strong>
-${escapeHtml(user.username)}
+${escapeHtml(
+    user.username
+)}
 </strong>
 </td>
 
@@ -1819,7 +2287,8 @@ ${
 
 </tr>
 
-`).join("")
+`
+        ).join("")
         : `
 <tr>
 
@@ -1851,7 +2320,9 @@ VERGILPANEL v${VERSION} · POWERED BY YASIN BEHZAD
     );
 }
 
-function newUserPage(error = "") {
+function newUserPage(
+    error = ""
+) {
     return layout(
         "New User",
         `
@@ -2117,7 +2588,10 @@ POWERED BY YASIN BEHZAD
     );
 }
 
-async function configPage(req, user) {
+async function configPage(
+    req,
+    user
+) {
     const origin =
         getPublicOrigin(req);
 
@@ -2171,7 +2645,9 @@ async function configPage(req, user) {
 <div class="card">
 
 <h1>
-⚔️ ${escapeHtml(user.username)}
+⚔️ ${escapeHtml(
+    user.username
+)}
 </h1>
 
 <p class="muted">
@@ -2380,25 +2856,23 @@ async function copyText(text){
 }
 
 /*
+ * ---------------------------------------------------------
  * Default Admin
- *
- * Fresh deployment:
- *
- * admin / admin
- *
- * Railway Variables can override it.
+ * ---------------------------------------------------------
  */
 
 function ensureDefaultAdmin() {
 
     const username =
         String(
-            process.env.ADMIN_USERNAME || "admin"
+            process.env.ADMIN_USERNAME ||
+            "admin"
         ).trim();
 
     const password =
         String(
-            process.env.ADMIN_PASSWORD || "admin"
+            process.env.ADMIN_PASSWORD ||
+            "admin"
         );
 
     const existing =
@@ -2406,7 +2880,9 @@ function ensureDefaultAdmin() {
             SELECT id
             FROM admins
             WHERE username = ?
-        `).get(username);
+        `).get(
+            username
+        );
 
     if (existing) {
 
@@ -2453,7 +2929,9 @@ function authenticate(
             SELECT *
             FROM admins
             WHERE username = ?
-        `).get(username);
+        `).get(
+            username
+        );
 
     if (!admin) {
         return false;
@@ -2465,8 +2943,15 @@ function authenticate(
     );
 }
 
-async function createUser(form) {
+/*
+ * ---------------------------------------------------------
+ * User management
+ * ---------------------------------------------------------
+ */
 
+async function createUser(
+    form
+) {
     const username =
         String(
             form.get("username") || ""
@@ -2483,7 +2968,9 @@ async function createUser(form) {
             SELECT id
             FROM users
             WHERE username = ?
-        `).get(username);
+        `).get(
+            username
+        );
 
     if (exists) {
         throw new Error(
@@ -2499,14 +2986,18 @@ async function createUser(form) {
 
     const trafficLimit =
         Number(
-            form.get("traffic_limit") || 0
+            form.get(
+                "traffic_limit"
+            ) || 0
         );
 
     let expiresAt = null;
 
     const expiry =
         String(
-            form.get("expires_at") || ""
+            form.get(
+                "expires_at"
+            ) || ""
         ).trim();
 
     if (expiry) {
@@ -2560,10 +3051,31 @@ async function createUser(form) {
             )
                 ? trafficLimit
                 : 0,
+
             expiresAt,
+
             subscriptionToken,
+
             nowIso()
         );
+
+    const createdUser =
+        db.prepare(`
+            SELECT *
+            FROM users
+            WHERE id = ?
+        `).get(
+            result.lastInsertRowid
+        );
+
+    /*
+     * برای کاربر جدید، ۶ Path اختصاصی
+     * همین‌جا یک‌بار ساخته و ذخیره می‌شوند.
+     */
+
+    ensureUserPaths(
+        createdUser
+    );
 
     await restartXray();
 
@@ -2576,8 +3088,9 @@ async function createUser(form) {
     );
 }
 
-async function deleteUser(id) {
-
+async function deleteUser(
+    id
+) {
     db.prepare(`
         DELETE FROM users
         WHERE id = ?
@@ -2588,8 +3101,9 @@ async function deleteUser(id) {
     await restartXray();
 }
 
-async function toggleUser(id) {
-
+async function toggleUser(
+    id
+) {
     const user =
         db.prepare(`
             SELECT *
@@ -2704,19 +3218,105 @@ function updateAdmin(
     }
 }
 
+/*
+ * ---------------------------------------------------------
+ * Path routing
+ * ---------------------------------------------------------
+ *
+ * Public random paths:
+ *
+ * /xhttp-xxxxxxxxxxxxxxxx
+ * /ws-xxxxxxxxxxxxxxxx
+ *
+ * Internal Xray paths:
+ *
+ * /xhttp
+ * /ws
+ */
+
+function findPathRoute(
+    pathname
+) {
+    const users =
+        activeUsers();
+
+    for (
+        const user
+        of users
+    ) {
+        const paths =
+            ensureUserPaths(
+                user
+            );
+
+        if (
+            paths.xhttp.includes(
+                pathname
+            )
+        ) {
+            return {
+                type: "xhttp",
+                targetPath:
+                    XHTTP_PATH,
+                user
+            };
+        }
+
+        if (
+            paths.ws.includes(
+                pathname
+            )
+        ) {
+            return {
+                type: "ws",
+                targetPath:
+                    WS_PATH,
+                user
+            };
+        }
+    }
+
+    return null;
+}
+
+/*
+ * ---------------------------------------------------------
+ * HTTP proxy
+ * ---------------------------------------------------------
+ */
+
 function proxyHttpToXray(
     req,
     res,
-    targetPort
+    targetPort,
+    targetPath
 ) {
+    const requestUrl =
+        new URL(
+            req.url,
+            `http://${req.headers.host || "localhost"}`
+        );
+
+    requestUrl.pathname =
+        targetPath;
+
     const options = {
-        hostname: "127.0.0.1",
-        port: targetPort,
-        path: req.url,
-        method: req.method,
+        hostname:
+            "127.0.0.1",
+
+        port:
+            targetPort,
+
+        path:
+            requestUrl.pathname +
+            requestUrl.search,
+
+        method:
+            req.method,
 
         headers: {
             ...req.headers,
+
             host:
                 `127.0.0.1:${targetPort}`
         }
@@ -2728,11 +3328,15 @@ function proxyHttpToXray(
             upstream => {
 
                 res.writeHead(
-                    upstream.statusCode || 502,
+                    upstream.statusCode ||
+                        502,
+
                     upstream.headers
                 );
 
-                upstream.pipe(res);
+                upstream.pipe(
+                    res
+                );
             }
         );
 
@@ -2745,7 +3349,9 @@ function proxyHttpToXray(
                 error
             );
 
-            if (!res.headersSent) {
+            if (
+                !res.headersSent
+            ) {
 
                 res.writeHead(
                     502,
@@ -2756,37 +3362,63 @@ function proxyHttpToXray(
                 );
             }
 
-            res.end("Bad Gateway");
+            res.end(
+                "Bad Gateway"
+            );
         }
     );
 
     req.pipe(proxy);
 }
 
+/*
+ * ---------------------------------------------------------
+ * WebSocket proxy
+ * ---------------------------------------------------------
+ */
+
 function proxyWebSocket(
     req,
     clientSocket,
-    head
+    head,
+    targetPath
 ) {
     const upstream =
         net.connect({
-            host: "127.0.0.1",
-            port: XRAY_WS_PORT
+            host:
+                "127.0.0.1",
+
+            port:
+                XRAY_WS_PORT
         });
 
     upstream.on(
         "connect",
         () => {
 
+            const requestUrl =
+                new URL(
+                    req.url,
+                    `http://${req.headers.host || "localhost"}`
+                );
+
+            requestUrl.pathname =
+                targetPath;
+
             const headers = [];
 
             headers.push(
-                `${req.method} ${req.url} HTTP/${req.httpVersion}`
+                `${req.method} ${requestUrl.pathname}${requestUrl.search} HTTP/${req.httpVersion}`
             );
 
             for (
-                const [key, value]
-                of Object.entries(req.headers)
+                const [
+                    key,
+                    value
+                ]
+                of Object.entries(
+                    req.headers
+                )
             ) {
 
                 if (
@@ -2815,18 +3447,27 @@ function proxyWebSocket(
             headers.push("");
 
             upstream.write(
-                headers.join("\r\n")
+                headers.join(
+                    "\r\n"
+                )
             );
 
             if (
                 head &&
                 head.length
             ) {
-                upstream.write(head);
+                upstream.write(
+                    head
+                );
             }
 
-            clientSocket.pipe(upstream);
-            upstream.pipe(clientSocket);
+            clientSocket.pipe(
+                upstream
+            );
+
+            upstream.pipe(
+                clientSocket
+            );
         }
     );
 
@@ -2866,6 +3507,12 @@ function proxyWebSocket(
     );
 }
 
+/*
+ * ---------------------------------------------------------
+ * Subscription
+ * ---------------------------------------------------------
+ */
+
 async function subscriptionResponse(
     req,
     res,
@@ -2876,7 +3523,9 @@ async function subscriptionResponse(
             SELECT *
             FROM users
             WHERE subscription_token = ?
-        `).get(token);
+        `).get(
+            token
+        );
 
     if (!user) {
 
@@ -2945,8 +3594,16 @@ async function subscriptionResponse(
         }
     );
 
-    res.end(content);
+    res.end(
+        content
+    );
 }
+
+/*
+ * ---------------------------------------------------------
+ * Main request handler
+ * ---------------------------------------------------------
+ */
 
 async function handleRequest(
     req,
@@ -2964,20 +3621,25 @@ async function handleRequest(
             url.pathname;
 
         /*
-         * XHTTP
+         * Multi-path XHTTP
          */
 
+        const pathRoute =
+            findPathRoute(
+                pathname
+            );
+
         if (
-            pathname === XHTTP_PATH ||
-            pathname.startsWith(
-                `${XHTTP_PATH}/`
-            )
+            pathRoute &&
+            pathRoute.type ===
+                "xhttp"
         ) {
 
             proxyHttpToXray(
                 req,
                 res,
-                XRAY_XHTTP_PORT
+                XRAY_XHTTP_PORT,
+                pathRoute.targetPath
             );
 
             return;
@@ -2988,7 +3650,9 @@ async function handleRequest(
          */
 
         if (
-            pathname.startsWith("/sub/")
+            pathname.startsWith(
+                "/sub/"
+            )
         ) {
 
             const token =
@@ -3008,14 +3672,17 @@ async function handleRequest(
          */
 
         if (
-            pathname === "/health"
+            pathname ===
+            "/health"
         ) {
 
             sendJson(
                 res,
                 {
                     ok: true,
-                    panel: VERSION,
+
+                    panel:
+                        VERSION,
 
                     xray:
                         Boolean(
@@ -3042,7 +3709,9 @@ async function handleRequest(
             req.method === "GET"
         ) {
 
-            if (getSession(req)) {
+            if (
+                getSession(req)
+            ) {
 
                 redirect(
                     res,
@@ -3070,12 +3739,16 @@ async function handleRequest(
 
             const username =
                 String(
-                    form.get("username") || ""
+                    form.get(
+                        "username"
+                    ) || ""
                 ).trim();
 
             const password =
                 String(
-                    form.get("password") || ""
+                    form.get(
+                        "password"
+                    ) || ""
                 );
 
             if (
@@ -3162,7 +3835,8 @@ async function handleRequest(
             res.writeHead(
                 302,
                 {
-                    Location: "/login",
+                    Location:
+                        "/login",
 
                     "Set-Cookie":
                         "vergil_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure"
@@ -3234,12 +3908,16 @@ async function handleRequest(
 
                 const username =
                     String(
-                        form.get("username") || ""
+                        form.get(
+                            "username"
+                        ) || ""
                     ).trim();
 
                 const password =
                     String(
-                        form.get("password") || ""
+                        form.get(
+                            "password"
+                        ) || ""
                     );
 
                 const confirm =
@@ -3298,7 +3976,8 @@ async function handleRequest(
          */
 
         if (
-            pathname === "/users/new" &&
+            pathname ===
+                "/users/new" &&
             req.method === "GET"
         ) {
 
@@ -3311,7 +3990,8 @@ async function handleRequest(
         }
 
         if (
-            pathname === "/users/new" &&
+            pathname ===
+                "/users/new" &&
             req.method === "POST"
         ) {
 
@@ -3340,7 +4020,7 @@ async function handleRequest(
                     res,
                     newUserPage(
                         error?.message ||
-                        "خطا در ساخت کاربر."
+                            "خطا در ساخت کاربر."
                     ),
                     500
                 );
@@ -3354,13 +4034,16 @@ async function handleRequest(
          */
 
         if (
-            pathname === "/users/config" &&
+            pathname ===
+                "/users/config" &&
             req.method === "GET"
         ) {
 
             const id =
                 Number(
-                    url.searchParams.get("id")
+                    url.searchParams.get(
+                        "id"
+                    )
                 );
 
             const user =
@@ -3368,7 +4051,9 @@ async function handleRequest(
                     SELECT *
                     FROM users
                     WHERE id = ?
-                `).get(id);
+                `).get(
+                    id
+                );
 
             if (!user) {
 
@@ -3403,6 +4088,15 @@ async function handleRequest(
                 return;
             }
 
+            /*
+             * اگر کاربر قدیمی باشد،
+             * همین‌جا هم Pathها ساخته می‌شوند.
+             */
+
+            ensureUserPaths(
+                user
+            );
+
             sendHtml(
                 res,
                 await configPage(
@@ -3419,7 +4113,8 @@ async function handleRequest(
          */
 
         if (
-            pathname === "/users/toggle" &&
+            pathname ===
+                "/users/toggle" &&
             req.method === "POST"
         ) {
 
@@ -3452,7 +4147,8 @@ async function handleRequest(
          */
 
         if (
-            pathname === "/users/delete" &&
+            pathname ===
+                "/users/delete" &&
             req.method === "POST"
         ) {
 
@@ -3519,7 +4215,9 @@ async function handleRequest(
             error
         );
 
-        if (!res.headersSent) {
+        if (
+            !res.headersSent
+        ) {
 
             sendJson(
                 res,
@@ -3534,14 +4232,28 @@ async function handleRequest(
     }
 }
 
+/*
+ * ---------------------------------------------------------
+ * HTTP server
+ * ---------------------------------------------------------
+ */
+
 const server =
     http.createServer(
         handleRequest
     );
 
+/*
+ * WebSocket random-path routing
+ */
+
 server.on(
     "upgrade",
-    (req, socket, head) => {
+    (
+        req,
+        socket,
+        head
+    ) => {
 
         try {
 
@@ -3551,17 +4263,21 @@ server.on(
                     `http://${req.headers.host || "localhost"}`
                 );
 
+            const route =
+                findPathRoute(
+                    url.pathname
+                );
+
             if (
-                url.pathname === WS_PATH ||
-                url.pathname.startsWith(
-                    `${WS_PATH}/`
-                )
+                route &&
+                route.type === "ws"
             ) {
 
                 proxyWebSocket(
                     req,
                     socket,
-                    head
+                    head,
+                    route.targetPath
                 );
 
                 return;
@@ -3576,7 +4292,20 @@ server.on(
     }
 );
 
+/*
+ * ---------------------------------------------------------
+ * Startup
+ * ---------------------------------------------------------
+ */
+
 ensureDefaultAdmin();
+
+/*
+ * کاربران قدیمی v0.8.0 هم
+ * Path اختصاصی دریافت می‌کنند.
+ */
+
+ensureAllUserPaths();
 
 await startXray();
 
@@ -3594,6 +4323,14 @@ server.listen(
         );
 
         console.log(
+            `🛣️ Multi-path: 3 XHTTP + 3 WebSocket per user`
+        );
+
+        console.log(
+            `📡 Subscription: 6 configs + 2 branding entries`
+        );
+
+        console.log(
             `💙 POWERED BY YASIN BEHZAD`
         );
 
@@ -3603,7 +4340,9 @@ server.listen(
     }
 );
 
-async function shutdown(signal) {
+async function shutdown(
+    signal
+) {
 
     console.log(
         `Received ${signal}`
@@ -3624,10 +4363,12 @@ async function shutdown(signal) {
 
 process.on(
     "SIGTERM",
-    () => shutdown("SIGTERM")
+    () =>
+        shutdown("SIGTERM")
 );
 
 process.on(
     "SIGINT",
-    () => shutdown("SIGINT")
+    () =>
+        shutdown("SIGINT")
 );
