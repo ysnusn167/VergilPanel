@@ -36,6 +36,10 @@ const VERSION = "0.8.0";
 let xrayProcess = null;
 let stoppingXray = false;
 let xrayRestarting = false;
+let xrayRestartTimer = null;
+let xrayRestartAttempts = 0;
+
+const proxyHttpAgent = new http.Agent({ keepAlive: true });
 
 const sessions = new Map();
 
@@ -149,6 +153,28 @@ function sendJson(res, data, status = 200) {
     });
 
     res.end(JSON.stringify(data));
+}
+
+async function checkTcpPort(port, timeout = 1200) {
+    return new Promise(resolve => {
+        let settled = false;
+        const socket = net.createConnection({
+            host: "127.0.0.1",
+            port
+        });
+
+        const finish = isOpen => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            resolve(isOpen);
+        };
+
+        socket.setTimeout(timeout);
+        socket.once("connect", () => finish(true));
+        socket.once("timeout", () => finish(false));
+        socket.once("error", () => finish(false));
+    });
 }
 
 async function readBody(req) {
@@ -318,8 +344,36 @@ async function writeXrayConfig() {
     );
 
     console.log(
-        `⚙️ Xray config synced: ${activeUsers().length} active user(s)`
+        `âš™ï¸ Xray config synced: ${activeUsers().length} active user(s)`
     );
+}
+
+function clearXrayRestartTimer() {
+    if (xrayRestartTimer) {
+        clearTimeout(xrayRestartTimer);
+        xrayRestartTimer = null;
+    }
+}
+
+function scheduleXrayRestart() {
+    if (stoppingXray || xrayRestarting || xrayRestartTimer) return;
+
+    xrayRestartAttempts = Math.min(xrayRestartAttempts + 1, 8);
+    const delay = Math.min(1500 * (2 ** (xrayRestartAttempts - 1)), 30000);
+
+    console.warn(`âš ï¸ Scheduling Xray restart in ${delay}ms (attempt ${xrayRestartAttempts})`);
+    xrayRestartTimer = setTimeout(async () => {
+        xrayRestartTimer = null;
+
+        if (stoppingXray || xrayRestarting) return;
+
+        try {
+            await startXray();
+        } catch (error) {
+            console.error("âŒ Xray restart failed:", error);
+            scheduleXrayRestart();
+        }
+    }, delay);
 }
 
 function stopXray() {
@@ -357,9 +411,9 @@ function stopXray() {
 async function startXray() {
     await writeXrayConfig();
 
-    console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
+    console.log(`âš™ï¸ Xray binary: ${XRAY_BIN}`);
 
-    xrayProcess = spawn(
+    const child = spawn(
         XRAY_BIN,
         [
             "run",
@@ -370,41 +424,37 @@ async function startXray() {
             stdio: ["ignore", "pipe", "pipe"]
         }
     );
+    xrayProcess = child;
 
-    xrayProcess.stdout.on("data", data => {
+    child.stdout.on("data", data => {
         process.stdout.write(`[XRAY] ${data}`);
     });
 
-    xrayProcess.stderr.on("data", data => {
+    child.stderr.on("data", data => {
         process.stderr.write(`[XRAY] ${data}`);
     });
 
-    xrayProcess.on("error", error => {
-        console.error(
-            "❌ Xray process error:",
-            error
-        );
+    child.on("error", error => {
+        console.error("âŒ Xray process error:", error);
+
+        if (xrayProcess === child) {
+            xrayProcess = null;
+        }
+
+        if (!stoppingXray && !xrayRestarting) {
+            scheduleXrayRestart();
+        }
     });
 
-    xrayProcess.on("exit", (code, signal) => {
-        console.log(
-            `⚠️ Xray exited. code=${code} signal=${signal}`
-        );
+    child.on("exit", (code, signal) => {
+        console.log(`âš ï¸ Xray exited. code=${code} signal=${signal}`);
 
-        xrayProcess = null;
+        if (xrayProcess === child) {
+            xrayProcess = null;
+        }
 
-        if (
-            !stoppingXray &&
-            !xrayRestarting
-        ) {
-            setTimeout(() => {
-                startXray().catch(error => {
-                    console.error(
-                        "❌ Xray restart failed:",
-                        error
-                    );
-                });
-            }, 1500);
+        if (!stoppingXray && !xrayRestarting) {
+            scheduleXrayRestart();
         }
     });
 }
@@ -413,13 +463,20 @@ async function restartXray() {
     if (xrayRestarting) return;
 
     xrayRestarting = true;
+    clearXrayRestartTimer();
+    let restartFailed = false;
 
     try {
         await stopXray();
         await startXray();
+    } catch (error) {
+        console.error("âŒ Xray restart failed:", error);
+        restartFailed = true;
     } finally {
         xrayRestarting = false;
     }
+
+    if (restartFailed) scheduleXrayRestart();
 }
 
 function makeVlessLinks(user, origin) {
@@ -457,8 +514,8 @@ function makeVlessLinks(user, origin) {
 /*
  * Dummy configuration
  *
- * این کانفیگ عمداً کار نمی‌کند.
- * فقط برای نمایش پیام مالک/برند داخل Subscription است.
+ * Ø§ÛŒÙ† Ú©Ø§Ù†ÙÛŒÚ¯ Ø¹Ù…Ø¯Ø§Ù‹ Ú©Ø§Ø± Ù†Ù…ÛŒâ€ŒÚ©Ù†Ø¯.
+ * ÙÙ‚Ø· Ø¨Ø±Ø§ÛŒ Ù†Ù…Ø§ÛŒØ´ Ù¾ÛŒØ§Ù… Ù…Ø§Ù„Ú©/Ø¨Ø±Ù†Ø¯ Ø¯Ø§Ø®Ù„ Subscription Ø§Ø³Øª.
  */
 
 function makeDummyConfig() {
@@ -471,7 +528,7 @@ function makeDummyConfig() {
 
     return (
         `vless://00000000-0000-0000-0000-000000000000@0.0.0.0:443?${params.toString()}#${encodeURIComponent(
-            "ساخته شده توسط یاسین - کاملا رایگان و غیرقابل فروش"
+            "Ø³Ø§Ø®ØªÙ‡ Ø´Ø¯Ù‡ ØªÙˆØ³Ø· ÛŒØ§Ø³ÛŒÙ† - Ú©Ø§Ù…Ù„Ø§ Ø±Ø§ÛŒÚ¯Ø§Ù† Ùˆ ØºÛŒØ±Ù‚Ø§Ø¨Ù„ ÙØ±ÙˆØ´"
         )}`
     );
 }
@@ -520,7 +577,7 @@ function layout(title, body) {
 >
 
 <title>
-${escapeHtml(title)} — VergilPanel
+${escapeHtml(title)} â€” VergilPanel
 </title>
 
 <style>
@@ -1422,7 +1479,7 @@ function loginPage(error = "") {
 <div class="card login-card">
 
 <div class="login-logo">
-⚔️ VERGIL<span>PANEL</span>
+âš”ï¸ VERGIL<span>PANEL</span>
 </div>
 
 <div class="login-sub">
@@ -1445,7 +1502,7 @@ ${escapeHtml(error)}
 >
 
 <label>
-نام کاربری
+Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ
 </label>
 
 <input
@@ -1456,7 +1513,7 @@ ${escapeHtml(error)}
 >
 
 <label>
-رمز عبور
+Ø±Ù…Ø² Ø¹Ø¨ÙˆØ±
 </label>
 
 <input
@@ -1474,7 +1531,7 @@ ${escapeHtml(error)}
     type="submit"
     style="width:100%"
 >
-ورود به پنل
+ÙˆØ±ÙˆØ¯ Ø¨Ù‡ Ù¾Ù†Ù„
 </button>
 
 </form>
@@ -1516,7 +1573,7 @@ function dashboardPage(req) {
 >
 
 <div class="brand-icon">
-⚔️
+âš”ï¸
 </div>
 
 <div>
@@ -1537,14 +1594,14 @@ ${escapeHtml(
     class="btn"
     href="/settings"
 >
-⚙️ تنظیمات
+âš™ï¸ ØªÙ†Ø¸ÛŒÙ…Ø§Øª
 </a>
 
 <a
     class="btn danger"
     href="/logout"
 >
-خروج
+Ø®Ø±ÙˆØ¬
 </a>
 
 </div>
@@ -1564,7 +1621,7 @@ VERGIL
 </div>
 
 <div class="hero-sub">
-مدیریت هوشمند VLESS با Xray
+Ù…Ø¯ÛŒØ±ÛŒØª Ù‡ÙˆØ´Ù…Ù†Ø¯ VLESS Ø¨Ø§ Xray
 <br>
 XHTTP + WebSocket
 </div>
@@ -1601,7 +1658,7 @@ Xray ${
 <div class="card">
 
 <div class="stat-label">
-کاربران
+Ú©Ø§Ø±Ø¨Ø±Ø§Ù†
 </div>
 
 <div class="stat-value">
@@ -1613,7 +1670,7 @@ ${users.length}
 <div class="card">
 
 <div class="stat-label">
-کاربران فعال
+Ú©Ø§Ø±Ø¨Ø±Ø§Ù† ÙØ¹Ø§Ù„
 </div>
 
 <div class="stat-value">
@@ -1663,11 +1720,11 @@ v${VERSION}
 <div>
 
 <h2>
-👤 کاربران
+ðŸ‘¤ Ú©Ø§Ø±Ø¨Ø±Ø§Ù†
 </h2>
 
 <div class="muted">
-مدیریت خودکار کانفیگ‌های Xray
+Ù…Ø¯ÛŒØ±ÛŒØª Ø®ÙˆØ¯Ú©Ø§Ø± Ú©Ø§Ù†ÙÛŒÚ¯â€ŒÙ‡Ø§ÛŒ Xray
 </div>
 
 </div>
@@ -1676,7 +1733,7 @@ v${VERSION}
     class="btn primary"
     href="/users/new"
 >
-＋ کاربر جدید
+ï¼‹ Ú©Ø§Ø±Ø¨Ø± Ø¬Ø¯ÛŒØ¯
 </a>
 
 </div>
@@ -1690,23 +1747,23 @@ v${VERSION}
 <tr>
 
 <th>
-نام کاربری
+Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ
 </th>
 
 <th>
-پروتکل
+Ù¾Ø±ÙˆØªÚ©Ù„
 </th>
 
 <th>
-وضعیت
+ÙˆØ¶Ø¹ÛŒØª
 </th>
 
 <th>
-کانفیگ
+Ú©Ø§Ù†ÙÛŒÚ¯
 </th>
 
 <th>
-عملیات
+Ø¹Ù…Ù„ÛŒØ§Øª
 </th>
 
 </tr>
@@ -1739,12 +1796,12 @@ ${
     user.status === "active"
         ? `
 <span class="badge green">
-● فعال
+â— ÙØ¹Ø§Ù„
 </span>
 `
         : `
 <span class="badge red">
-● غیرفعال
+â— ØºÛŒØ±ÙØ¹Ø§Ù„
 </span>
 `
 }
@@ -1757,7 +1814,7 @@ ${
     class="btn"
     href="/users/config?id=${user.id}"
 >
-⚙️ کانفیگ
+âš™ï¸ Ú©Ø§Ù†ÙÛŒÚ¯
 </a>
 
 </td>
@@ -1784,8 +1841,8 @@ ${
 
 ${
     user.status === "active"
-        ? "خاموش"
-        : "فعال"
+        ? "Ø®Ø§Ù…ÙˆØ´"
+        : "ÙØ¹Ø§Ù„"
 }
 
 </button>
@@ -1795,7 +1852,7 @@ ${
 <form
     method="POST"
     action="/users/delete"
-    onsubmit="return confirm('این کاربر حذف شود؟')"
+    onsubmit="return confirm('Ø§ÛŒÙ† Ú©Ø§Ø±Ø¨Ø± Ø­Ø°Ù Ø´ÙˆØ¯ØŸ')"
 >
 
 <input
@@ -1808,7 +1865,7 @@ ${
     class="btn danger"
     type="submit"
 >
-حذف
+Ø­Ø°Ù
 </button>
 
 </form>
@@ -1827,7 +1884,7 @@ ${
     colspan="5"
     class="muted"
 >
-هنوز کاربری ساخته نشده است.
+Ù‡Ù†ÙˆØ² Ú©Ø§Ø±Ø¨Ø±ÛŒ Ø³Ø§Ø®ØªÙ‡ Ù†Ø´Ø¯Ù‡ Ø§Ø³Øª.
 </td>
 
 </tr>
@@ -1843,7 +1900,7 @@ ${
 </div>
 
 <div class="footer">
-VERGILPANEL v${VERSION} · POWERED BY YASIN BEHZAD
+VERGILPANEL v${VERSION} Â· POWERED BY YASIN BEHZAD
 </div>
 
 </div>
@@ -1863,14 +1920,14 @@ function newUserPage(error = "") {
     href="/dashboard"
     class="brand"
 >
-⚔️ VERGIL<span>PANEL</span>
+âš”ï¸ VERGIL<span>PANEL</span>
 </a>
 
 <a
     class="btn"
     href="/dashboard"
 >
-← داشبورد
+â† Ø¯Ø§Ø´Ø¨ÙˆØ±Ø¯
 </a>
 
 </div>
@@ -1878,15 +1935,15 @@ function newUserPage(error = "") {
 <div class="card form">
 
 <div class="settings-icon">
-👤
+ðŸ‘¤
 </div>
 
 <h1>
-ساخت کاربر
+Ø³Ø§Ø®Øª Ú©Ø§Ø±Ø¨Ø±
 </h1>
 
 <p class="muted">
-UUID و Subscription به صورت خودکار ساخته می‌شوند.
+UUID Ùˆ Subscription Ø¨Ù‡ ØµÙˆØ±Øª Ø®ÙˆØ¯Ú©Ø§Ø± Ø³Ø§Ø®ØªÙ‡ Ù…ÛŒâ€ŒØ´ÙˆÙ†Ø¯.
 </p>
 
 ${
@@ -1905,7 +1962,7 @@ ${escapeHtml(error)}
 >
 
 <label>
-نام کاربری
+Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ
 </label>
 
 <input
@@ -1917,13 +1974,13 @@ ${escapeHtml(error)}
 >
 
 <label>
-محدودیت ترافیک
+Ù…Ø­Ø¯ÙˆØ¯ÛŒØª ØªØ±Ø§ÙÛŒÚ©
 </label>
 
 <select name="traffic_limit">
 
 <option value="0">
-نامحدود
+Ù†Ø§Ù…Ø­Ø¯ÙˆØ¯
 </option>
 
 <option value="10737418240">
@@ -1945,7 +2002,7 @@ ${escapeHtml(error)}
 </select>
 
 <label>
-تاریخ انقضا
+ØªØ§Ø±ÛŒØ® Ø§Ù†Ù‚Ø¶Ø§
 </label>
 
 <input
@@ -1960,7 +2017,7 @@ ${escapeHtml(error)}
     class="btn primary"
     type="submit"
 >
-⚔️ ساخت کاربر
+âš”ï¸ Ø³Ø§Ø®Øª Ú©Ø§Ø±Ø¨Ø±
 </button>
 
 </form>
@@ -1991,14 +2048,14 @@ function settingsPage(
     href="/dashboard"
     class="brand"
 >
-⚔️ VERGIL<span>PANEL</span>
+âš”ï¸ VERGIL<span>PANEL</span>
 </a>
 
 <a
     class="btn"
     href="/dashboard"
 >
-← داشبورد
+â† Ø¯Ø§Ø´Ø¨ÙˆØ±Ø¯
 </a>
 
 </div>
@@ -2006,22 +2063,22 @@ function settingsPage(
 <div class="card form">
 
 <div class="settings-icon">
-⚙️
+âš™ï¸
 </div>
 
 <h1>
-تنظیمات مدیر
+ØªÙ†Ø¸ÛŒÙ…Ø§Øª Ù…Ø¯ÛŒØ±
 </h1>
 
 <p class="muted">
-نام کاربری و رمز عبور ورود به پنل را تغییر دهید.
+Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ Ùˆ Ø±Ù…Ø² Ø¹Ø¨ÙˆØ± ÙˆØ±ÙˆØ¯ Ø¨Ù‡ Ù¾Ù†Ù„ Ø±Ø§ ØªØºÛŒÛŒØ± Ø¯Ù‡ÛŒØ¯.
 </p>
 
 ${
     message
         ? `
 <div class="notice">
-✅ ${escapeHtml(message)}
+âœ… ${escapeHtml(message)}
 </div>
 `
         : ""
@@ -2031,7 +2088,7 @@ ${
     error
         ? `
 <div class="notice">
-❌ ${escapeHtml(error)}
+âŒ ${escapeHtml(error)}
 </div>
 `
         : ""
@@ -2043,7 +2100,7 @@ ${
 >
 
 <label>
-نام کاربری جدید
+Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ Ø¬Ø¯ÛŒØ¯
 </label>
 
 <input
@@ -2057,25 +2114,25 @@ ${
 >
 
 <label>
-رمز عبور جدید
+Ø±Ù…Ø² Ø¹Ø¨ÙˆØ± Ø¬Ø¯ÛŒØ¯
 </label>
 
 <input
     type="password"
     name="password"
-    placeholder="حداقل 4 کاراکتر"
+    placeholder="Ø­Ø¯Ø§Ù‚Ù„ 4 Ú©Ø§Ø±Ø§Ú©ØªØ±"
     minlength="4"
     dir="ltr"
 >
 
 <label>
-تکرار رمز عبور
+ØªÚ©Ø±Ø§Ø± Ø±Ù…Ø² Ø¹Ø¨ÙˆØ±
 </label>
 
 <input
     type="password"
     name="password_confirm"
-    placeholder="تکرار رمز عبور"
+    placeholder="ØªÚ©Ø±Ø§Ø± Ø±Ù…Ø² Ø¹Ø¨ÙˆØ±"
     minlength="4"
     dir="ltr"
 >
@@ -2086,7 +2143,7 @@ ${
     class="btn primary"
     type="submit"
 >
-💾 ذخیره تغییرات
+ðŸ’¾ Ø°Ø®ÛŒØ±Ù‡ ØªØºÛŒÛŒØ±Ø§Øª
 </button>
 
 </form>
@@ -2096,13 +2153,13 @@ ${
 <div class="notice">
 
 <strong>
-🔐 اطلاعات ورود
+ðŸ” Ø§Ø·Ù„Ø§Ø¹Ø§Øª ÙˆØ±ÙˆØ¯
 </strong>
 
 <br><br>
 
-اگر رمز عبور را خالی بگذارید،
-رمز فعلی تغییر نمی‌کند.
+Ø§Ú¯Ø± Ø±Ù…Ø² Ø¹Ø¨ÙˆØ± Ø±Ø§ Ø®Ø§Ù„ÛŒ Ø¨Ú¯Ø°Ø§Ø±ÛŒØ¯ØŒ
+Ø±Ù…Ø² ÙØ¹Ù„ÛŒ ØªØºÛŒÛŒØ± Ù†Ù…ÛŒâ€ŒÚ©Ù†Ø¯.
 
 </div>
 
@@ -2156,14 +2213,14 @@ async function configPage(req, user) {
     href="/dashboard"
     class="brand"
 >
-⚔️ VERGIL<span>PANEL</span>
+âš”ï¸ VERGIL<span>PANEL</span>
 </a>
 
 <a
     class="btn"
     href="/dashboard"
 >
-← داشبورد
+â† Ø¯Ø§Ø´Ø¨ÙˆØ±Ø¯
 </a>
 
 </div>
@@ -2171,17 +2228,17 @@ async function configPage(req, user) {
 <div class="card">
 
 <h1>
-⚔️ ${escapeHtml(user.username)}
+âš”ï¸ ${escapeHtml(user.username)}
 </h1>
 
 <p class="muted">
-VLESS · XHTTP + WebSocket
+VLESS Â· XHTTP + WebSocket
 </p>
 
 <div class="notice">
 
 <strong>
-📡 Subscription
+ðŸ“¡ Subscription
 </strong>
 
 <pre class="config">${escapeHtml(
@@ -2194,7 +2251,7 @@ VLESS · XHTTP + WebSocket
         subscriptionUrl
     )})'
 >
-📋 کپی Subscription
+ðŸ“‹ Ú©Ù¾ÛŒ Subscription
 </button>
 
 </div>
@@ -2204,7 +2261,7 @@ VLESS · XHTTP + WebSocket
 <div class="qr-card">
 
 <h3>
-📡 Subscription QR
+ðŸ“¡ Subscription QR
 </h3>
 
 <img
@@ -2220,7 +2277,7 @@ VLESS · XHTTP + WebSocket
         subscriptionUrl
     )})'
 >
-کپی لینک
+Ú©Ù¾ÛŒ Ù„ÛŒÙ†Ú©
 </button>
 
 </div>
@@ -2228,7 +2285,7 @@ VLESS · XHTTP + WebSocket
 <div class="qr-card">
 
 <h3>
-🔥 XHTTP QR
+ðŸ”¥ XHTTP QR
 </h3>
 
 <img
@@ -2244,7 +2301,7 @@ VLESS · XHTTP + WebSocket
         links.xhttp
     )})'
 >
-کپی
+Ú©Ù¾ÛŒ
 </button>
 
 </div>
@@ -2252,7 +2309,7 @@ VLESS · XHTTP + WebSocket
 </div>
 
 <h2>
-🚀 VLESS + XHTTP
+ðŸš€ VLESS + XHTTP
 </h2>
 
 <pre class="config">${escapeHtml(
@@ -2265,13 +2322,13 @@ VLESS · XHTTP + WebSocket
         links.xhttp
     )})'
 >
-📋 Copy XHTTP
+ðŸ“‹ Copy XHTTP
 </button>
 
 <br><br>
 
 <h2>
-🌐 VLESS + WebSocket
+ðŸŒ VLESS + WebSocket
 </h2>
 
 <pre class="config">${escapeHtml(
@@ -2284,7 +2341,7 @@ VLESS · XHTTP + WebSocket
         links.websocket
     )})'
 >
-📋 Copy WebSocket
+ðŸ“‹ Copy WebSocket
 </button>
 
 <div class="qr-grid">
@@ -2292,7 +2349,7 @@ VLESS · XHTTP + WebSocket
 <div class="qr-card">
 
 <h3>
-🔥 XHTTP
+ðŸ”¥ XHTTP
 </h3>
 
 <img
@@ -2305,7 +2362,7 @@ VLESS · XHTTP + WebSocket
 <div class="qr-card">
 
 <h3>
-🌐 WebSocket
+ðŸŒ WebSocket
 </h3>
 
 <img
@@ -2322,23 +2379,23 @@ VLESS · XHTTP + WebSocket
 <div class="notice">
 
 <strong>
-💙 ساخته شده توسط یاسین
+ðŸ’™ Ø³Ø§Ø®ØªÙ‡ Ø´Ø¯Ù‡ ØªÙˆØ³Ø· ÛŒØ§Ø³ÛŒÙ†
 </strong>
 
 <br>
 
-کاملاً رایگان و غیرقابل فروش
+Ú©Ø§Ù…Ù„Ø§Ù‹ Ø±Ø§ÛŒÚ¯Ø§Ù† Ùˆ ØºÛŒØ±Ù‚Ø§Ø¨Ù„ ÙØ±ÙˆØ´
 
 <br><br>
 
 <span class="muted small">
-این پیام داخل Subscription نیز قرار گرفته است.
+Ø§ÛŒÙ† Ù¾ÛŒØ§Ù… Ø¯Ø§Ø®Ù„ Subscription Ù†ÛŒØ² Ù‚Ø±Ø§Ø± Ú¯Ø±ÙØªÙ‡ Ø§Ø³Øª.
 </span>
 
 </div>
 
 <h2>
-🆔 UUID
+ðŸ†” UUID
 </h2>
 
 <pre class="config">${escapeHtml(
@@ -2361,12 +2418,12 @@ async function copyText(text){
 
         await navigator.clipboard.writeText(text);
 
-        alert("کپی شد ✅");
+        alert("Ú©Ù¾ÛŒ Ø´Ø¯ âœ…");
 
     }catch{
 
         prompt(
-            "متن را کپی کنید:",
+            "Ù…ØªÙ† Ø±Ø§ Ú©Ù¾ÛŒ Ú©Ù†ÛŒØ¯:",
             text
         );
 
@@ -2420,7 +2477,7 @@ function ensureDefaultAdmin() {
         );
 
         console.log(
-            `👤 Admin ready: ${username}`
+            `ðŸ‘¤ Admin ready: ${username}`
         );
 
         return;
@@ -2440,7 +2497,7 @@ function ensureDefaultAdmin() {
     );
 
     console.log(
-        `👤 Default admin created: ${username}`
+        `ðŸ‘¤ Default admin created: ${username}`
     );
 }
 
@@ -2474,7 +2531,7 @@ async function createUser(form) {
 
     if (!username) {
         throw new Error(
-            "نام کاربری الزامی است."
+            "Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ Ø§Ù„Ø²Ø§Ù…ÛŒ Ø§Ø³Øª."
         );
     }
 
@@ -2487,7 +2544,7 @@ async function createUser(form) {
 
     if (exists) {
         throw new Error(
-            "این نام کاربری قبلاً وجود دارد."
+            "Ø§ÛŒÙ† Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ Ù‚Ø¨Ù„Ø§Ù‹ ÙˆØ¬ÙˆØ¯ Ø¯Ø§Ø±Ø¯."
         );
     }
 
@@ -2520,7 +2577,7 @@ async function createUser(form) {
             )
         ) {
             throw new Error(
-                "تاریخ انقضا نامعتبر است."
+                "ØªØ§Ø±ÛŒØ® Ø§Ù†Ù‚Ø¶Ø§ Ù†Ø§Ù…Ø¹ØªØ¨Ø± Ø§Ø³Øª."
             );
         }
 
@@ -2642,7 +2699,7 @@ function updateAdmin(
 
     if (!cleanUsername) {
         throw new Error(
-            "نام کاربری نمی‌تواند خالی باشد."
+            "Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ Ù†Ù…ÛŒâ€ŒØªÙˆØ§Ù†Ø¯ Ø®Ø§Ù„ÛŒ Ø¨Ø§Ø´Ø¯."
         );
     }
 
@@ -2664,7 +2721,7 @@ function updateAdmin(
 
         if (duplicate) {
             throw new Error(
-                "این نام کاربری قبلاً استفاده شده است."
+                "Ø§ÛŒÙ† Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ Ù‚Ø¨Ù„Ø§Ù‹ Ø§Ø³ØªÙØ§Ø¯Ù‡ Ø´Ø¯Ù‡ Ø§Ø³Øª."
             );
         }
     }
@@ -2675,7 +2732,7 @@ function updateAdmin(
             String(password).length < 4
         ) {
             throw new Error(
-                "رمز عبور باید حداقل 4 کاراکتر باشد."
+                "Ø±Ù…Ø² Ø¹Ø¨ÙˆØ± Ø¨Ø§ÛŒØ¯ Ø­Ø¯Ø§Ù‚Ù„ 4 Ú©Ø§Ø±Ø§Ú©ØªØ± Ø¨Ø§Ø´Ø¯."
             );
         }
 
@@ -2714,52 +2771,48 @@ function proxyHttpToXray(
         port: targetPort,
         path: req.url,
         method: req.method,
-
+        agent: proxyHttpAgent,
         headers: {
             ...req.headers,
-            host:
-                `127.0.0.1:${targetPort}`
+            host: `127.0.0.1:${targetPort}`
         }
     };
 
-    const proxy =
-        http.request(
-            options,
-            upstream => {
+    const proxy = http.request(options, upstream => {
+        upstream.on("error", error => {
+            console.error("HTTP upstream response error:", error);
+            if (!res.destroyed) res.destroy(error);
+        });
 
-                res.writeHead(
-                    upstream.statusCode || 502,
-                    upstream.headers
-                );
+        res.writeHead(upstream.statusCode || 502, upstream.headers);
+        upstream.pipe(res);
+    });
 
-                upstream.pipe(res);
-            }
-        );
+    proxy.setTimeout(15000, () => {
+        const error = new Error("Upstream request timed out");
+        console.error("HTTP proxy timeout:", error.message);
+        proxy.destroy(error);
+    });
 
-    proxy.on(
-        "error",
-        error => {
+    proxy.on("error", error => {
+        console.error("HTTP proxy error:", error);
 
-            console.error(
-                "HTTP proxy error:",
-                error
-            );
-
-            if (!res.headersSent) {
-
-                res.writeHead(
-                    502,
-                    {
-                        "Content-Type":
-                            "text/plain"
-                    }
-                );
-            }
-
-            res.end("Bad Gateway");
+        if (res.destroyed) return;
+        if (!res.headersSent) {
+            const status = error.message === "Upstream request timed out" ? 504 : 502;
+            res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end(status === 504 ? "Gateway Timeout" : "Bad Gateway");
+        } else {
+            res.destroy(error);
         }
-    );
+    });
 
+    req.on("aborted", () => proxy.destroy());
+    req.on("error", error => proxy.destroy(error));
+    res.on("close", () => {
+        if (!res.writableEnded) proxy.destroy();
+    });
+    res.on("error", error => proxy.destroy(error));
     req.pipe(proxy);
 }
 
@@ -2768,102 +2821,69 @@ function proxyWebSocket(
     clientSocket,
     head
 ) {
-    const upstream =
-        net.connect({
-            host: "127.0.0.1",
-            port: XRAY_WS_PORT
-        });
+    const upstream = net.connect({
+        host: "127.0.0.1",
+        port: XRAY_WS_PORT
+    });
+    let connected = false;
 
-    upstream.on(
-        "connect",
-        () => {
+    upstream.setTimeout(10000, () => {
+        const error = new Error("WebSocket upstream connection timed out");
+        console.error("WebSocket proxy timeout:", error.message);
+        if (!connected && !clientSocket.destroyed) {
+            clientSocket.end("HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n");
+        }
+        upstream.destroy(error);
+    });
 
-            const headers = [];
+    upstream.on("connect", () => {
+        connected = true;
+        upstream.setTimeout(0);
+        upstream.setKeepAlive(true, 30000);
 
-            headers.push(
-                `${req.method} ${req.url} HTTP/${req.httpVersion}`
-            );
-
-            for (
-                const [key, value]
-                of Object.entries(req.headers)
-            ) {
-
-                if (
-                    Array.isArray(value)
-                ) {
-
-                    for (
-                        const item
-                        of value
-                    ) {
-
-                        headers.push(
-                            `${key}: ${item}`
-                        );
-                    }
-
-                } else {
-
-                    headers.push(
-                        `${key}: ${value}`
-                    );
-                }
+        const headers = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
+        for (const [key, value] of Object.entries(req.headers)) {
+            if (Array.isArray(value)) {
+                for (const item of value) headers.push(`${key}: ${item}`);
+            } else {
+                headers.push(`${key}: ${value}`);
             }
+        }
 
-            headers.push("");
-            headers.push("");
-
-            upstream.write(
-                headers.join("\r\n")
-            );
-
-            if (
-                head &&
-                head.length
-            ) {
-                upstream.write(head);
-            }
-
+        headers.push("", "");
+        try {
+            upstream.write(headers.join("\r\n"));
+            if (head && head.length) upstream.write(head);
             clientSocket.pipe(upstream);
             upstream.pipe(clientSocket);
+        } catch (error) {
+            console.error("WebSocket proxy forwarding error:", error);
+            clientSocket.destroy();
+            upstream.destroy();
         }
-    );
+    });
 
-    upstream.on(
-        "error",
-        error => {
-
-            console.error(
-                "WebSocket proxy error:",
-                error
-            );
-
-            try {
+    upstream.on("error", error => {
+        console.error("WebSocket proxy error:", error);
+        if (!clientSocket.destroyed) {
+            if (!connected) {
+                clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+            } else {
                 clientSocket.destroy();
-            } catch {}
+            }
         }
-    );
+    });
 
-    clientSocket.on(
-        "error",
-        () => {
+    upstream.on("close", () => {
+        if (!clientSocket.destroyed) clientSocket.end();
+    });
 
-            try {
-                upstream.destroy();
-            } catch {}
-        }
-    );
+    clientSocket.on("error", error => {
+        console.error("WebSocket client socket error:", error);
+        upstream.destroy();
+    });
 
-    clientSocket.on(
-        "close",
-        () => {
-
-            try {
-                upstream.destroy();
-            } catch {}
-        }
-    );
+    clientSocket.on("close", () => upstream.destroy());
 }
 
 async function subscriptionResponse(
@@ -3010,24 +3030,31 @@ async function handleRequest(
         if (
             pathname === "/health"
         ) {
+            const processOk = Boolean(
+                xrayProcess &&
+                !xrayProcess.killed &&
+                xrayProcess.exitCode === null
+            );
+            const [xhttp, websocket] = await Promise.all([
+                checkTcpPort(XRAY_XHTTP_PORT),
+                checkTcpPort(XRAY_WS_PORT)
+            ]);
+            const ok = processOk && xhttp && websocket;
 
             sendJson(
                 res,
                 {
-                    ok: true,
+                    ok,
                     panel: VERSION,
-
-                    xray:
-                        Boolean(
-                            xrayProcess &&
-                            !xrayProcess.killed
-                        ),
-
+                    process: processOk,
+                    xhttp,
+                    websocket,
                     transports: [
                         "xhttp",
                         "websocket"
                     ]
-                }
+                },
+                ok ? 200 : 503
             );
 
             return;
@@ -3088,7 +3115,7 @@ async function handleRequest(
                 sendHtml(
                     res,
                     loginPage(
-                        "نام کاربری یا رمز عبور اشتباه است."
+                        "Ù†Ø§Ù… Ú©Ø§Ø±Ø¨Ø±ÛŒ ÛŒØ§ Ø±Ù…Ø² Ø¹Ø¨ÙˆØ± Ø§Ø´ØªØ¨Ø§Ù‡ Ø§Ø³Øª."
                     ),
                     401
                 );
@@ -3109,8 +3136,8 @@ async function handleRequest(
             );
 
             /*
-             * اگر ورود با admin/admin باشد،
-             * کاربر را برای تغییر اطلاعات به Settings می‌فرستیم.
+             * Ø§Ú¯Ø± ÙˆØ±ÙˆØ¯ Ø¨Ø§ admin/admin Ø¨Ø§Ø´Ø¯ØŒ
+             * Ú©Ø§Ø±Ø¨Ø± Ø±Ø§ Ø¨Ø±Ø§ÛŒ ØªØºÛŒÛŒØ± Ø§Ø·Ù„Ø§Ø¹Ø§Øª Ø¨Ù‡ Settings Ù…ÛŒâ€ŒÙØ±Ø³ØªÛŒÙ….
              */
 
             const admin =
@@ -3255,7 +3282,7 @@ async function handleRequest(
                 ) {
 
                     throw new Error(
-                        "رمزهای عبور یکسان نیستند."
+                        "Ø±Ù…Ø²Ù‡Ø§ÛŒ Ø¹Ø¨ÙˆØ± ÛŒÚ©Ø³Ø§Ù† Ù†ÛŒØ³ØªÙ†Ø¯."
                     );
                 }
 
@@ -3265,8 +3292,8 @@ async function handleRequest(
                 );
 
                 /*
-                 * تمام Sessionهای قبلی حذف می‌شوند
-                 * تا با اطلاعات جدید دوباره Login شود.
+                 * ØªÙ…Ø§Ù… SessionÙ‡Ø§ÛŒ Ù‚Ø¨Ù„ÛŒ Ø­Ø°Ù Ù…ÛŒâ€ŒØ´ÙˆÙ†Ø¯
+                 * ØªØ§ Ø¨Ø§ Ø§Ø·Ù„Ø§Ø¹Ø§Øª Ø¬Ø¯ÛŒØ¯ Ø¯ÙˆØ¨Ø§Ø±Ù‡ Login Ø´ÙˆØ¯.
                  */
 
                 sessions.clear();
@@ -3284,7 +3311,7 @@ async function handleRequest(
                         req,
                         "",
                         error?.message ||
-                            "خطا در ذخیره تنظیمات."
+                            "Ø®Ø·Ø§ Ø¯Ø± Ø°Ø®ÛŒØ±Ù‡ ØªÙ†Ø¸ÛŒÙ…Ø§Øª."
                     ),
                     400
                 );
@@ -3326,7 +3353,7 @@ async function handleRequest(
                     );
 
                 console.log(
-                    `👤 User created: ${user.username}`
+                    `ðŸ‘¤ User created: ${user.username}`
                 );
 
                 redirect(
@@ -3340,7 +3367,7 @@ async function handleRequest(
                     res,
                     newUserPage(
                         error?.message ||
-                        "خطا در ساخت کاربر."
+                        "Ø®Ø·Ø§ Ø¯Ø± Ø³Ø§Ø®Øª Ú©Ø§Ø±Ø¨Ø±."
                     ),
                     500
                 );
@@ -3382,14 +3409,14 @@ async function handleRequest(
 <div class="card">
 
 <h1>
-کاربر پیدا نشد
+Ú©Ø§Ø±Ø¨Ø± Ù¾ÛŒØ¯Ø§ Ù†Ø´Ø¯
 </h1>
 
 <a
     class="btn"
     href="/dashboard"
 >
-داشبورد
+Ø¯Ø§Ø´Ø¨ÙˆØ±Ø¯
 </a>
 
 </div>
@@ -3494,14 +3521,14 @@ async function handleRequest(
 </h1>
 
 <p class="muted">
-صفحه مورد نظر پیدا نشد.
+ØµÙØ­Ù‡ Ù…ÙˆØ±Ø¯ Ù†Ø¸Ø± Ù¾ÛŒØ¯Ø§ Ù†Ø´Ø¯.
 </p>
 
 <a
     class="btn"
     href="/dashboard"
 >
-بازگشت
+Ø¨Ø§Ø²Ú¯Ø´Øª
 </a>
 
 </div>
@@ -3586,19 +3613,19 @@ server.listen(
     () => {
 
         console.log(
-            `⚔️ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
+            `âš”ï¸ VergilPanel v${VERSION} running on ${HOST}:${PORT}`
         );
 
         console.log(
-            `👤 Login: admin / admin`
+            `ðŸ‘¤ Login: admin / admin`
         );
 
         console.log(
-            `💙 POWERED BY YASIN BEHZAD`
+            `ðŸ’™ POWERED BY YASIN BEHZAD`
         );
 
         console.log(
-            `⚔️ Railway TCP Proxy NOT required`
+            `âš”ï¸ Railway TCP Proxy NOT required`
         );
     }
 );
@@ -3610,6 +3637,7 @@ async function shutdown(signal) {
     );
 
     stoppingXray = true;
+    clearXrayRestartTimer();
 
     try {
         await stopXray();
