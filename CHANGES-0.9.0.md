@@ -1,4 +1,4 @@
-# VergilPanel 0.9.0 - changes
+# VergilPanel 0.9.1 - changes
 
 ## Security
 - Default login admin / admin is kept on fresh installs (first login redirects to Settings). The old bug is fixed: it is created only when no admin exists and is no longer reset to admin/admin on every restart. ADMIN_USERNAME / ADMIN_PASSWORD still work and can reset the password on boot.
@@ -21,3 +21,8 @@
 - Real traffic limits (needs the Xray Stats API).
 - Adding/removing users without restarting Xray.
 - Dockerfile: pinned Xray version, npm ci, non-root user.
+
+## 0.9.1
+- Removed the untested Xray outbound tweaks (sockopt / domainStrategy / sniffing key) and the fp/alpn link parameters; the Xray config is back to the proven form.
+- Startup now runs `xray run -test` and prints the result in the Railway log ("Xray config test").
+- /health now shows `lastXrayExit` (why Xray last stopped).
