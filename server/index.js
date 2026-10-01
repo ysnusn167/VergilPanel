@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS users (
     subscription_token TEXT UNIQUE,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS hosts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    address TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    network TEXT NOT NULL DEFAULT 'tcp',
+    security TEXT NOT NULL DEFAULT 'none',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
 `);
 
 function hashPassword(password) {
@@ -320,11 +331,18 @@ function activeUsers() {
     `).all(nowIso());
 }
 
+// --- hosts helpers ---
+const stmtGetAllHosts = db.prepare('SELECT * FROM hosts ORDER BY id');
+const stmtGetHostById = db.prepare('SELECT * FROM hosts WHERE id = ?');
+const stmtInsertHost = db.prepare('INSERT INTO hosts (label, address, port, network, security, enabled) VALUES (?, ?, ?, ?, ?, 1)');
+const stmtUpdateHost = db.prepare('UPDATE hosts SET label=?, address=?, port=?, network=?, security=?, enabled=? WHERE id=?');
+const stmtDeleteHost = db.prepare('DELETE FROM hosts WHERE id = ?');
+const stmtEnabledHosts = db.prepare('SELECT * FROM hosts WHERE enabled = 1');
+
 function activeKey() {
-    return activeUsers()
-        .map(user => user.uuid)
-        .sort()
-        .join(",");
+    const uuidsKey = activeUsers().map(user => user.uuid).sort().join(',');
+    const hostKey = stmtEnabledHosts.all().map(h => `${h.id}:${h.port}:${h.network}`).join('|');
+    return uuidsKey + '||hosts:' + hostKey;
 }
 
 function allUsers() {
@@ -380,6 +398,14 @@ function generateXrayConfig() {
                     }
                 }
             },
+
+            ...stmtEnabledHosts.all().filter(h => h.network === "tcp").map(h => ({
+                listen: "0.0.0.0",
+                port: h.port,
+                protocol: "vless",
+                settings: { clients, decryption: "none" },
+                streamSettings: { network: "tcp", security: h.security === "tls" ? "tls" : "none" }
+            })),
 
             {
                 listen: "127.0.0.1",
@@ -583,13 +609,20 @@ function makeVlessLinks(user, origin) {
             alpn: "http/1.1"
         });
 
-    return {
+    const links = {
         xhttp:
             `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(user.username)}-XHTTP`,
-
         websocket:
             `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(user.username)}-WS`
     };
+    const tcpHostLinks = stmtEnabledHosts.all().filter(h => h.network === "tcp").map(h => {
+        const params = new URLSearchParams({
+            encryption: "none", type: "tcp", security: h.security || "none",
+            ...(h.security === "tls" ? { sni: h.address, fp: "chrome" } : {})
+        });
+        return `vless://${user.uuid}@${h.address}:${h.port}?${params.toString()}#${encodeURIComponent(h.label)}`;
+    });
+    return [links.xhttp, links.websocket, ...tcpHostLinks];
 }
 
 /*
@@ -615,19 +648,12 @@ function makeDummyConfig() {
 }
 
 function makeSubscription(user, origin) {
-    const links =
-        makeVlessLinks(
-            user,
-            origin
-        );
-
     const dummy =
         makeDummyConfig();
 
     return Buffer.from(
         [
-            links.xhttp,
-            links.websocket,
+            ...makeVlessLinks(user, origin),
             dummy
         ].join("\n"),
         "utf8"
@@ -1626,6 +1652,20 @@ POWERED BY YASIN BEHZAD
 </div>
 `
     );
+}
+
+
+function hostsPage() {
+    return layout("Hosts", `
+<div class="container"><div class="nav"><a class="brand" href="/dashboard"><div class="brand-icon">⚔️</div><div>VERGIL<span>PANEL</span></div></a><div class="nav-right"><a class="btn" href="/dashboard">🏠 داشبورد</a><a class="btn danger" href="/logout">خروج</a></div></div>
+<div class="card"><h1>🌐 مدیریت هاست‌ها</h1><p class="muted">افزودن و مدیریت هاست‌های اتصال</p>
+<label>عنوان</label><input id="label" dir="ltr"><label>آدرس</label><input id="address" dir="ltr"><label>پورت</label><input id="port" type="number" min="1" max="65535" dir="ltr"><label>شبکه</label><select id="network"><option>tcp</option><option>ws</option><option>xhttp</option></select><label>امنیت</label><select id="security"><option>none</option><option>tls</option></select><br><button class="btn primary" onclick="addHost()">افزودن</button><span id="msg" class="muted"></span></div>
+<div class="card" style="margin-top:18px"><h2>هاست‌ها</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>عنوان</th><th>آدرس</th><th>پورت</th><th>شبکه</th><th>امنیت</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody id="rows"></tbody></table></div></div></div>
+<script>
+async function loadHosts(){const r=await fetch('/api/hosts'),d=await r.json(),rows=document.getElementById('rows');rows.innerHTML='';(d.hosts||[]).forEach(h=>{const tr=document.createElement('tr');tr.innerHTML='<td>'+h.id+'</td><td>'+h.label+'</td><td dir="ltr">'+h.address+'</td><td>'+h.port+'</td><td>'+h.network+'</td><td>'+h.security+'</td><td>'+ (h.enabled?'فعال':'غیرفعال')+'</td><td><button class="btn" onclick="toggleHost('+h.id+')">تغییر</button> <button class="btn danger" onclick="deleteHost('+h.id+')">حذف</button></td>';rows.appendChild(tr)})}
+async function addHost(){const body={label:label.value,address:address.value,port:port.value,network:network.value,security:security.value};const r=await fetch('/api/hosts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();msg.textContent=r.ok?'✅ اضافه شد':('❌ '+(d.error||'خطا'));if(r.ok)loadHosts()}
+async function toggleHost(id){await fetch('/api/hosts/'+id+'/toggle',{method:'POST'});loadHosts()} async function deleteHost(id){if(confirm('حذف شود؟')){await fetch('/api/hosts/'+id,{method:'DELETE'});loadHosts()}} loadHosts();
+</script>`);
 }
 
 function dashboardPage(req) {
@@ -3533,6 +3573,29 @@ async function handleRequest(
 
             return;
         }
+
+
+        // =================== Hosts API ===================
+        if (req.method === "GET" && pathname === "/api/hosts") { sendJson(res, { hosts: stmtGetAllHosts.all() }); return; }
+        if (req.method === "POST" && pathname === "/api/hosts") {
+            let body; try { body = JSON.parse(await readBody(req)); } catch { sendJson(res,{error:"Invalid JSON"},400); return; }
+            const {label,address,port,network="tcp",security="none"}=body||{}; const portNum=parseInt(port,10);
+            if (!label||!address||!port) { sendJson(res,{error:"label, address and port are required"},400); return; }
+            if (!["tcp","ws","xhttp"].includes(network)) { sendJson(res,{error:"Invalid network type"},400); return; }
+            if (!["none","tls"].includes(security)) { sendJson(res,{error:"Invalid security type"},400); return; }
+            if (!Number.isInteger(portNum)||portNum<1||portNum>65535) { sendJson(res,{error:"Invalid port"},400); return; }
+            const info=stmtInsertHost.run(label.trim(),address.trim(),portNum,network,security); await restartXray(); sendJson(res,{host:stmtGetHostById.get(info.lastInsertRowid)},201); return;
+        }
+        if (req.method === "PUT" && /^\/api\/hosts\/\d+$/.test(pathname)) {
+            const id=parseInt(pathname.split('/')[3],10), e=stmtGetHostById.get(id); if(!e){sendJson(res,{error:"Host not found"},404);return;}
+            let b; try{b=JSON.parse(await readBody(req))}catch{sendJson(res,{error:"Invalid JSON"},400);return;}
+            const label=(b.label??e.label).toString().trim(), address=(b.address??e.address).toString().trim(), network=b.network??e.network, security=b.security??e.security, enabled=b.enabled!==undefined?(b.enabled?1:0):e.enabled, portNum=parseInt(b.port??e.port,10);
+            if(!["tcp","ws","xhttp"].includes(network)){sendJson(res,{error:"Invalid network type"},400);return;} if(!["none","tls"].includes(security)){sendJson(res,{error:"Invalid security type"},400);return;} if(!Number.isInteger(portNum)||portNum<1||portNum>65535){sendJson(res,{error:"Invalid port"},400);return;}
+            stmtUpdateHost.run(label,address,portNum,network,security,enabled,id); await restartXray(); sendJson(res,{host:stmtGetHostById.get(id)}); return;
+        }
+        if (req.method === "DELETE" && /^\/api\/hosts\/\d+$/.test(pathname)) { const id=parseInt(pathname.split('/')[3],10); if(!stmtGetHostById.get(id)){sendJson(res,{error:"Host not found"},404);return;} stmtDeleteHost.run(id); await restartXray(); sendJson(res,{ok:true}); return; }
+        if (req.method === "POST" && /^\/api\/hosts\/\d+\/toggle$/.test(pathname)) { const id=parseInt(pathname.split('/')[3],10),h=stmtGetHostById.get(id); if(!h){sendJson(res,{error:"Host not found"},404);return;} stmtUpdateHost.run(h.label,h.address,h.port,h.network,h.security,h.enabled?0:1,id); await restartXray(); sendJson(res,{host:stmtGetHostById.get(id)}); return; }
+        if (req.method === "GET" && pathname === "/hosts") { sendHtml(res, hostsPage()); return; }
 
         /*
          * User Config
