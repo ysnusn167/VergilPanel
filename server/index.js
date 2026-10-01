@@ -1,7 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import net from "node:net";
 import Database from "better-sqlite3";
 import QRCode from "qrcode";
@@ -31,12 +31,13 @@ const XHTTP_PATH =
 const WS_PATH =
     process.env.WS_PATH || "/ws";
 
-const VERSION = "0.9.0";
+const VERSION = "0.10.0";
 
 let xrayProcess = null;
 let stoppingXray = false;
 let xrayRestarting = false;
 let xrayRestartPending = false;
+let lastXrayExit = "none";
 
 const sessions = new Map();
 
@@ -72,15 +73,9 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS hosts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    label TEXT NOT NULL,
-    address TEXT NOT NULL,
-    port INTEGER NOT NULL,
-    network TEXT NOT NULL DEFAULT 'tcp',
-    security TEXT NOT NULL DEFAULT 'none',
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 `);
 
@@ -317,6 +312,220 @@ function getPublicOrigin(req) {
     return `https://${host}`;
 }
 
+/* ---------- App settings (key/value) ---------- */
+
+function getSetting(key, fallback = "") {
+    const row = db
+        .prepare("SELECT value FROM app_settings WHERE key = ?")
+        .get(key);
+
+    return row ? row.value : fallback;
+}
+
+function setSetting(key, value) {
+    db.prepare(`
+        INSERT INTO app_settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, String(value));
+}
+
+const RAW_PROTOCOLS = ["none", "shadowsocks", "reality"];
+const SS_METHOD = "2022-blake3-aes-128-gcm";
+
+function rawConfig() {
+    const protocol = getSetting("raw_protocol", "none");
+
+    return {
+        host: getSetting("public_host", ""),
+        port: getSetting("public_port", ""),
+        protocol: RAW_PROTOCOLS.includes(protocol) ? protocol : "none",
+        internalPort: Number(getSetting("raw_internal_port", "8443")) || 8443,
+        sni: getSetting("reality_sni", "www.microsoft.com"),
+        ssPsk: getSetting("ss_psk", ""),
+        realityPrivate: getSetting("reality_private", ""),
+        realityPublic: getSetting("reality_public", ""),
+        realityShortId: getSetting("reality_short_id", "")
+    };
+}
+
+function ensureRawSecrets() {
+    if (!getSetting("ss_psk")) {
+        setSetting("ss_psk", crypto.randomBytes(16).toString("base64"));
+    }
+
+    if (!getSetting("reality_short_id")) {
+        setSetting("reality_short_id", crypto.randomBytes(4).toString("hex"));
+    }
+
+    if (!getSetting("reality_private") || !getSetting("reality_public")) {
+        try {
+            const result = spawnSync(XRAY_BIN, ["x25519"], {
+                encoding: "utf8",
+                timeout: 10000
+            });
+
+            const out = String(result.stdout || "");
+
+            const priv = out.match(/private\s*key\s*:\s*(\S+)/i)?.[1];
+            const pub = out.match(/(?:public\s*key|password)[^:\n]*:\s*(\S+)/i)?.[1];
+
+            if (priv && pub) {
+                setSetting("reality_private", priv);
+                setSetting("reality_public", pub);
+            } else {
+                console.error("❌ Could not parse xray x25519 output");
+            }
+        } catch (error) {
+            console.error("❌ Reality key generation failed:", error?.message);
+        }
+    }
+}
+
+function rawSignature() {
+    const cfg = rawConfig();
+
+    return JSON.stringify([
+        cfg.protocol,
+        cfg.internalPort,
+        cfg.sni,
+        cfg.ssPsk,
+        cfg.realityPrivate,
+        cfg.realityShortId
+    ]);
+}
+
+function ssUserKey(user, psk) {
+    return crypto
+        .createHmac("sha256", psk)
+        .update(user.uuid)
+        .digest()
+        .subarray(0, 16)
+        .toString("base64");
+}
+
+function rawInbound(users) {
+    const cfg = rawConfig();
+
+    if (cfg.protocol === "none") return null;
+
+    if (users.length === 0) {
+        console.log("ℹ️ Raw TCP inbound skipped: no active users");
+        return null;
+    }
+
+    ensureRawSecrets();
+
+    const fresh = rawConfig();
+
+    if (fresh.protocol === "shadowsocks") {
+        return {
+            listen: "0.0.0.0",
+            port: fresh.internalPort,
+            protocol: "shadowsocks",
+
+            settings: {
+                method: SS_METHOD,
+                password: fresh.ssPsk,
+                network: "tcp",
+                clients: users.map(user => ({
+                    password: ssUserKey(user, fresh.ssPsk),
+                    email: user.username
+                }))
+            }
+        };
+    }
+
+    if (fresh.protocol === "reality") {
+        if (!fresh.realityPrivate || !fresh.realityPublic) {
+            console.error("❌ Reality keys missing, raw inbound skipped");
+            return null;
+        }
+
+        return {
+            listen: "0.0.0.0",
+            port: fresh.internalPort,
+            protocol: "vless",
+
+            settings: {
+                decryption: "none",
+                clients: users.map(user => ({
+                    id: user.uuid,
+                    email: user.username,
+                    flow: "xtls-rprx-vision"
+                }))
+            },
+
+            streamSettings: {
+                network: "tcp",
+                security: "reality",
+
+                realitySettings: {
+                    show: false,
+                    dest: `${fresh.sni}:443`,
+                    xver: 0,
+                    serverNames: [fresh.sni],
+                    privateKey: fresh.realityPrivate,
+                    shortIds: [fresh.realityShortId]
+                }
+            }
+        };
+    }
+
+    return null;
+}
+
+function rawLabel(protocol) {
+    return protocol === "shadowsocks"
+        ? "Shadowsocks (TCP)"
+        : "VLESS + Reality (TCP)";
+}
+
+function makeRawLink(user) {
+    const cfg = rawConfig();
+
+    if (cfg.protocol === "none" || !cfg.host || !cfg.port) return null;
+
+    const name = encodeURIComponent(user.username);
+
+    if (cfg.protocol === "shadowsocks") {
+        if (!cfg.ssPsk) return null;
+
+        const userinfo = [
+            SS_METHOD,
+            cfg.ssPsk,
+            ssUserKey(user, cfg.ssPsk)
+        ].map(encodeURIComponent).join(":");
+
+        return `ss://${userinfo}@${cfg.host}:${cfg.port}#${name}-SS`;
+    }
+
+    if (cfg.protocol === "reality") {
+        if (!cfg.realityPublic) return null;
+
+        const params = new URLSearchParams({
+            encryption: "none",
+            flow: "xtls-rprx-vision",
+            security: "reality",
+            sni: cfg.sni,
+            fp: "chrome",
+            pbk: cfg.realityPublic,
+            sid: cfg.realityShortId,
+            type: "tcp"
+        });
+
+        return `vless://${user.uuid}@${cfg.host}:${cfg.port}?${params.toString()}#${name}-REALITY`;
+    }
+
+    return null;
+}
+
+function rawLinkList(user) {
+    const link = makeRawLink(user);
+
+    return link ? [link] : [];
+}
+
 function activeUsers() {
     return db.prepare(`
         SELECT *
@@ -331,18 +540,11 @@ function activeUsers() {
     `).all(nowIso());
 }
 
-// --- hosts helpers ---
-const stmtGetAllHosts = db.prepare('SELECT * FROM hosts ORDER BY id');
-const stmtGetHostById = db.prepare('SELECT * FROM hosts WHERE id = ?');
-const stmtInsertHost = db.prepare('INSERT INTO hosts (label, address, port, network, security, enabled) VALUES (?, ?, ?, ?, ?, 1)');
-const stmtUpdateHost = db.prepare('UPDATE hosts SET label=?, address=?, port=?, network=?, security=?, enabled=? WHERE id=?');
-const stmtDeleteHost = db.prepare('DELETE FROM hosts WHERE id = ?');
-const stmtEnabledHosts = db.prepare('SELECT * FROM hosts WHERE enabled = 1');
-
 function activeKey() {
-    const uuidsKey = activeUsers().map(user => user.uuid).sort().join(',');
-    const hostKey = stmtEnabledHosts.all().map(h => `${h.id}:${h.port}:${h.network}`).join('|');
-    return uuidsKey + '||hosts:' + hostKey;
+    return activeUsers()
+        .map(user => user.uuid)
+        .sort()
+        .join(",") + "|" + rawSignature();
 }
 
 function allUsers() {
@@ -362,7 +564,7 @@ function getAdmin() {
     `).get();
 }
 
-function generateXrayConfig() {
+function generateBaseXrayConfig() {
     const clients = activeUsers().map(user => ({
         id: user.uuid,
         email: user.username
@@ -384,10 +586,6 @@ function generateXrayConfig() {
                     decryption: "none"
                 },
 
-                sniffing: {
-                    enabled: false
-                },
-
                 streamSettings: {
                     network: "xhttp",
                     security: "none",
@@ -399,14 +597,6 @@ function generateXrayConfig() {
                 }
             },
 
-            ...stmtEnabledHosts.all().filter(h => h.network === "tcp").map(h => ({
-                listen: "0.0.0.0",
-                port: h.port,
-                protocol: "vless",
-                settings: { clients, decryption: "none" },
-                streamSettings: { network: "tcp", security: h.security === "tls" ? "tls" : "none" }
-            })),
-
             {
                 listen: "127.0.0.1",
                 port: XRAY_WS_PORT,
@@ -415,10 +605,6 @@ function generateXrayConfig() {
                 settings: {
                     clients,
                     decryption: "none"
-                },
-
-                sniffing: {
-                    enabled: false
                 },
 
                 streamSettings: {
@@ -434,27 +620,25 @@ function generateXrayConfig() {
 
         outbounds: [
             {
-                protocol: "freedom",
-
-                settings: {
-                    domainStrategy: "UseIPv4"
-                },
-
-                streamSettings: {
-                    sockopt: {
-                        tcpKeepAliveIdle: 30,
-                        tcpKeepAliveInterval: 30
-                    }
-                }
+                protocol: "freedom"
             }
         ]
     };
 }
 
-async function writeXrayConfig() {
-    lastSyncKey = activeKey();
+function generateXrayConfig() {
+    const config = generateBaseXrayConfig();
+    const inbound = rawInbound(activeUsers());
 
+    if (inbound) config.inbounds.push(inbound);
+
+    return config;
+}
+
+async function writeXrayConfig() {
     const config = generateXrayConfig();
+
+    lastSyncKey = activeKey();
 
     await fs.writeFile(
         XRAY_CONFIG,
@@ -504,6 +688,24 @@ async function startXray() {
 
     console.log(`⚙️ Xray binary: ${XRAY_BIN}`);
 
+    try {
+        const test = spawnSync(
+            XRAY_BIN,
+            ["run", "-test", "-config", XRAY_CONFIG],
+            { encoding: "utf8", timeout: 10000 }
+        );
+
+        console.log(`🧪 Xray config test: exit=${test.status}`);
+
+        const out = `${test.stdout || ""}${test.stderr || ""}`.trim();
+
+        if (out) {
+            console.log(`[XRAY-TEST] ${out.slice(-1500)}`);
+        }
+    } catch (error) {
+        console.error("🧪 Xray config test failed to run:", error);
+    }
+
     const child = xrayProcess = spawn(
         XRAY_BIN,
         [
@@ -535,6 +737,8 @@ async function startXray() {
         console.log(
             `⚠️ Xray exited. code=${code} signal=${signal}`
         );
+
+        lastXrayExit = `code=${code} signal=${signal}`;
 
         const wasCurrent = xrayProcess === child;
 
@@ -592,8 +796,6 @@ function makeVlessLinks(user, origin) {
             path: XHTTP_PATH,
             host: domain,
             sni: domain,
-            fp: "chrome",
-            alpn: "h2,http/1.1",
             mode: "auto"
         });
 
@@ -604,25 +806,16 @@ function makeVlessLinks(user, origin) {
             type: "ws",
             path: WS_PATH,
             host: domain,
-            sni: domain,
-            fp: "chrome",
-            alpn: "http/1.1"
+            sni: domain
         });
 
-    const links = {
+    return {
         xhttp:
             `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(user.username)}-XHTTP`,
+
         websocket:
             `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(user.username)}-WS`
     };
-    const tcpHostLinks = stmtEnabledHosts.all().filter(h => h.network === "tcp").map(h => {
-        const params = new URLSearchParams({
-            encryption: "none", type: "tcp", security: h.security || "none",
-            ...(h.security === "tls" ? { sni: h.address, fp: "chrome" } : {})
-        });
-        return `vless://${user.uuid}@${h.address}:${h.port}?${params.toString()}#${encodeURIComponent(h.label)}`;
-    });
-    return [links.xhttp, links.websocket, ...tcpHostLinks];
 }
 
 /*
@@ -648,12 +841,20 @@ function makeDummyConfig() {
 }
 
 function makeSubscription(user, origin) {
+    const links =
+        makeVlessLinks(
+            user,
+            origin
+        );
+
     const dummy =
         makeDummyConfig();
 
     return Buffer.from(
         [
-            ...makeVlessLinks(user, origin),
+            links.xhttp,
+            links.websocket,
+            ...rawLinkList(user),
             dummy
         ].join("\n"),
         "utf8"
@@ -1654,20 +1855,6 @@ POWERED BY YASIN BEHZAD
     );
 }
 
-
-function hostsPage() {
-    return layout("Hosts", `
-<div class="container"><div class="nav"><a class="brand" href="/dashboard"><div class="brand-icon">⚔️</div><div>VERGIL<span>PANEL</span></div></a><div class="nav-right"><a class="btn" href="/dashboard">🏠 داشبورد</a><a class="btn danger" href="/logout">خروج</a></div></div>
-<div class="card"><h1>🌐 مدیریت هاست‌ها</h1><p class="muted">افزودن و مدیریت هاست‌های اتصال</p>
-<label>عنوان</label><input id="label" dir="ltr"><label>آدرس</label><input id="address" dir="ltr"><label>پورت</label><input id="port" type="number" min="1" max="65535" dir="ltr"><label>شبکه</label><select id="network"><option>tcp</option><option>ws</option><option>xhttp</option></select><label>امنیت</label><select id="security"><option>none</option><option>tls</option></select><br><button class="btn primary" onclick="addHost()">افزودن</button><span id="msg" class="muted"></span></div>
-<div class="card" style="margin-top:18px"><h2>هاست‌ها</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>عنوان</th><th>آدرس</th><th>پورت</th><th>شبکه</th><th>امنیت</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody id="rows"></tbody></table></div></div></div>
-<script>
-async function loadHosts(){const r=await fetch('/api/hosts'),d=await r.json(),rows=document.getElementById('rows');rows.innerHTML='';(d.hosts||[]).forEach(h=>{const tr=document.createElement('tr');tr.innerHTML='<td>'+h.id+'</td><td>'+h.label+'</td><td dir="ltr">'+h.address+'</td><td>'+h.port+'</td><td>'+h.network+'</td><td>'+h.security+'</td><td>'+ (h.enabled?'فعال':'غیرفعال')+'</td><td><button class="btn" onclick="toggleHost('+h.id+')">تغییر</button> <button class="btn danger" onclick="deleteHost('+h.id+')">حذف</button></td>';rows.appendChild(tr)})}
-async function addHost(){const body={label:label.value,address:address.value,port:port.value,network:network.value,security:security.value};const r=await fetch('/api/hosts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();msg.textContent=r.ok?'✅ اضافه شد':('❌ '+(d.error||'خطا'));if(r.ok)loadHosts()}
-async function toggleHost(id){await fetch('/api/hosts/'+id+'/toggle',{method:'POST'});loadHosts()} async function deleteHost(id){if(confirm('حذف شود؟')){await fetch('/api/hosts/'+id,{method:'DELETE'});loadHosts()}} loadHosts();
-</script>`);
-}
-
 function dashboardPage(req) {
     const users = allUsers();
     const active = activeUsers();
@@ -2158,6 +2345,8 @@ function settingsPage(
     const admin =
         getAdmin();
 
+    const raw = rawConfig();
+
     return layout(
         "Settings",
         `
@@ -2286,6 +2475,106 @@ ${
 
 </div>
 
+<div class="card form">
+
+<h1>
+🛰️ شبکه و پروتکل TCP
+</h1>
+
+<p class="muted">
+برای کانفیگ‌های TCP (Shadowsocks یا Reality) در Railway یک TCP Proxy بسازید.
+پورت داخلی (Application Port) را برابر مقدار «پورت داخلی» پایین بگذارید،
+سپس دامنه و پورتی که Railway می‌دهد را در Host و Port بنویسید.
+</p>
+
+<form
+    method="POST"
+    action="/settings/network"
+>
+
+<label>
+Host (دامنه TCP Proxy یا دامنه اختصاصی)
+</label>
+
+<input
+    name="public_host"
+    value="${escapeHtml(raw.host)}"
+    placeholder="example.proxy.rlwy.net"
+    maxlength="253"
+    dir="ltr"
+>
+
+<label>
+Port (پورت بیرونی که Railway می‌دهد)
+</label>
+
+<input
+    name="public_port"
+    value="${escapeHtml(raw.port)}"
+    placeholder="12345"
+    inputmode="numeric"
+    maxlength="5"
+    dir="ltr"
+>
+
+<label>
+پروتکل TCP
+</label>
+
+<select
+    name="raw_protocol"
+    dir="ltr"
+>
+<option value="none" ${raw.protocol === "none" ? "selected" : ""}>غیرفعال</option>
+<option value="shadowsocks" ${raw.protocol === "shadowsocks" ? "selected" : ""}>Shadowsocks 2022</option>
+<option value="reality" ${raw.protocol === "reality" ? "selected" : ""}>VLESS + Reality</option>
+</select>
+
+<label>
+پورت داخلی (Application Port در TCP Proxy)
+</label>
+
+<input
+    name="raw_internal_port"
+    value="${escapeHtml(String(raw.internalPort))}"
+    inputmode="numeric"
+    maxlength="5"
+    dir="ltr"
+>
+
+<label>
+دامنه ظاهری Reality (فقط برای Reality)
+</label>
+
+<input
+    name="reality_sni"
+    value="${escapeHtml(raw.sni)}"
+    maxlength="253"
+    dir="ltr"
+>
+
+<br><br>
+
+<button
+    class="btn primary"
+    type="submit"
+>
+💾 ذخیره تنظیمات شبکه
+</button>
+
+</form>
+
+<br>
+
+<div class="notice">
+
+⚠️ با فعال کردن این بخش، Xray مستقیماً روی اینترنت باز می‌شود.
+فقط یک TCP Proxy برای هر سرویس مجاز است، پس هم‌زمان فقط یک پروتکل TCP فعال است.
+
+</div>
+
+</div>
+
 <div class="footer">
 POWERED BY YASIN BEHZAD
 </div>
@@ -2322,6 +2611,39 @@ async function configPage(req, user) {
         await qrCode(
             subscriptionUrl
         );
+
+    const rawLink = makeRawLink(user);
+    const rawQr = rawLink ? await qrCode(rawLink) : "";
+    const rawSection = rawLink
+        ? `
+<br><br>
+
+<h2>
+🛰️ ${rawLabel(rawConfig().protocol)}
+</h2>
+
+<p class="muted small">
+این کانفیگ روی پورت TCP Proxy است و فقط روی اینترنت‌هایی کار می‌کند که پورت غیر ۴۴۳ را باز می‌گذارند.
+</p>
+
+<pre class="config">${escapeHtml(rawLink)}</pre>
+
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(rawLink)})'
+>
+📋 Copy
+</button>
+
+<br><br>
+
+<img
+    src="${rawQr}"
+    alt="TCP QR"
+    style="max-width:260px"
+>
+`
+        : "";
 
     return layout(
         `${user.username} Config`,
@@ -2464,6 +2786,8 @@ VLESS · XHTTP + WebSocket
 >
 📋 Copy WebSocket
 </button>
+
+${rawSection}
 
 <div class="qr-grid">
 
@@ -3237,6 +3561,8 @@ async function handleRequest(
                     ok: true,
                     panel: VERSION,
 
+                    lastXrayExit,
+
                     xray:
                         Boolean(
                             xrayProcess &&
@@ -3518,6 +3844,125 @@ async function handleRequest(
             return;
         }
 
+        if (
+            pathname === "/settings/network" &&
+            req.method === "POST"
+        ) {
+
+            try {
+
+                const form =
+                    await readForm(req);
+
+                const hostRe =
+                    /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$/;
+
+                const host =
+                    String(form.get("public_host") || "")
+                        .trim()
+                        .toLowerCase();
+
+                const publicPort =
+                    String(form.get("public_port") || "").trim();
+
+                const protocol =
+                    String(form.get("raw_protocol") || "none");
+
+                const internalPort =
+                    Number(String(form.get("raw_internal_port") || "8443").trim());
+
+                const sni =
+                    String(form.get("reality_sni") || "www.microsoft.com")
+                        .trim()
+                        .toLowerCase();
+
+                if (host && !hostRe.test(host)) {
+                    throw new Error(
+                        "Host معتبر نیست (فقط دامنه یا IP، بدون http و بدون پورت)."
+                    );
+                }
+
+                if (
+                    publicPort &&
+                    !(/^\d{1,5}$/.test(publicPort) &&
+                        Number(publicPort) >= 1 &&
+                        Number(publicPort) <= 65535)
+                ) {
+                    throw new Error("Port بیرونی معتبر نیست.");
+                }
+
+                if (!RAW_PROTOCOLS.includes(protocol)) {
+                    throw new Error("پروتکل نامعتبر است.");
+                }
+
+                if (
+                    !Number.isInteger(internalPort) ||
+                    internalPort < 1 ||
+                    internalPort > 65535
+                ) {
+                    throw new Error("پورت داخلی معتبر نیست.");
+                }
+
+                if (
+                    [PORT, XRAY_XHTTP_PORT, XRAY_WS_PORT].includes(internalPort)
+                ) {
+                    throw new Error(
+                        "این پورت داخلی قبلاً توسط پنل استفاده می‌شود؛ پورت دیگری مثل 8443 انتخاب کنید."
+                    );
+                }
+
+                if (!hostRe.test(sni)) {
+                    throw new Error("دامنه Reality معتبر نیست.");
+                }
+
+                setSetting("public_host", host);
+                setSetting("public_port", publicPort);
+                setSetting("raw_protocol", protocol);
+                setSetting("raw_internal_port", internalPort);
+                setSetting("reality_sni", sni);
+
+                if (protocol !== "none") {
+                    ensureRawSecrets();
+                }
+
+                if (
+                    protocol === "reality" &&
+                    !getSetting("reality_public")
+                ) {
+                    throw new Error(
+                        "ساخت کلید Reality ناموفق بود؛ لاگ‌های Railway را بررسی کنید."
+                    );
+                }
+
+                restartXray().catch(error => {
+                    console.error("❌ Xray restart failed:", error);
+                });
+
+                sendHtml(
+                    res,
+                    settingsPage(
+                        req,
+                        "تنظیمات شبکه ذخیره شد و Xray دوباره راه‌اندازی می‌شود."
+                    )
+                );
+
+            } catch (error) {
+
+                sendHtml(
+                    res,
+                    settingsPage(
+                        req,
+                        "",
+                        error?.message ||
+                            "خطا در ذخیره تنظیمات شبکه."
+                    ),
+                    400
+                );
+            }
+
+            return;
+        }
+
         /*
          * New User
          */
@@ -3573,29 +4018,6 @@ async function handleRequest(
 
             return;
         }
-
-
-        // =================== Hosts API ===================
-        if (req.method === "GET" && pathname === "/api/hosts") { sendJson(res, { hosts: stmtGetAllHosts.all() }); return; }
-        if (req.method === "POST" && pathname === "/api/hosts") {
-            let body; try { body = JSON.parse(await readBody(req)); } catch { sendJson(res,{error:"Invalid JSON"},400); return; }
-            const {label,address,port,network="tcp",security="none"}=body||{}; const portNum=parseInt(port,10);
-            if (!label||!address||!port) { sendJson(res,{error:"label, address and port are required"},400); return; }
-            if (!["tcp","ws","xhttp"].includes(network)) { sendJson(res,{error:"Invalid network type"},400); return; }
-            if (!["none","tls"].includes(security)) { sendJson(res,{error:"Invalid security type"},400); return; }
-            if (!Number.isInteger(portNum)||portNum<1||portNum>65535) { sendJson(res,{error:"Invalid port"},400); return; }
-            const info=stmtInsertHost.run(label.trim(),address.trim(),portNum,network,security); await restartXray(); sendJson(res,{host:stmtGetHostById.get(info.lastInsertRowid)},201); return;
-        }
-        if (req.method === "PUT" && /^\/api\/hosts\/\d+$/.test(pathname)) {
-            const id=parseInt(pathname.split('/')[3],10), e=stmtGetHostById.get(id); if(!e){sendJson(res,{error:"Host not found"},404);return;}
-            let b; try{b=JSON.parse(await readBody(req))}catch{sendJson(res,{error:"Invalid JSON"},400);return;}
-            const label=(b.label??e.label).toString().trim(), address=(b.address??e.address).toString().trim(), network=b.network??e.network, security=b.security??e.security, enabled=b.enabled!==undefined?(b.enabled?1:0):e.enabled, portNum=parseInt(b.port??e.port,10);
-            if(!["tcp","ws","xhttp"].includes(network)){sendJson(res,{error:"Invalid network type"},400);return;} if(!["none","tls"].includes(security)){sendJson(res,{error:"Invalid security type"},400);return;} if(!Number.isInteger(portNum)||portNum<1||portNum>65535){sendJson(res,{error:"Invalid port"},400);return;}
-            stmtUpdateHost.run(label,address,portNum,network,security,enabled,id); await restartXray(); sendJson(res,{host:stmtGetHostById.get(id)}); return;
-        }
-        if (req.method === "DELETE" && /^\/api\/hosts\/\d+$/.test(pathname)) { const id=parseInt(pathname.split('/')[3],10); if(!stmtGetHostById.get(id)){sendJson(res,{error:"Host not found"},404);return;} stmtDeleteHost.run(id); await restartXray(); sendJson(res,{ok:true}); return; }
-        if (req.method === "POST" && /^\/api\/hosts\/\d+\/toggle$/.test(pathname)) { const id=parseInt(pathname.split('/')[3],10),h=stmtGetHostById.get(id); if(!h){sendJson(res,{error:"Host not found"},404);return;} stmtUpdateHost.run(h.label,h.address,h.port,h.network,h.security,h.enabled?0:1,id); await restartXray(); sendJson(res,{host:stmtGetHostById.get(id)}); return; }
-        if (req.method === "GET" && pathname === "/hosts") { sendHtml(res, hostsPage()); return; }
 
         /*
          * User Config
@@ -3881,7 +4303,7 @@ server.listen(
         );
 
         console.log(
-            `⚔️ Railway TCP Proxy NOT required`
+            `⚔️ Railway TCP Proxy is optional (Settings → Network)`
         );
     }
 );
