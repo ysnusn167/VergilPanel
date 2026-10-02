@@ -31,7 +31,7 @@ const XHTTP_PATH =
 const WS_PATH =
     process.env.WS_PATH || "/ws";
 
-const VERSION = "0.10.0";
+const VERSION = "0.10.2";
 
 let xrayProcess = null;
 let stoppingXray = false;
@@ -869,6 +869,35 @@ async function qrCode(text) {
     });
 }
 
+const ASSET_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp"
+};
+
+const assets = new Map();
+
+for (const name of [
+    "logo-96.jpg",
+    "logo-256.jpg",
+    "bg.jpg",
+    "bg.webp",
+    "bg.png"
+]) {
+    try {
+        assets.set(
+            name,
+            await fs.readFile(new URL(`./assets/${name}`, import.meta.url))
+        );
+    } catch {
+        // optional asset is missing
+    }
+}
+
+const bgAsset =
+    ["bg.webp", "bg.jpg", "bg.png"].find(name => assets.has(name)) || "";
+
 function layout(title, body) {
     return `
 <!doctype html>
@@ -887,6 +916,10 @@ function layout(title, body) {
 <title>
 ${escapeHtml(title)} — VergilPanel
 </title>
+
+<link rel="icon" type="image/jpeg" href="/assets/logo-96.jpg">
+<link rel="apple-touch-icon" href="/assets/logo-256.jpg">
+<meta name="theme-color" content="#03070d">
 
 <style>
 
@@ -1031,6 +1064,34 @@ a{
     text-shadow:
         0 0 25px
         rgba(64,210,255,.45);
+}
+
+.brand-img{
+    width:39px;
+    height:39px;
+    border-radius:12px;
+    object-fit:cover;
+    border:1px solid rgba(94,218,255,.3);
+    box-shadow:0 0 26px rgba(39,201,255,.28);
+}
+
+.brand-icon img{
+    width:100%;
+    height:100%;
+    border-radius:inherit;
+    object-fit:cover;
+    display:block;
+}
+
+.login-logo-img{
+    display:block;
+    width:128px;
+    height:128px;
+    margin:0 auto 14px;
+    border-radius:50%;
+    object-fit:cover;
+    border:2px solid rgba(94,218,255,.35);
+    box-shadow:0 0 50px rgba(39,201,255,.4);
 }
 
 .nav-right{
@@ -1764,6 +1825,22 @@ pre.config{
 
 }
 
+${
+    bgAsset
+        ? `
+body::after{
+    content:"";
+    position:fixed;
+    inset:0;
+    z-index:-2;
+    pointer-events:none;
+    background:
+        linear-gradient(rgba(2,5,10,.5), rgba(2,5,10,.84)),
+        url(/assets/${bgAsset}) center / cover no-repeat;
+}
+`
+        : ""
+}
 </style>
 
 </head>
@@ -1786,8 +1863,14 @@ function loginPage(error = "") {
 
 <div class="card login-card">
 
+<img
+    class="login-logo-img"
+    src="/assets/logo-256.jpg"
+    alt="VergilPanel"
+>
+
 <div class="login-logo">
-⚔️ VERGIL<span>PANEL</span>
+VERGIL<span>PANEL</span>
 </div>
 
 <div class="login-sub">
@@ -1881,7 +1964,7 @@ function dashboardPage(req) {
 >
 
 <div class="brand-icon">
-⚔️
+<img src="/assets/logo-96.jpg" alt="">
 </div>
 
 <div>
@@ -2228,7 +2311,8 @@ function newUserPage(error = "") {
     href="/dashboard"
     class="brand"
 >
-⚔️ VERGIL<span>PANEL</span>
+<img class="brand-img" src="/assets/logo-96.jpg" alt="">
+VERGIL<span>PANEL</span>
 </a>
 
 <a
@@ -2358,7 +2442,8 @@ function settingsPage(
     href="/dashboard"
     class="brand"
 >
-⚔️ VERGIL<span>PANEL</span>
+<img class="brand-img" src="/assets/logo-96.jpg" alt="">
+VERGIL<span>PANEL</span>
 </a>
 
 <a
@@ -2656,7 +2741,8 @@ async function configPage(req, user) {
     href="/dashboard"
     class="brand"
 >
-⚔️ VERGIL<span>PANEL</span>
+<img class="brand-img" src="/assets/logo-96.jpg" alt="">
+VERGIL<span>PANEL</span>
 </a>
 
 <a
@@ -3506,6 +3592,35 @@ async function handleRequest(
 
         const pathname =
             url.pathname;
+
+        /*
+         * Static assets (logo / background)
+         */
+
+        if (
+            pathname.startsWith("/assets/") &&
+            (req.method === "GET" || req.method === "HEAD")
+        ) {
+            const name = pathname.slice(8);
+            const file = assets.get(name);
+
+            if (!file) {
+                res.writeHead(404);
+                res.end();
+                return;
+            }
+
+            const ext = name.slice(name.lastIndexOf("."));
+
+            res.writeHead(200, {
+                "Content-Type": ASSET_TYPES[ext] || "application/octet-stream",
+                "Content-Length": file.length,
+                "Cache-Control": "public, max-age=86400"
+            });
+
+            res.end(req.method === "HEAD" ? undefined : file);
+            return;
+        }
 
         /*
          * XHTTP
