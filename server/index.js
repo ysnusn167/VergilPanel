@@ -31,7 +31,18 @@ const XHTTP_PATH =
 const WS_PATH =
     process.env.WS_PATH || "/ws";
 
-const VERSION = "0.10.2";
+const PROTOCOLS = [
+    { id: "vless-xhttp", type: "vless", network: "xhttp", path: XHTTP_PATH, port: XRAY_XHTTP_PORT, label: "VLESS + XHTTP", tag: "XHTTP" },
+    { id: "vless-ws", type: "vless", network: "ws", path: WS_PATH, port: XRAY_WS_PORT, label: "VLESS + WebSocket", tag: "WS" },
+    { id: "vless-httpupgrade", type: "vless", network: "httpupgrade", path: "/vl-hu", port: 10003, label: "VLESS + HTTPUpgrade", tag: "VLESS-HU" },
+    { id: "vmess-ws", type: "vmess", network: "ws", path: "/vmess", port: 10004, label: "VMess + WebSocket", tag: "VMESS-WS" },
+    { id: "vmess-httpupgrade", type: "vmess", network: "httpupgrade", path: "/vmess-hu", port: 10005, label: "VMess + HTTPUpgrade", tag: "VMESS-HU" },
+    { id: "trojan-ws", type: "trojan", network: "ws", path: "/trojan", port: 10006, label: "Trojan + WebSocket", tag: "TROJAN-WS" },
+    { id: "trojan-httpupgrade", type: "trojan", network: "httpupgrade", path: "/trojan-hu", port: 10007, label: "Trojan + HTTPUpgrade", tag: "TROJAN-HU" },
+    { id: "shadowsocks-ws", type: "shadowsocks", network: "ws", path: "/ss", port: 10008, label: "Shadowsocks + WebSocket", tag: "SS-WS" }
+];
+
+const VERSION = "0.11.0";
 
 let xrayProcess = null;
 let stoppingXray = false;
@@ -544,7 +555,7 @@ function activeKey() {
     return activeUsers()
         .map(user => user.uuid)
         .sort()
-        .join(",") + "|" + rawSignature();
+        .join(",") + "|" + rawSignature() + "|" + getSetting("disabled_protocols", "");
 }
 
 function allUsers() {
@@ -564,59 +575,99 @@ function getAdmin() {
     `).get();
 }
 
+function enabledProtocols() {
+    const off = new Set(
+        getSetting("disabled_protocols", "").split(",").filter(Boolean)
+    );
+
+    return PROTOCOLS.filter(p => !off.has(p.id));
+}
+
+function ensureSsPsk() {
+    if (!getSetting("ss_psk")) {
+        setSetting("ss_psk", crypto.randomBytes(16).toString("base64"));
+    }
+
+    return getSetting("ss_psk");
+}
+
+function trojanPassword(user) {
+    return crypto
+        .createHash("sha256")
+        .update(`trojan:${user.uuid}`)
+        .digest("hex")
+        .slice(0, 32);
+}
+
+function protocolInbound(p, users) {
+    const streamSettings = { network: p.network, security: "none" };
+
+    if (p.network === "xhttp") {
+        streamSettings.xhttpSettings = { path: p.path, mode: "auto" };
+    } else if (p.network === "ws") {
+        streamSettings.wsSettings = { path: p.path };
+    } else if (p.network === "httpupgrade") {
+        streamSettings.httpupgradeSettings = { path: p.path };
+    }
+
+    let settings;
+
+    if (p.type === "vless") {
+        settings = {
+            clients: users.map(u => ({ id: u.uuid, email: u.username })),
+            decryption: "none"
+        };
+    } else if (p.type === "vmess") {
+        settings = {
+            clients: users.map(u => ({ id: u.uuid, email: u.username, alterId: 0 }))
+        };
+    } else if (p.type === "trojan") {
+        settings = {
+            clients: users.map(u => ({ password: trojanPassword(u), email: u.username }))
+        };
+    } else if (p.type === "shadowsocks") {
+        const psk = ensureSsPsk();
+
+        settings = {
+            method: SS_METHOD,
+            password: psk,
+            network: "tcp",
+            clients: users.map(u => ({ password: ssUserKey(u, psk), email: u.username }))
+        };
+    } else {
+        return null;
+    }
+
+    return {
+        listen: "127.0.0.1",
+        port: p.port,
+        protocol: p.type,
+        tag: p.id,
+        settings,
+        streamSettings
+    };
+}
+
 function generateBaseXrayConfig() {
-    const clients = activeUsers().map(user => ({
-        id: user.uuid,
-        email: user.username
-    }));
+    const users = activeUsers();
+    const inbounds = [];
+
+    for (const p of enabledProtocols()) {
+        // VLESS keeps working with an empty client list (as before);
+        // the other protocols are skipped until at least one user exists.
+        if (p.type !== "vless" && users.length === 0) continue;
+
+        const inbound = protocolInbound(p, users);
+
+        if (inbound) inbounds.push(inbound);
+    }
 
     return {
         log: {
             loglevel: "warning"
         },
 
-        inbounds: [
-            {
-                listen: "127.0.0.1",
-                port: XRAY_XHTTP_PORT,
-                protocol: "vless",
-
-                settings: {
-                    clients,
-                    decryption: "none"
-                },
-
-                streamSettings: {
-                    network: "xhttp",
-                    security: "none",
-
-                    xhttpSettings: {
-                        path: XHTTP_PATH,
-                        mode: "auto"
-                    }
-                }
-            },
-
-            {
-                listen: "127.0.0.1",
-                port: XRAY_WS_PORT,
-                protocol: "vless",
-
-                settings: {
-                    clients,
-                    decryption: "none"
-                },
-
-                streamSettings: {
-                    network: "websocket",
-                    security: "none",
-
-                    wsSettings: {
-                        path: WS_PATH
-                    }
-                }
-            }
-        ],
+        inbounds,
 
         outbounds: [
             {
@@ -784,38 +835,76 @@ async function restartXray() {
     }
 }
 
-function makeVlessLinks(user, origin) {
-    const domain =
-        new URL(origin).hostname;
+function makeProtocolLink(p, user, domain) {
+    const name = `${encodeURIComponent(user.username)}-${p.tag}`;
 
-    const xhttpParams =
-        new URLSearchParams({
-            encryption: "none",
-            security: "tls",
-            type: "xhttp",
-            path: XHTTP_PATH,
-            host: domain,
-            sni: domain,
-            mode: "auto"
-        });
-
-    const wsParams =
-        new URLSearchParams({
-            encryption: "none",
-            security: "tls",
-            type: "ws",
-            path: WS_PATH,
-            host: domain,
-            sni: domain
-        });
-
-    return {
-        xhttp:
-            `vless://${user.uuid}@${domain}:443?${xhttpParams.toString()}#${encodeURIComponent(user.username)}-XHTTP`,
-
-        websocket:
-            `vless://${user.uuid}@${domain}:443?${wsParams.toString()}#${encodeURIComponent(user.username)}-WS`
+    const common = {
+        security: "tls",
+        type: p.network,
+        path: p.path,
+        host: domain,
+        sni: domain
     };
+
+    if (p.type === "vless") {
+        const params = new URLSearchParams({
+            encryption: "none",
+            ...common,
+            ...(p.network === "xhttp" ? { mode: "auto" } : {})
+        });
+
+        return `vless://${user.uuid}@${domain}:443?${params.toString()}#${name}`;
+    }
+
+    if (p.type === "trojan") {
+        const params = new URLSearchParams(common);
+
+        return `trojan://${trojanPassword(user)}@${domain}:443?${params.toString()}#${name}`;
+    }
+
+    if (p.type === "vmess") {
+        const json = {
+            v: "2",
+            ps: `${user.username}-${p.tag}`,
+            add: domain,
+            port: "443",
+            id: user.uuid,
+            aid: "0",
+            scy: "auto",
+            net: p.network,
+            type: "none",
+            host: domain,
+            path: p.path,
+            tls: "tls",
+            sni: domain
+        };
+
+        return `vmess://${Buffer.from(JSON.stringify(json), "utf8").toString("base64")}`;
+    }
+
+    if (p.type === "shadowsocks") {
+        const psk = ensureSsPsk();
+
+        const userinfo = [
+            SS_METHOD,
+            psk,
+            ssUserKey(user, psk)
+        ].map(encodeURIComponent).join(":");
+
+        const params = new URLSearchParams(common);
+
+        return `ss://${userinfo}@${domain}:443?${params.toString()}#${name}`;
+    }
+
+    return null;
+}
+
+function makeProtocolLinks(user, origin) {
+    const domain = new URL(origin).hostname;
+
+    return enabledProtocols()
+        .map(p => ({ ...p, link: makeProtocolLink(p, user, domain) }))
+        .filter(item => item.link);
 }
 
 /*
@@ -841,19 +930,14 @@ function makeDummyConfig() {
 }
 
 function makeSubscription(user, origin) {
-    const links =
-        makeVlessLinks(
-            user,
-            origin
-        );
+    const links = makeProtocolLinks(user, origin).map(item => item.link);
 
     const dummy =
         makeDummyConfig();
 
     return Buffer.from(
         [
-            links.xhttp,
-            links.websocket,
+            ...links,
             ...rawLinkList(user),
             dummy
         ].join("\n"),
@@ -2012,9 +2096,9 @@ VERGIL
 </div>
 
 <div class="hero-sub">
-مدیریت هوشمند VLESS با Xray
+مدیریت هوشمند Xray
 <br>
-XHTTP + WebSocket
+VLESS · VMess · Trojan · Shadowsocks
 </div>
 
 <div class="powered">
@@ -2080,7 +2164,7 @@ Transport
     class="stat-value"
     style="font-size:20px"
 >
-XHTTP + WS
+${enabledProtocols().length} پروتکل
 </div>
 
 </div>
@@ -2177,7 +2261,7 @@ ${escapeHtml(user.username)}
 
 <td>
 <span class="badge">
-VLESS
+ALL
 </span>
 </td>
 
@@ -2331,11 +2415,11 @@ VERGIL<span>PANEL</span>
 </div>
 
 <h1>
-ساخت کاربر
+ساخت ساب
 </h1>
 
 <p class="muted">
-UUID و Subscription به صورت خودکار ساخته می‌شوند.
+فقط یک اسم بنویس؛ همه پروتکل‌ها و Subscription به صورت خودکار ساخته می‌شوند.
 </p>
 
 ${
@@ -2360,10 +2444,13 @@ ${escapeHtml(error)}
 <input
     name="username"
     required
-    maxlength="64"
+    maxlength="32"
     placeholder="User-01"
     dir="ltr"
 >
+
+<details style="margin-top:14px">
+<summary class="muted">تنظیمات اختیاری</summary>
 
 <label>
 محدودیت ترافیک
@@ -2403,13 +2490,15 @@ ${escapeHtml(error)}
     dir="ltr"
 >
 
+</details>
+
 <br><br>
 
 <button
     class="btn primary"
     type="submit"
 >
-⚔️ ساخت کاربر
+⚔️ ساخت ساب
 </button>
 
 </form>
@@ -2563,6 +2652,49 @@ ${
 <div class="card form">
 
 <h1>
+🧩 پروتکل‌ها
+</h1>
+
+<p class="muted">
+پروتکل‌های روشن به‌صورت خودکار داخل Subscription همه کاربران قرار می‌گیرند.
+</p>
+
+<form
+    method="POST"
+    action="/settings/protocols"
+>
+
+${
+    PROTOCOLS.map(p => `
+<label style="display:flex;align-items:center;gap:10px;margin:10px 0">
+<input
+    type="checkbox"
+    name="protocols"
+    value="${p.id}"
+    style="width:auto"
+    ${enabledProtocols().some(x => x.id === p.id) ? "checked" : ""}
+>
+<span dir="ltr">${escapeHtml(p.label)}</span>
+</label>
+`).join("")
+}
+
+<br>
+
+<button
+    class="btn primary"
+    type="submit"
+>
+💾 ذخیره پروتکل‌ها
+</button>
+
+</form>
+
+</div>
+
+<div class="card form">
+
+<h1>
 🛰️ شبکه و پروتکل TCP
 </h1>
 
@@ -2673,8 +2805,8 @@ async function configPage(req, user) {
     const origin =
         getPublicOrigin(req);
 
-    const links =
-        makeVlessLinks(
+    const items =
+        makeProtocolLinks(
             user,
             origin
         );
@@ -2682,30 +2814,54 @@ async function configPage(req, user) {
     const subscriptionUrl =
         `${origin}/sub/${user.subscription_token}`;
 
-    const xhttpQr =
-        await qrCode(
-            links.xhttp
-        );
-
-    const wsQr =
-        await qrCode(
-            links.websocket
-        );
-
     const subQr =
         await qrCode(
             subscriptionUrl
         );
 
+    const protocolCards =
+        (await Promise.all(
+            items.map(async item => {
+                const qr = await qrCode(item.link);
+
+                return `
+<details class="notice">
+
+<summary>
+<strong>${escapeHtml(item.label)}</strong>
+</summary>
+
+<pre class="config">${escapeHtml(item.link)}</pre>
+
+<button
+    class="btn"
+    onclick='copyText(${JSON.stringify(item.link)})'
+>
+📋 Copy
+</button>
+
+<br><br>
+
+<img
+    src="${qr}"
+    alt="${escapeHtml(item.label)} QR"
+    style="max-width:220px;background:#fff;padding:8px;border-radius:12px"
+>
+
+</details>
+`;
+            })
+        )).join("");
+
     const rawLink = makeRawLink(user);
     const rawQr = rawLink ? await qrCode(rawLink) : "";
     const rawSection = rawLink
         ? `
-<br><br>
+<details class="notice">
 
-<h2>
-🛰️ ${rawLabel(rawConfig().protocol)}
-</h2>
+<summary>
+<strong>🛰️ ${rawLabel(rawConfig().protocol)}</strong>
+</summary>
 
 <p class="muted small">
 این کانفیگ روی پورت TCP Proxy است و فقط روی اینترنت‌هایی کار می‌کند که پورت غیر ۴۴۳ را باز می‌گذارند.
@@ -2725,8 +2881,10 @@ async function configPage(req, user) {
 <img
     src="${rawQr}"
     alt="TCP QR"
-    style="max-width:260px"
+    style="max-width:220px;background:#fff;padding:8px;border-radius:12px"
 >
+
+</details>
 `
         : "";
 
@@ -2761,7 +2919,7 @@ VERGIL<span>PANEL</span>
 </h1>
 
 <p class="muted">
-VLESS · XHTTP + WebSocket
+${items.length + (rawLink ? 1 : 0)} کانفیگ داخل Subscription
 </p>
 
 <div class="notice">
@@ -2783,129 +2941,23 @@ VLESS · XHTTP + WebSocket
 📋 کپی Subscription
 </button>
 
-</div>
-
-<div class="qr-grid">
-
-<div class="qr-card">
-
-<h3>
-📡 Subscription QR
-</h3>
+<br><br>
 
 <img
     src="${subQr}"
     alt="Subscription QR"
+    style="max-width:220px;background:#fff;padding:8px;border-radius:12px"
 >
-
-<br><br>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        subscriptionUrl
-    )})'
->
-کپی لینک
-</button>
-
-</div>
-
-<div class="qr-card">
-
-<h3>
-🔥 XHTTP QR
-</h3>
-
-<img
-    src="${xhttpQr}"
-    alt="XHTTP QR"
->
-
-<br><br>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        links.xhttp
-    )})'
->
-کپی
-</button>
-
-</div>
 
 </div>
 
 <h2>
-🚀 VLESS + XHTTP
+🧩 کانفیگ تک‌تک پروتکل‌ها
 </h2>
 
-<pre class="config">${escapeHtml(
-    links.xhttp
-)}</pre>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        links.xhttp
-    )})'
->
-📋 Copy XHTTP
-</button>
-
-<br><br>
-
-<h2>
-🌐 VLESS + WebSocket
-</h2>
-
-<pre class="config">${escapeHtml(
-    links.websocket
-)}</pre>
-
-<button
-    class="btn"
-    onclick='copyText(${JSON.stringify(
-        links.websocket
-    )})'
->
-📋 Copy WebSocket
-</button>
+${protocolCards}
 
 ${rawSection}
-
-<div class="qr-grid">
-
-<div class="qr-card">
-
-<h3>
-🔥 XHTTP
-</h3>
-
-<img
-    src="${xhttpQr}"
-    alt="XHTTP QR"
->
-
-</div>
-
-<div class="qr-card">
-
-<h3>
-🌐 WebSocket
-</h3>
-
-<img
-    src="${wsQr}"
-    alt="WebSocket QR"
->
-
-</div>
-
-</div>
-
-<br>
 
 <div class="notice">
 
@@ -3376,12 +3428,13 @@ function proxyHttpToXray(
 function proxyWebSocket(
     req,
     clientSocket,
-    head
+    head,
+    targetPort = XRAY_WS_PORT
 ) {
     const upstream =
         net.connect({
             host: "127.0.0.1",
-            port: XRAY_WS_PORT
+            port: targetPort
         });
 
     for (const sock of [upstream, clientSocket]) {
@@ -3684,10 +3737,8 @@ async function handleRequest(
                             !xrayProcess.killed
                         ),
 
-                    transports: [
-                        "xhttp",
-                        "websocket"
-                    ]
+                    transports:
+                        enabledProtocols().map(p => p.id)
                 }
             );
 
@@ -4019,7 +4070,7 @@ async function handleRequest(
                 }
 
                 if (
-                    [PORT, XRAY_XHTTP_PORT, XRAY_WS_PORT].includes(internalPort)
+                    [PORT, ...PROTOCOLS.map(p => p.port)].includes(internalPort)
                 ) {
                     throw new Error(
                         "این پورت داخلی قبلاً توسط پنل استفاده می‌شود؛ پورت دیگری مثل 8443 انتخاب کنید."
@@ -4070,6 +4121,65 @@ async function handleRequest(
                         "",
                         error?.message ||
                             "خطا در ذخیره تنظیمات شبکه."
+                    ),
+                    400
+                );
+            }
+
+            return;
+        }
+
+        if (
+            pathname === "/settings/protocols" &&
+            req.method === "POST"
+        ) {
+
+            try {
+
+                const form =
+                    await readForm(req);
+
+                const chosen =
+                    new Set(form.getAll("protocols"));
+
+                const valid =
+                    PROTOCOLS.filter(p => chosen.has(p.id));
+
+                if (valid.length === 0) {
+                    throw new Error(
+                        "حداقل یک پروتکل باید روشن باشد."
+                    );
+                }
+
+                setSetting(
+                    "disabled_protocols",
+                    PROTOCOLS
+                        .filter(p => !chosen.has(p.id))
+                        .map(p => p.id)
+                        .join(",")
+                );
+
+                restartXray().catch(error => {
+                    console.error("❌ Xray restart failed:", error);
+                });
+
+                sendHtml(
+                    res,
+                    settingsPage(
+                        req,
+                        "پروتکل‌ها ذخیره شد و Xray دوباره راه‌اندازی می‌شود."
+                    )
+                );
+
+            } catch (error) {
+
+                sendHtml(
+                    res,
+                    settingsPage(
+                        req,
+                        "",
+                        error?.message ||
+                            "خطا در ذخیره پروتکل‌ها."
                     ),
                     400
                 );
@@ -4342,18 +4452,16 @@ server.on(
                     `http://${req.headers.host || "localhost"}`
                 );
 
-            if (
-                url.pathname === WS_PATH ||
-                url.pathname.startsWith(
-                    `${WS_PATH}/`
+            const match = enabledProtocols().find(p =>
+                p.network !== "xhttp" &&
+                (
+                    url.pathname === p.path ||
+                    url.pathname.startsWith(`${p.path}/`)
                 )
-            ) {
+            );
 
-                proxyWebSocket(
-                    req,
-                    socket,
-                    head
-                );
+            if (match) {
+                proxyWebSocket(req, socket, head, match.port);
 
                 return;
             }
