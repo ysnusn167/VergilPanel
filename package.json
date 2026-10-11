@@ -1,8 +1,8 @@
 {
   "name": "vergilpanel",
-  "version": "0.7.0",
+  "version": "0.11.0",
   "private": true,
-  "description": "VergilPanel - automatic VLESS XHTTP and WebSocket panel.",
+  "description": "VergilPanel - automatic multi-protocol (VLESS, VMess, Trojan, Shadowsocks) Xray panel.",
   "type": "module",
   "scripts": {
     "start": "node server/index.js",

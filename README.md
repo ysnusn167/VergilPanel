@@ -12,8 +12,11 @@ VergilPanel یک پنل مدیریت ساده، مدرن و سبک برای مد
 
 ✨ Features
 
-- ⚔️ VLESS + XHTTP
-- 🌐 VLESS + WebSocket
+- ⚔️ VLESS + XHTTP / WebSocket / HTTPUpgrade
+- 🔷 VMess + WebSocket / HTTPUpgrade
+- 🛡️ Trojan + WebSocket / HTTPUpgrade
+- 🌑 Shadowsocks 2022 + WebSocket
+- 🧩 ساخت ساب فقط با یک اسم؛ همه پروتکل‌ها خودکار داخل Subscription می‌آیند
 - 🔗 Subscription URL
 - 📱 QR Code برای کانفیگ‌ها
 - 📋 Copy Config
@@ -218,8 +221,7 @@ VLESS + WebSocket + HTTPS
 
 ارتباط داخلی VergilPanel با Xray روی localhost انجام می‌شود:
 
-127.0.0.1:10001
-127.0.0.1:10002
+127.0.0.1:10001 ... 127.0.0.1:10008
 
 Xray مستقیماً روی اینترنت Public نیست.
 
